@@ -1101,9 +1101,34 @@ static UIScreen nav_pop(UIScreen fallback) {
     return fallback;
 }
 
+// Kicks off a background fetch of whatever tracks weren't loaded by the
+// initial page for the album/playlist just opened, so play_track()'s notion
+// of "the queue" (s_tracks/s_num_tracks) ends up complete even if playback
+// starts before the user scrolls far enough to lazy-load the rest. Always
+// cancels any fetch already in flight first, so a stale response left over
+// from whatever list was open before this one can never land in s_tracks
+// after it's been overwritten with a different list.
+static void start_queue_fill_if_needed(void) {
+    plex_api_queue_fill_async_cancel();
+    int remaining = s_total_items - s_loaded_items;
+    int capacity = PLEX_MAX_ITEMS - s_loaded_items;
+    if (remaining > capacity) remaining = capacity;
+    if (remaining > 0) {
+        plex_api_queue_fill_async_start(s_active_key, s_loaded_items, remaining);
+    }
+}
+
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     album_art_update();
     plex_api_timeline_async_update();
+    plex_api_queue_fill_async_update();
+    if (plex_api_queue_fill_async_is_done()) {
+        int fetched = plex_api_queue_fill_async_take_result(s_tracks, PLEX_MAX_ITEMS);
+        if (fetched > 0) {
+            s_num_tracks += fetched;
+            s_loaded_items = s_num_tracks;
+        }
+    }
     plex_api_lyrics_async_update();
     if (plex_api_lyrics_async_is_done()) {
         s_num_lyrics = plex_api_lyrics_async_take_result(s_lyrics, PLEX_MAX_LYRICS);
@@ -1664,13 +1689,19 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 char query[128] = "";
                 if (show_keyboard("Search Music Tracks", query, sizeof(query)) && query[0] != '\0') {
                     strncpy(s_current_title, "Search Results", PLEX_MAX_STR);
+                    plex_api_queue_fill_async_cancel(); // these fetch everything in one go - drop any fill still chasing a previously opened album/playlist
+                    s_total_items = 0;
                     s_num_tracks = plex_api_search_tracks(query, s_tracks, PLEX_MAX_ITEMS);
+                    s_loaded_items = s_num_tracks;
                     nav_push(SCREEN_HUB);
                     ui_set_screen(SCREEN_TRACKS);
                 }
             } else if (s_selected_idx == 3) { // Recently Added
                 strncpy(s_current_title, "Recently Added Tracks", PLEX_MAX_STR);
+                plex_api_queue_fill_async_cancel();
+                s_total_items = 0;
                 s_num_tracks = plex_api_get_recently_added(s_tracks, PLEX_MAX_ITEMS);
+                s_loaded_items = s_num_tracks;
                 nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_TRACKS);
             } else if (s_selected_idx == 4) { // All Libraries
@@ -1805,6 +1836,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_albums[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_tracks = s_loaded_items;
+            start_queue_fill_if_needed();
             nav_push(SCREEN_ALBUMS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0) {
@@ -1812,6 +1844,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_playlists[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_tracks = s_loaded_items;
+            start_queue_fill_if_needed();
             nav_push(SCREEN_PLAYLISTS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_TRACKS && s_list_count > 0 && s_selected_idx < s_num_tracks) {
@@ -1819,9 +1852,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     }
 
-    // Continuous Scrolling Lazy Loading Trigger
-    if ((s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS || s_screen == SCREEN_TRACKS) && !s_is_lazy_loading) {
-        int current_count = (s_screen == SCREEN_ARTISTS) ? s_num_artists : ((s_screen == SCREEN_ALBUMS) ? s_num_albums : s_num_tracks);
+    // Continuous Scrolling Lazy Loading Trigger (Artists/Albums only - Tracks
+    // screens now fetch the rest of the list in the background as soon as
+    // they're opened, via start_queue_fill_if_needed(), so the queue is
+    // complete whether or not the user ever scrolls to the bottom)
+    if ((s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS) && !s_is_lazy_loading) {
+        int current_count = (s_screen == SCREEN_ARTISTS) ? s_num_artists : s_num_albums;
         if (current_count < s_total_items && s_selected_idx >= current_count - 5) {
             s_is_lazy_loading = true;
             int new_items = 0;
@@ -1831,11 +1867,8 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             } else if (s_screen == SCREEN_ALBUMS) {
                 new_items = plex_api_get_albums_page(s_active_key, s_albums, current_count, PLEX_PAGE_SIZE, NULL);
                 s_num_albums += new_items;
-            } else if (s_screen == SCREEN_TRACKS) {
-                new_items = plex_api_get_tracks_page(s_active_key, s_tracks, current_count, PLEX_PAGE_SIZE, NULL);
-                s_num_tracks += new_items;
             }
-            s_loaded_items = (s_screen == SCREEN_ARTISTS) ? s_num_artists : ((s_screen == SCREEN_ALBUMS) ? s_num_albums : s_num_tracks);
+            s_loaded_items = (s_screen == SCREEN_ARTISTS) ? s_num_artists : s_num_albums;
             s_is_lazy_loading = false;
         }
     }
