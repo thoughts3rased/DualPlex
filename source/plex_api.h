@@ -119,6 +119,12 @@ bool plex_api_is_local_connection(void);
 // Test if the server is reachable and the token is valid.
 bool plex_api_test_connection(void);
 
+// Whether the most recent plex_api_test_connection() call succeeded -
+// distinct from just having a server_url/token configured at all. Drives
+// whether the top bar shows the local/remote + HTTP/HTTPS icons or a
+// single "disconnected" one instead (see ui_render_top()).
+bool plex_api_is_connected(void);
+
 // Create a PIN for plex.tv/link authorization flow.
 bool plex_api_create_pin(PlexPin* out_pin);
 

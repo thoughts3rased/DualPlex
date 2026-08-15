@@ -462,6 +462,7 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
 #define ICON_CP_GLOBE           0xF0AC
 #define ICON_CP_LOCK            0xF023
 #define ICON_CP_LOCK_OPEN       0xF3C1
+#define ICON_CP_DISCONNECTED    0xE560 // "plug-circle-xmark"
 
 // Every codepoint above sits in Font Awesome's Private Use Area, always a
 // 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
@@ -653,6 +654,14 @@ static void draw_icon_globe(float cx, float cy, float size, u32 color) {
 // Padlock glyph: closed (HTTPS) or open (HTTP).
 static void draw_icon_padlock(float cx, float cy, float size, u32 color, bool locked) {
     draw_icon_glyph(locked ? ICON_CP_LOCK : ICON_CP_LOCK_OPEN, cx, cy, size, color);
+}
+
+// "Unplugged" glyph shown in place of the house/globe + padlock pair while
+// a server is configured but plex_api_is_connected() hasn't confirmed a
+// working connection yet (still connecting, or the last attempt failed) -
+// neither of those icons has anything real to report before then.
+static void draw_icon_disconnected(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_DISCONNECTED, cx, cy, size, color);
 }
 
 static void format_time(int ms, char* buf, size_t buf_size) {
@@ -1539,6 +1548,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_config->server_name, s_servers[s_selected_idx].name, sizeof(s_config->server_name) - 1);
             config_save(s_config);
             plex_api_init(s_config->server_url, s_config->auth_token);
+            // Confirms the connection so plex_api_is_connected() (and the
+            // top bar's house/globe + padlock icons, gated on it) reflect
+            // reality on the Hub screen right away, instead of reporting
+            // "disconnected" indefinitely just because nothing had called
+            // this yet - jumping straight to SCREEN_HUB either way since
+            // there's nowhere better to send a failure on this screen; the
+            // icon and normal in-app errors cover it from here.
+            plex_api_test_connection();
             ui_set_screen(SCREEN_HUB);
         }
         return;
@@ -2045,15 +2062,23 @@ void ui_render_top(C3D_RenderTarget* top) {
     // local-network vs. remote/internet server address, padlock for plain
     // HTTP vs. HTTPS. Only shown once a server is actually configured
     // (plex_api_get_server_url() reads back "" before Setup/Link finishes)
-    // - nothing meaningful to report before then.
+    // - nothing meaningful to report before then. Neither icon has an
+    // answer worth showing until plex_api_is_connected() confirms an
+    // actual working connection either (mid-reconnect-attempt, or the
+    // last attempt failed) - a single "disconnected" glyph takes both
+    // icons' place instead, centered over the same two slots.
     const char* conn_url = plex_api_get_server_url();
     if (conn_url && conn_url[0]) {
-        if (plex_api_is_local_connection()) {
-            draw_icon_house(96, 17, 14, COL_TEXT_DIM);
+        if (!plex_api_is_connected()) {
+            draw_icon_disconnected(109, 17, 15, COL_TEXT_DIM);
         } else {
-            draw_icon_globe(96, 17, 14, COL_TEXT_DIM);
+            if (plex_api_is_local_connection()) {
+                draw_icon_house(96, 17, 14, COL_TEXT_DIM);
+            } else {
+                draw_icon_globe(96, 17, 14, COL_TEXT_DIM);
+            }
+            draw_icon_padlock(122, 17, 14, COL_TEXT_DIM, plex_api_is_https());
         }
-        draw_icon_padlock(122, 17, 14, COL_TEXT_DIM, plex_api_is_https());
     }
 
     // Top-Right HUD: Time, right-aligned. 12/24-hour format: the 3DS has a

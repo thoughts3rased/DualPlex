@@ -16,6 +16,15 @@ static char s_auth_token[128] = {0};
 static bool s_initialized = false;
 static PlexQualityTier s_quality_tier = QUALITY_MP3_320;  // Default: highest MP3
 
+// Whether the most recent plex_api_test_connection() call actually
+// succeeded - distinct from s_initialized, which just means plex_api_init()
+// was called with a non-empty server_url/token, regardless of whether
+// anything has answered back yet. Drives the top bar's connection-status
+// icons (see ui_render_top()): they show nothing useful before a
+// connection has actually been confirmed, so plex_api_is_connected()
+// gates them instead of just "is a server configured at all".
+static bool s_connected = false;
+
 // Cached result of the last DNS-backed local/remote classification (see
 // resolve_host_is_local_via_dns() and plex_api_test_connection() below).
 // Invalidated on every plex_api_init()/cleanup() so a stale answer from a
@@ -353,6 +362,7 @@ bool plex_api_init(const char* server_url, const char* auth_token) {
     }
 
     s_local_override_valid = false; // stale answer from a previous server
+    s_connected = false; // not yet confirmed against this server/token
     s_initialized = true;
     return true;
 }
@@ -362,6 +372,7 @@ void plex_api_cleanup(void) {
     s_server_url[0] = '\0';
     s_auth_token[0] = '\0';
     s_local_override_valid = false;
+    s_connected = false;
 }
 
 const char* plex_api_get_token(void) {
@@ -374,6 +385,10 @@ const char* plex_api_get_server_url(void) {
 
 bool plex_api_is_https(void) {
     return strncmp(s_server_url, "https://", 8) == 0;
+}
+
+bool plex_api_is_connected(void) {
+    return s_connected;
 }
 
 // Whether an IPv4 address starting with octets `a.b....` falls in a
@@ -474,7 +489,11 @@ bool plex_api_is_local_connection(void) {
     return false;
 }
 
-bool plex_api_test_connection(void) {
+// Does the actual work for plex_api_test_connection() below, which just
+// wraps this to also update s_connected (a single spot handling that
+// regardless of which of this function's several return points is hit,
+// rather than needing every one of them to remember to set it).
+static bool test_connection_impl(void) {
     // Resolve local-vs-remote once per connection attempt here rather than
     // from plex_api_is_local_connection() itself - that's called every
     // frame to draw the top-bar icon, and a plain hostname (the only case
@@ -537,6 +556,11 @@ bool plex_api_test_connection(void) {
     }
 
     return false;
+}
+
+bool plex_api_test_connection(void) {
+    s_connected = test_connection_impl();
+    return s_connected;
 }
 
 bool plex_api_create_pin(PlexPin* out_pin) {

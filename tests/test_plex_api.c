@@ -740,6 +740,19 @@ TEST(is_https_false_for_plain_http_input) {
     CHECK(!plex_api_is_https());
 }
 
+TEST(is_connected_false_until_a_connection_test_actually_runs) {
+    /* plex_api_is_connected() gates the top bar's connection-status icons
+     * (a single "disconnected" glyph replaces them otherwise) - it must
+     * default to false right after init(), not just whenever a server_url
+     * happens to be configured, since nothing has actually confirmed
+     * reachability yet at that point. plex_api_test_connection() itself
+     * needs live network to exercise for real (same reason it has no
+     * other unit coverage), so this only checks the state init() alone
+     * leaves behind. */
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_connected());
+}
+
 /* ================================================================== */
 
 int main(void) {
@@ -779,6 +792,7 @@ int main(void) {
     RUN(is_https_preserved_for_hostnames);
     RUN(is_https_downgraded_for_bare_ip_addresses);
     RUN(is_https_false_for_plain_http_input);
+    RUN(is_connected_false_until_a_connection_test_actually_runs);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {
