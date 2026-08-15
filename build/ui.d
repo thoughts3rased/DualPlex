@@ -115,7 +115,8 @@ ui.o: C:/Users/Samuel.Tong/Code/3ds-plex-client/source/ui.c \
  C:/Users/Samuel.Tong/Code/3ds-plex-client/source/plex_api.h \
  C:/Users/Samuel.Tong/Code/3ds-plex-client/source/audio_player.h \
  C:/Users/Samuel.Tong/Code/3ds-plex-client/source/album_art.h \
- C:/Users/Samuel.Tong/Code/3ds-plex-client/source/logger.h
+ C:/Users/Samuel.Tong/Code/3ds-plex-client/source/logger.h \
+ C:/Users/Samuel.Tong/Code/3ds-plex-client/build/iconfont_bin.h
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/ui.h:
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
@@ -233,3 +234,4 @@ C:/Users/Samuel.Tong/Code/3ds-plex-client/source/plex_api.h:
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/audio_player.h:
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/album_art.h:
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/logger.h:
+C:/Users/Samuel.Tong/Code/3ds-plex-client/build/iconfont_bin.h:

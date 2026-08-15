@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <time.h>
 
 #include "config.h"
 #include "plex_api.h"
@@ -22,7 +23,12 @@ static AppConfig app_config;
 int main(int argc, char* argv[]) {
     // Enable New 3DS 804MHz CPU Clock Speedup & L2 Cache
     osSetSpeedupEnable(true);
-    
+
+    // Seed rand() (used for shuffle) - without this it produces the exact
+    // same sequence every launch, since nothing else in the app called
+    // srand(). svcGetSystemTick() varies even if the RTC hasn't been set.
+    srand((unsigned int)(time(NULL) ^ svcGetSystemTick()));
+
     // Initialize services
     gfxInitDefault();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);

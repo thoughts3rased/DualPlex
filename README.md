@@ -43,7 +43,10 @@ auth_token=YOUR_PLEX_TOKEN
 - **L/R**: Cycle the top screen between Now Playing, Lyrics, and Visualizer views
 - **L+R together**: Toggle the live log viewer
 - **X**: Change visualizer style (while the Visualizer view is active)
+- **New 3DS C-Stick left/right**: Toggle shuffle / cycle repeat mode (off → all → one)
+- **New 3DS ZL/ZR**: Previous / next track
 - **Touch the progress bar** (Now Playing Controls, bottom screen): seek to that point in the track
+- **Now Playing Controls** (bottom screen) also has touch buttons for shuffle, prev, play/pause, next, and repeat
 - **START**: Exit application
 
 ## Project Structure
@@ -56,3 +59,7 @@ auth_token=YOUR_PLEX_TOKEN
 
 ## License
 MIT License.
+
+Playback control icons use [Font Awesome Free](https://fontawesome.com) 6.5.1 (solid style),
+licensed under the [SIL OFL 1.1](licenses/fontawesome-LICENSE.txt); only the handful of glyphs
+actually used are baked into `data/iconfont.bin` and linked directly into the binary.

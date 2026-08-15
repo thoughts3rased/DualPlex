@@ -514,6 +514,54 @@ TEST(parse_lyrics_stream_response_no_lyrics_present_returns_zero) {
     CHECK(count == 0);
 }
 
+/* Regression: instrumental breaks weren't being recognized. Root cause -
+ * Plex marks a known break as a Line entry with a timestamp but no Span at
+ * all (nothing to say), and the parser silently dropped any Line with no
+ * text, losing the marker instead of keeping it as an empty-text entry for
+ * find_active_lyric_line() (ui.c) to recognize. Captured live from PMS for
+ * Vantage - "Like I Like It", which has three such breaks. */
+TEST(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers) {
+    char* fixture = read_fixture("tests/fixtures/vantage_instrumental_break.json");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    PlexLyricLine lines[64];
+    int count = parse_lyrics_stream_response(fixture, lines, 64);
+    CHECK(count > 0);
+
+    /* The break markers themselves: timed, but with empty text. */
+    static const int break_starts[] = {31320, 79380, 159720};
+    for (size_t b = 0; b < sizeof(break_starts) / sizeof(break_starts[0]); b++) {
+        bool found = false;
+        for (int i = 0; i < count; i++) {
+            if (lines[i].time_ms == break_starts[b]) {
+                found = true;
+                CHECK_STR_EQ(lines[i].text, "");
+                break;
+            }
+        }
+        CHECK(found);
+    }
+
+    /* The real lines immediately flanking the first break must have survived
+     * parsing too - this isn't only about the marker itself. */
+    bool found_before = false, found_after = false;
+    for (int i = 0; i < count; i++) {
+        if (lines[i].time_ms == 27410) {
+            found_before = true;
+            CHECK_STR_EQ(lines[i].text, "Like I like it (like I like it)");
+        }
+        if (lines[i].time_ms == 63830) {
+            found_after = true;
+            CHECK_STR_EQ(lines[i].text, "A whole lot more than a little bit");
+        }
+    }
+    CHECK(found_before);
+    CHECK(found_after);
+
+    free(fixture);
+}
+
 /* ================================================================== */
 
 int main(void) {
@@ -539,6 +587,7 @@ int main(void) {
     RUN(parse_lyrics_stream_response_flat_array_fallback_shape);
     RUN(parse_lyrics_stream_response_raw_lrc_text_fallback_shape);
     RUN(parse_lyrics_stream_response_no_lyrics_present_returns_zero);
+    RUN(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {

@@ -17,7 +17,17 @@
 #define AUDIO_NUM_CHANNELS 2
 #define AUDIO_SAMPLES_PER_BUF 4096
 #define AUDIO_NUM_WAVE_BUFS 4
-#define AUDIO_RING_BUF_SIZE (256 * 1024)
+// How far ahead of playback the download is allowed to buffer compressed
+// audio. This is the main defense against mid-track stutter: dr_flac's
+// read callback (flac_read_proc) has to synchronously block the whole app
+// when the ring runs dry mid-decode (it can't return "try again later"
+// without falsely signaling end-of-stream - see flac_read_proc's comment).
+// High-bitrate FLAC (800kbps+ is common on well-ripped CDs) can outpace a
+// merely-adequate WiFi connection for stretches at a time; 256KB only banked
+// ~2.4s of headroom for an 847kbps track, too little margin for a real
+// network hiccup. 1MB banks ~9.7s for that same track and is trivial memory
+// for the New3DS FLAC direct-stream requires anyway.
+#define AUDIO_RING_BUF_SIZE (1024 * 1024)
 #define AUDIO_PCM_BUF_SIZE (AUDIO_SAMPLES_PER_BUF * AUDIO_NUM_CHANNELS * sizeof(s16))
 
 typedef struct {
@@ -174,10 +184,15 @@ static size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata
     size_t total = size * nmemb;
     size_t avail = ring_available_write();
     if (avail < total) {
-        if (avail > 0) {
-            ring_write((u8*)ptr, avail);
-            s_ring.total_downloaded += avail;
-        }
+        // Must not write any of this chunk before pausing: CURL_WRITEFUNC_PAUSE
+        // tells curl this callback consumed zero bytes, so it redelivers the
+        // exact same chunk in full once resumed. Writing part of it now (the
+        // old behavior) meant those bytes got written a second time on
+        // redelivery - duplicating a segment of the compressed stream, which
+        // desyncs the decoder's frame alignment. It resyncs by skipping
+        // forward to the next valid frame, silently dropping real audio in
+        // the process - audible as small chunks of the song missing, and the
+        // whole track finishing early since less content actually got decoded.
         s_curl_paused = true;
         return CURL_WRITEFUNC_PAUSE;
     }
@@ -216,10 +231,8 @@ static size_t prefetch_curl_write_cb(void* ptr, size_t size, size_t nmemb, void*
     size_t total = size * nmemb;
     size_t avail = prefetch_ring_available_write();
     if (avail < total) {
-        if (avail > 0) {
-            prefetch_ring_write((u8*)ptr, avail);
-            s_prefetch_ring.total_downloaded += avail;
-        }
+        // See curl_write_cb()'s comment - must not write any of this chunk
+        // before pausing, or the redelivered chunk duplicates it on resume.
         s_prefetch_curl_paused = true;
         return CURL_WRITEFUNC_PAUSE;
     }

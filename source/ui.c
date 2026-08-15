@@ -3,6 +3,7 @@
 #include "audio_player.h"
 #include "album_art.h"
 #include "logger.h"
+#include "iconfont_bin.h" // bundled Font Awesome Free icon font (SIL OFL 1.1, see licenses/fontawesome-LICENSE.txt), embedded via bin2s from data/iconfont.bin
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,11 +68,29 @@ static bool s_is_lazy_loading = false;
 static char s_current_title[PLEX_MAX_STR] = "";
 static int s_current_track_idx = -1;
 static bool s_auto_advance = true;
+
+// Shuffle/repeat playback state.
+static bool s_shuffle_enabled = false;
+typedef enum { REPEAT_OFF, REPEAT_ALL, REPEAT_ONE, REPEAT_MODE_COUNT } RepeatMode;
+static RepeatMode s_repeat_mode = REPEAT_OFF;
+// Shuffle has no well-defined "previous" (it's random), so Prev instead
+// steps back through actual play history built up as shuffle advances -
+// pushed to in play_next_track(), popped in play_prev_track().
+#define SHUFFLE_HISTORY_MAX 32
+static int s_shuffle_history[SHUFFLE_HISTORY_MAX];
+static int s_shuffle_history_count = 0;
 // Index of the track to prefetch once it's safe to do so (-1 = none pending).
 // Some Plex servers only permit one concurrent transcode session, so we hold
 // off starting the next track's prefetch until the current track's own
 // stream has finished downloading - see audio_player_is_download_finished().
 static int s_pending_prefetch_idx = -1;
+// Track index the currently in-flight/ready prefetch buffer actually holds
+// (-1 = none). audio_player_is_prefetch_ready() only reports "is there a
+// prefetched buffer", not which track it's for - without checking this too,
+// jumping ahead in the queue (e.g. skipping past the natural next track)
+// would activate that stale next-track prefetch as if it were the track the
+// user actually picked, playing the wrong audio under the right metadata.
+static int s_prefetch_track_idx = -1;
 
 // Top-screen view mode, cycled with L/R (see ui_update()).
 typedef enum {
@@ -110,6 +129,16 @@ static u32 s_status_color = COL_TEXT_DIM;
 #define PLEX_MAX_LYRICS 64
 static PlexLyricLine s_lyrics[PLEX_MAX_LYRICS];
 static int s_num_lyrics = 0;
+// Smoothly-animated scroll position for the lyrics views, shared by both
+// (top-screen and bottom-screen) since they represent the same underlying
+// state. Eases toward find_scroll_anchor_line()'s target each frame instead
+// of snapping straight to it. s_lyrics_scroll_gen tracks which "set" of
+// lyrics (i.e. which track) the animated position belongs to, so loading a
+// new track's lyrics snaps instantly instead of visibly sliding from the
+// old song's line index to the new one's.
+static float s_lyrics_scroll_pos = 0.0f;
+static int s_lyrics_scroll_gen = -1;
+static int s_lyrics_load_id = 0; // bumped each time a new track's lyrics are loaded
 
 // Live Log Viewer Overlay
 static bool s_show_logs = false;
@@ -117,12 +146,19 @@ static int s_log_scroll_offset = 0;
 
 void ui_init(void) {
     s_text_buf = C2D_TextBufNew(8192);
-    s_font = NULL;
+    s_font = C2D_FontLoadFromMem(iconfont_bin, iconfont_bin_size);
+    if (!s_font) {
+        LOG_ERROR("Failed to load bundled icon font - playback icons will not render");
+    }
     album_art_init();
     LOG_INFO("UI system initialized");
 }
 
 void ui_cleanup(void) {
+    if (s_font) {
+        C2D_FontFree(s_font);
+        s_font = NULL;
+    }
     album_art_cleanup();
     C2D_TextBufDelete(s_text_buf);
     LOG_INFO("UI system cleaned up");
@@ -255,28 +291,36 @@ static void draw_scrolling_text(const char* str, float x, float y, float max_w, 
     }
 }
 
-static void draw_text_wrapped(const char* str, float start_y, float max_width, float max_height, float scaleX, float scaleY, u32 color) {
-    if (!str || !str[0]) return;
-    
+// Word-wraps str to fit within max_width, drawing each resulting row centered
+// within [region_x, region_x+max_width] and stopping once max_height is
+// used up (rows that would overflow it are simply not drawn, rather than
+// spilling past the caller's box). Returns how many rows were actually
+// drawn (0 if str is empty or nothing fit) so callers stacking multiple
+// wrapped blocks - e.g. lyric lines - can advance by the real height instead
+// of assuming a fixed one-line height and overlapping the next block.
+static int draw_text_wrapped_at(const char* str, float region_x, float start_y, float max_width, float max_height, float scaleX, float scaleY, u32 color) {
+    if (!str || !str[0]) return 0;
+
     char clean[512];
     strncpy(clean, str, sizeof(clean) - 1);
     clean[sizeof(clean) - 1] = '\0';
     for (int i = 0; clean[i]; i++) {
         if (clean[i] == '\n' || clean[i] == '\r' || clean[i] == '\t') clean[i] = ' ';
     }
-    
+
     char line[128] = "";
     char word[64] = "";
     float cur_y = start_y;
     float line_h = 20.0f * scaleY;
-    
+    int rows = 0;
+
     const char* p = clean;
     while (*p && (cur_y + line_h <= start_y + max_height)) {
         while (*p == ' ') p++;
         if (!*p) break;
-        
+
         int wlen = 0;
-        while (*p && *p != ' ' && wlen < sizeof(word) - 1) {
+        while (*p && *p != ' ' && wlen < (int)sizeof(word) - 1) {
             word[wlen++] = *p++;
         }
         word[wlen] = '\0';
@@ -287,24 +331,29 @@ static void draw_text_wrapped(const char* str, float start_y, float max_width, f
         } else {
             snprintf(test, sizeof(test), "%s %s", line, word);
         }
-        
+
         C2D_Text txt;
         C2D_TextParse(&txt, s_text_buf, test);
         C2D_TextOptimize(&txt);
         float tw, th;
         C2D_TextGetDimensions(&txt, scaleX, scaleY, &tw, &th);
-        
+
         if (tw > max_width && line[0] != '\0') {
-            draw_text_centered(line, cur_y, TOP_WIDTH, scaleX, scaleY, color);
+            draw_text_centered_at(line, region_x, cur_y, max_width, scaleX, scaleY, color);
+            rows++;
             cur_y += line_h;
             strncpy(line, word, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
         } else {
             strncpy(line, test, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
         }
     }
     if (line[0] != '\0' && (cur_y + line_h <= start_y + max_height)) {
-        draw_text_centered(line, cur_y, TOP_WIDTH, scaleX, scaleY, color);
+        draw_text_centered_at(line, region_x, cur_y, max_width, scaleX, scaleY, color);
+        rows++;
     }
+    return rows;
 }
 
 static float s_spinner_angle = 0.0f;
@@ -330,12 +379,107 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
     }
 }
 
+// --- Playback control icons -------------------------------------------
+// Rendered from a bundled icon font (Font Awesome Free 6.5.1, solid style;
+// SIL OFL 1.1, see licenses/fontawesome-LICENSE.txt) rather than plain
+// Unicode symbols (▶ ⏸ ⏭ etc.) or emoji, since the console's system font
+// has no glyphs for those and falls back to "?" - same issue as the
+// pre-existing "⚡" charging indicator and "◀" back arrow elsewhere in this
+// file (left as hand-drawn shapes; not part of this icon set).
+// Only the specific glyphs actually used are baked into the .bcfnt
+// (data/iconfont.bin, embedded directly into the binary - see the Makefile's
+// bin2o rule - so no RomFS is needed to ship it).
+#define ICON_CP_PLAY           0xF04B
+#define ICON_CP_PAUSE          0xF04C
+#define ICON_CP_BACKWARD_STEP  0xF048
+#define ICON_CP_FORWARD_STEP   0xF051
+#define ICON_CP_SHUFFLE        0xF074
+#define ICON_CP_REPEAT         0xF363
+
+// Every codepoint above sits in Font Awesome's Private Use Area, always a
+// 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
+// embedding raw UTF-8 bytes as source literals, so the codepoint value stays
+// self-evident and nothing depends on this file's saved encoding.
+static void utf8_encode_icon(u32 cp, char* out) {
+    out[0] = (char)(0xE0 | ((cp >> 12) & 0x0F));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));
+    out[3] = '\0';
+}
+
+// Shared renderer for the icon-font glyphs above, centered on (cx, cy) and
+// scaled so the glyph is roughly `size` pixels tall (the font was baked at
+// 24px). Falls back to nothing drawn if the bundled font failed to load.
+static void draw_icon_glyph(u32 codepoint, float cx, float cy, float size, u32 color) {
+    if (!s_font) return;
+    char utf8[4];
+    utf8_encode_icon(codepoint, utf8);
+    C2D_Text text;
+    C2D_TextFontParse(&text, s_font, s_text_buf, utf8);
+    C2D_TextOptimize(&text);
+    float scale = size / 24.0f;
+    float w, h;
+    C2D_TextGetDimensions(&text, scale, scale, &w, &h);
+    C2D_DrawText(&text, C2D_WithColor, cx - w / 2.0f, cy - h / 2.0f, 0.5f, scale, scale, color);
+}
+
+static void draw_icon_play(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_PLAY, cx, cy, size, color);
+}
+
+static void draw_icon_pause(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_PAUSE, cx, cy, size, color);
+}
+
+static void draw_icon_skip_next(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_FORWARD_STEP, cx, cy, size, color);
+}
+
+static void draw_icon_skip_prev(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_BACKWARD_STEP, cx, cy, size, color);
+}
+
+static void draw_icon_shuffle(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_SHUFFLE, cx, cy, size, color);
+}
+
+// Font Awesome's free set has no distinct "repeat-one" glyph, so repeat-one
+// draws the regular repeat glyph with a small "1" (baked into the same font)
+// beside it, same idea as the previous hand-drawn version.
+static void draw_icon_repeat(float cx, float cy, float size, u32 color, bool repeat_one) {
+    if (repeat_one) {
+        draw_icon_glyph(ICON_CP_REPEAT, cx - size * 0.22f, cy, size * 0.9f, color);
+        if (s_font) {
+            char utf8[4];
+            utf8_encode_icon('1', utf8);
+            C2D_Text text;
+            C2D_TextFontParse(&text, s_font, s_text_buf, utf8);
+            C2D_TextOptimize(&text);
+            float scale = (size * 0.5f) / 24.0f;
+            float w, h;
+            C2D_TextGetDimensions(&text, scale, scale, &w, &h);
+            float gx = cx + size * 0.42f, gy = cy + size * 0.12f;
+            C2D_DrawText(&text, C2D_WithColor, gx - w / 2.0f, gy - h / 2.0f, 0.5f, scale, scale, color);
+        }
+    } else {
+        draw_icon_glyph(ICON_CP_REPEAT, cx, cy, size, color);
+    }
+}
+
+static void draw_icon_back_arrow(float cx, float cy, float size, u32 color) {
+    float h = size, w = size * 0.85f;
+    C2D_DrawTriangle(cx + w * 0.4f, cy - h * 0.5f, color,
+                      cx + w * 0.4f, cy + h * 0.5f, color,
+                      cx - w * 0.6f, cy, color, 0.5f);
+}
+
 static void draw_header(const char* title) {
     C2D_DrawRectSolid(0, 0, 0.5f, BTM_WIDTH, 40, COL_SURFACE);
     C2D_DrawRectSolid(0, 40, 0.5f, BTM_WIDTH, 2, COL_ACCENT);
     draw_text(title, 8, 10, 0.6f, 0.6f, COL_TEXT);
     if (s_screen != SCREEN_SETUP && s_screen != SCREEN_LIBRARIES) {
-        draw_text("\xE2\x97\x80 B: Back", BTM_WIDTH - 80, 12, 0.45f, 0.45f, COL_TEXT_DIM);
+        draw_icon_back_arrow(BTM_WIDTH - 78, 18, 10, COL_TEXT_DIM);
+        draw_text("B: Back", BTM_WIDTH - 68, 12, 0.45f, 0.45f, COL_TEXT_DIM);
     }
 }
 
@@ -421,17 +565,126 @@ static void format_quality_tag(const PlexTrack* track, char* buf, size_t max) {
     snprintf(buf, max, "[%s]", codec_str);
 }
 
-// Index into s_lyrics of the line active at pos_ms, or 0 if there are none/
-// none have started yet. Shared by the bottom-screen Lyrics screen and the
-// top-screen Lyrics view.
-static int find_current_lyric_line(int pos_ms) {
-    int current_line = 0;
+// Index of the lyric line whose timestamp has most recently passed - used to
+// anchor the scroll position, so the view stays parked near the last-sung
+// line through gaps rather than jumping around. Always returns a valid
+// index once there's any lyric data (clamped to line 0 before the first
+// line's timestamp), including during instrumental breaks - see
+// find_active_lyric_line() below for whether anything should actually be
+// *highlighted* right now, which is a different question.
+static int find_scroll_anchor_line(int pos_ms) {
+    int line = 0;
     for (int i = 0; i < s_num_lyrics; i++) {
         if (pos_ms >= s_lyrics[i].time_ms) {
-            current_line = i;
+            line = i;
         }
     }
-    return current_line;
+    return line;
+}
+
+// Longest an instrumental gap is allowed to hold a line's highlight before
+// it's treated as "nothing is actually being sung right now". LRC only
+// gives each line a start time, not a duration, so there's no exact way to
+// know when a line's vocal actually ends - this is a reasonable upper bound
+// on how long one line takes to sing. Covers both a long intro before the
+// first line, and mid-song instrumental breaks.
+#define LYRIC_MAX_HOLD_MS 6000
+
+// Index of the lyric line that should be shown as "currently playing" right
+// now, or -1 if none should be (before the first line starts, or deep into
+// an instrumental break between two lines).
+static int find_active_lyric_line(int pos_ms) {
+    if (s_num_lyrics == 0 || pos_ms < s_lyrics[0].time_ms) return -1;
+
+    int line = find_scroll_anchor_line(pos_ms);
+
+    // Plex marks known instrumental breaks explicitly: a timed entry with no
+    // text (see parse_lyrics_stream_response()'s comment on Line/Span). When
+    // one's present, trust it outright instead of guessing from timing - it's
+    // exact, where the fallback below is not.
+    if (s_lyrics[line].text[0] == '\0') return -1;
+
+    // Fallback for lines/providers with no explicit break marker: LRC only
+    // gives each line a start time, not a duration, so infer a break from an
+    // unusually long gap to the next real line instead.
+    int line_start = s_lyrics[line].time_ms;
+    int next_start = (line + 1 < s_num_lyrics) ? s_lyrics[line + 1].time_ms : -1;
+    int gap = (next_start >= 0) ? (next_start - line_start) : -1;
+
+    // gap < 0 means this is the last line (always held till the song ends);
+    // gap <= the grace window means a normal line-to-line handoff, held
+    // exactly until the next line as before. Only a long gap that's been
+    // running longer than the grace window clears the highlight.
+    if (gap >= 0 && gap > LYRIC_MAX_HOLD_MS && (pos_ms - line_start) > LYRIC_MAX_HOLD_MS) {
+        return -1;
+    }
+    return line;
+}
+
+static u32 lerp_color(u32 c1, u32 c2, float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    u8 r1 = c1 & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = (c1 >> 16) & 0xFF, a1 = (c1 >> 24) & 0xFF;
+    u8 r2 = c2 & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = (c2 >> 16) & 0xFF, a2 = (c2 >> 24) & 0xFF;
+    u8 r = (u8)(r1 + (r2 - r1) * t);
+    u8 g = (u8)(g1 + (g2 - g1) * t);
+    u8 b = (u8)(b1 + (b2 - b1) * t);
+    u8 a = (u8)(a1 + (a2 - a1) * t);
+    return RGBA8(r, g, b, a);
+}
+
+// Advances the shared smooth-scroll position toward target_line, snapping
+// instantly instead if the lyrics were (re)loaded since the last call - a
+// newly-loaded track's lyrics shouldn't visibly slide in from the old
+// song's line index.
+static float update_lyrics_scroll(int target_line) {
+    if (s_lyrics_scroll_gen != s_lyrics_load_id) {
+        s_lyrics_scroll_pos = (float)target_line;
+        s_lyrics_scroll_gen = s_lyrics_load_id;
+    } else {
+        s_lyrics_scroll_pos += ((float)target_line - s_lyrics_scroll_pos) * 0.2f;
+    }
+    return s_lyrics_scroll_pos;
+}
+
+// Draws a scrolling, smoothly-sliding window of lyric lines around the
+// current position, instead of the line-to-line hard snap this used to do.
+// half_window lines are shown above and below center. Each line's font size
+// and color blend continuously between dim_scale/dim_col (at rest) and
+// active_scale/active_col (exactly at the highlighted line) based on how
+// close it is to center - so a line grows/brightens in as it becomes
+// current and shrinks/dims back out as it's passed, rather than the size
+// and color also hard-snapping alongside the position.
+static void draw_lyrics_block(int pos_ms, float region_x, float base_y, float width, float row_h, int half_window,
+                               float active_scale, float dim_scale, u32 active_col, u32 dim_col) {
+    if (s_num_lyrics == 0) return;
+
+    int anchor = find_scroll_anchor_line(pos_ms);
+    int active = find_active_lyric_line(pos_ms);
+    float center = update_lyrics_scroll(anchor);
+
+    int lo = (int)floorf(center) - half_window - 1;
+    int hi = (int)ceilf(center) + half_window + 1;
+    for (int i = lo; i <= hi; i++) {
+        if (i < 0 || i >= s_num_lyrics) continue;
+
+        float rel = (float)i - center;
+        if (rel < -half_window || rel > half_window) continue;
+        float ly = base_y + (rel + half_window) * row_h;
+
+        // Only the line that's genuinely active right now (not just nearest
+        // to the scroll center - see find_active_lyric_line()) blends toward
+        // the highlighted style. During an instrumental break, active is -1
+        // and every line renders at rest, even the one parked at center.
+        float t = 1.0f - fabsf(rel);
+        if (t < 0.0f) t = 0.0f;
+        float active_t = (i == active) ? t : 0.0f;
+
+        float scale = dim_scale + (active_scale - dim_scale) * active_t;
+        u32 col = lerp_color(dim_col, active_col, active_t);
+
+        draw_text_wrapped_at(s_lyrics[i].text, region_x, ly, width, row_h * 1.4f, scale, scale, col);
+    }
 }
 
 static bool show_keyboard(const char* hint, char* buf, size_t buf_size) {
@@ -441,6 +694,43 @@ static bool show_keyboard(const char* hint, char* buf, size_t buf_size) {
     swkbdSetInitialText(&swkbd, buf);
     SwkbdButton button = swkbdInputText(&swkbd, buf, buf_size);
     return (button != SWKBD_BUTTON_NONE && button != SWKBD_BUTTON_LEFT);
+}
+
+static void shuffle_history_push(int idx) {
+    if (s_shuffle_history_count >= SHUFFLE_HISTORY_MAX) {
+        memmove(s_shuffle_history, s_shuffle_history + 1, (SHUFFLE_HISTORY_MAX - 1) * sizeof(int));
+        s_shuffle_history_count = SHUFFLE_HISTORY_MAX - 1;
+    }
+    s_shuffle_history[s_shuffle_history_count++] = idx;
+}
+
+// Track to advance to going forward from s_current_track_idx, respecting
+// shuffle and repeat. -1 means stop (end of queue, repeat off).
+static int compute_next_track_idx(void) {
+    if (s_num_tracks == 0) return -1;
+    if (s_repeat_mode == REPEAT_ONE) return s_current_track_idx;
+
+    if (s_shuffle_enabled) {
+        if (s_num_tracks == 1) return s_current_track_idx;
+        int idx, tries = 0;
+        do {
+            idx = rand() % s_num_tracks;
+        } while (idx == s_current_track_idx && ++tries < 20);
+        return idx;
+    }
+
+    if (s_current_track_idx + 1 < s_num_tracks) return s_current_track_idx + 1;
+    if (s_repeat_mode == REPEAT_ALL) return 0;
+    return -1;
+}
+
+// Track to go back to (linear order / repeat-all wrap only - shuffle mode
+// instead steps back through s_shuffle_history, handled in play_prev_track()
+// since that needs to pop the stack, not just read it).
+static int compute_prev_track_idx(void) {
+    if (s_current_track_idx > 0) return s_current_track_idx - 1;
+    if (s_repeat_mode == REPEAT_ALL && s_num_tracks > 0) return s_num_tracks - 1;
+    return -1;
 }
 
 static void play_track(int idx) {
@@ -463,8 +753,12 @@ static void play_track(int idx) {
         }
     }
     
-    // Try seamless transition via prefetch
-    if (audio_player_is_prefetch_ready()) {
+    // Try seamless transition via prefetch - only if the buffered prefetch is
+    // actually for the track being requested (it's always started for
+    // whatever was the natural next track at the time; jumping ahead in the
+    // queue past that must fall through to a fresh load below instead of
+    // playing the wrong, already-buffered track under idx's metadata).
+    if (idx == s_prefetch_track_idx && audio_player_is_prefetch_ready()) {
         // Build the URL we'd use for this track to compare with prefetch
         if (plex_api_get_stream_url(&s_tracks[idx], url, sizeof(url))) {
             // Activate the prefetch (it becomes the main stream)
@@ -487,16 +781,24 @@ static void play_track(int idx) {
 
                 // Defer prefetching the NEXT track until this one's stream has
                 // finished downloading (see s_pending_prefetch_idx above).
-                s_pending_prefetch_idx = (idx + 1 < s_num_tracks) ? (idx + 1) : -1;
+                // In shuffle mode this is only a *prediction* (the real pick
+                // happens again, independently, when we actually advance) -
+                // if it doesn't match, the prefetch just goes unused rather
+                // than being played (see play_track()'s prefetch-index check
+                // above), so a mismatch costs bandwidth, not correctness.
+                s_pending_prefetch_idx = compute_next_track_idx();
                 return;  // Done - seamless transition complete
             }
         }
     }
     
-    // Normal path: no prefetch available, load from scratch
+    // Normal path: no prefetch available (or it was for a different track),
+    // load from scratch. audio_player_load_url() cancels any prefetch in
+    // flight, so that buffer - if any - is no longer valid for anything.
     if (plex_api_get_stream_url(&s_tracks[idx], url, sizeof(url))) {
         audio_player_set_duration(s_tracks[idx].duration);
         audio_player_load_url(url);
+        s_prefetch_track_idx = -1;
         s_current_track_idx = idx;
         s_auto_advance = true;
         
@@ -514,9 +816,41 @@ static void play_track(int idx) {
         plex_api_lyrics_async_start(s_tracks[idx].rating_key);
 
         // Defer prefetching the NEXT track until this one's stream has
-        // finished downloading (see s_pending_prefetch_idx above).
-        s_pending_prefetch_idx = (idx + 1 < s_num_tracks) ? (idx + 1) : -1;
+        // finished downloading (see s_pending_prefetch_idx above). In shuffle
+        // mode this is only a prediction - see the comment on the identical
+        // line above in the seamless-transition branch.
+        s_pending_prefetch_idx = compute_next_track_idx();
     }
+}
+
+// Advances to the next track per compute_next_track_idx() (shuffle/repeat
+// aware). Returns false if there's nowhere to go (end of queue, repeat off) -
+// caller decides what that means (stop vs. leave as-is).
+static bool play_next_track(void) {
+    if (s_current_track_idx < 0) return false;
+    int next = compute_next_track_idx();
+    if (next < 0) return false;
+    if (s_shuffle_enabled && next != s_current_track_idx) {
+        shuffle_history_push(s_current_track_idx);
+    }
+    play_track(next);
+    return true;
+}
+
+// Goes back a track: in shuffle mode, pops actual play history (shuffle has
+// no well-defined "previous" otherwise); linear mode just steps back by one
+// (or wraps to the last track under repeat-all). Returns false if there's
+// nowhere to go.
+static bool play_prev_track(void) {
+    if (s_current_track_idx < 0) return false;
+    if (s_shuffle_enabled && s_shuffle_history_count > 0) {
+        play_track(s_shuffle_history[--s_shuffle_history_count]);
+        return true;
+    }
+    int prev = compute_prev_track_idx();
+    if (prev < 0) return false;
+    play_track(prev);
+    return true;
 }
 
 // Seeks the currently-playing track to target_ms by reloading its stream from
@@ -534,7 +868,8 @@ static void seek_to(int target_ms) {
     if (!plex_api_get_seek_url(track, target_ms, url, sizeof(url))) return;
 
     audio_player_set_duration(track->duration);
-    audio_player_load_url(url);
+    audio_player_load_url(url); // cancels any in-flight prefetch
+    s_prefetch_track_idx = -1;
     audio_player_set_position_offset_ms(target_ms);
     s_auto_advance = true;
 
@@ -550,6 +885,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     plex_api_lyrics_async_update();
     if (plex_api_lyrics_async_is_done()) {
         s_num_lyrics = plex_api_lyrics_async_take_result(s_lyrics, PLEX_MAX_LYRICS);
+        s_lyrics_load_id++;
     }
 
     // Toggle live log viewer overlay with L + R combo
@@ -621,10 +957,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     if (s_pending_prefetch_idx >= 0 && audio_player_is_download_finished()) {
         int next_idx = s_pending_prefetch_idx;
         s_pending_prefetch_idx = -1;
+        s_prefetch_track_idx = -1;
         if (next_idx < s_num_tracks) {
             char next_url[PLEX_MAX_URL];
             if (plex_api_get_stream_url(&s_tracks[next_idx], next_url, sizeof(next_url))) {
                 audio_player_prefetch_url(next_url);
+                s_prefetch_track_idx = next_idx;
             }
         }
     }
@@ -652,24 +990,25 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
     
     if (pstate == PLAYER_ERROR && s_current_track_idx >= 0) {
-        LOG_WARN("Track %d (%s) encountered stream error (HTTP 400). Skipping...", 
+        LOG_WARN("Track %d (%s) encountered stream error (HTTP 400). Skipping...",
             s_current_track_idx + 1, s_tracks[s_current_track_idx].title);
         snprintf(s_status_msg, sizeof(s_status_msg), "Track %d failed (HTTP 400). Skipping...", s_current_track_idx + 1);
         s_status_color = COL_ERROR;
-        
+
         plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
-        
-        if (s_auto_advance && s_current_track_idx + 1 < s_num_tracks) {
-            play_track(s_current_track_idx + 1);
-        } else {
+
+        if (!s_auto_advance || !play_next_track()) {
             s_auto_advance = false;
             s_current_track_idx = -1;
             audio_player_stop();
         }
     } else if (pstate == PLAYER_STOPPED && s_current_track_idx >= 0 && s_auto_advance) {
-        if (audio_player_get_position_ms() > 1000 && s_current_track_idx + 1 < s_num_tracks) {
+        if (audio_player_get_position_ms() > 1000) {
             plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", s_tracks[s_current_track_idx].duration, s_tracks[s_current_track_idx].duration);
-            play_track(s_current_track_idx + 1);
+            if (!play_next_track()) {
+                s_auto_advance = false;
+                s_current_track_idx = -1;
+            }
         } else {
             s_auto_advance = false;
             s_current_track_idx = -1;
@@ -687,14 +1026,10 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // New 3DS ZL / ZR Track Navigation Triggers
     if (kDown & KEY_ZR) {
-        if (s_current_track_idx + 1 < s_num_tracks) {
-            play_track(s_current_track_idx + 1);
-        }
+        play_next_track();
     }
     if (kDown & KEY_ZL) {
-        if (s_current_track_idx > 0) {
-            play_track(s_current_track_idx - 1);
-        }
+        play_prev_track();
     }
 
     // L/R alone cycle the top-screen view (Now Playing / Lyrics / Visualizer).
@@ -723,6 +1058,15 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             s_selected_idx++;
             if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
         }
+    }
+    // New 3DS C-Stick shortcuts for shuffle/repeat (also reachable via touch
+    // on the Now Playing Controls screen - see its input handler below).
+    if (kDown & KEY_CSTICK_LEFT) {
+        s_shuffle_enabled = !s_shuffle_enabled;
+        s_shuffle_history_count = 0; // stale once shuffle state changes
+    }
+    if (kDown & KEY_CSTICK_RIGHT) {
+        s_repeat_mode = (RepeatMode)((s_repeat_mode + 1) % REPEAT_MODE_COUNT);
     }
     if (kDown & KEY_Y) {
         audio_player_toggle();
@@ -759,14 +1103,21 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 if (frac > 1.0f) frac = 1.0f;
                 seek_to((int)(frac * s_tracks[s_current_track_idx].duration));
             }
-            else if (touch.px >= 20 && touch.px <= 105 && touch.py >= 108 && touch.py <= 153) {
-                if (s_current_track_idx > 0) play_track(s_current_track_idx - 1);
+            else if (touch.px >= 15 && touch.px <= 60 && touch.py >= 108 && touch.py <= 153) {
+                s_shuffle_enabled = !s_shuffle_enabled;
+                s_shuffle_history_count = 0;
             }
-            else if (touch.px >= 115 && touch.px <= 205 && touch.py >= 103 && touch.py <= 158) {
+            else if (touch.px >= 65 && touch.px <= 120 && touch.py >= 108 && touch.py <= 153) {
+                play_prev_track();
+            }
+            else if (touch.px >= 125 && touch.px <= 195 && touch.py >= 103 && touch.py <= 158) {
                 audio_player_toggle();
             }
-            else if (touch.px >= 215 && touch.px <= 300 && touch.py >= 108 && touch.py <= 153) {
-                if (s_current_track_idx + 1 < s_num_tracks) play_track(s_current_track_idx + 1);
+            else if (touch.px >= 200 && touch.px <= 255 && touch.py >= 108 && touch.py <= 153) {
+                play_next_track();
+            }
+            else if (touch.px >= 260 && touch.px <= 305 && touch.py >= 108 && touch.py <= 153) {
+                s_repeat_mode = (RepeatMode)((s_repeat_mode + 1) % REPEAT_MODE_COUNT);
             }
             else if (touch.px >= 20 && touch.px <= 155 && touch.py >= 168 && touch.py <= 213) {
                 ui_set_screen(SCREEN_QUEUE);
@@ -1288,17 +1639,9 @@ static void draw_top_lyrics(PlexTrack* track, PlayerState state) {
         return;
     }
 
-    int current_line = find_current_lyric_line(pos_ms);
-    float ly = 55;
-    for (int i = current_line - 3; i <= current_line + 3; i++) {
-        if (i >= 0 && i < s_num_lyrics) {
-            bool is_current = (i == current_line);
-            u32 lcol = is_current ? COL_ACCENT : COL_TEXT_DIM;
-            float lscale = is_current ? 0.55f : 0.4f;
-            draw_text_centered_at(s_lyrics[i].text, lyr_x, ly, lyr_w, lscale, lscale, lcol);
-        }
-        ly += 24;
-    }
+    // base_y=42, half_window=3, row_h=26 -> spans 42 to 198, with margin
+    // clear of both the divider above and the "L/R: Change View" hint below.
+    draw_lyrics_block(pos_ms, lyr_x, 42, lyr_w, 26.0f, 3, 0.55f, 0.4f, COL_ACCENT, COL_TEXT_DIM);
 }
 
 // Track details in small text at top, visualizer filling the rest.
@@ -1580,20 +1923,33 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
             draw_text_centered("No track playing", 65, BTM_WIDTH, 0.6f, 0.6f, COL_TEXT_DIM);
         }
 
-        // Large Playback Buttons: [ Prev ]  [ Play/Pause ]  [ Next ]
-        C2D_DrawRectSolid(20, 113, 0.5f, 85, 38, COL_SURFACE);
-        draw_text_centered("<< Prev", 124, 125, 0.5f, 0.5f, COL_TEXT);
+        // Playback Buttons: [ Shuffle ] [ Prev ] [ Play/Pause ] [ Next ] [ Repeat ]
+        // Icon-only (no text labels) using drawn shapes, not Unicode symbols -
+        // see the icon functions' comment above draw_header().
+        u32 dark_icon = C2D_Color32(0x12, 0x12, 0x18, 0xFF);
+
+        C2D_DrawRectSolid(15, 108, 0.5f, 45, 45, s_shuffle_enabled ? COL_ACCENT : COL_SURFACE);
+        draw_icon_shuffle(37, 130, 18, s_shuffle_enabled ? dark_icon : COL_TEXT_DIM);
+
+        C2D_DrawRectSolid(65, 108, 0.5f, 55, 45, COL_SURFACE);
+        draw_icon_skip_prev(92, 130, 20, COL_TEXT);
 
         PlayerState pbtn_state = audio_player_get_state();
-        C2D_DrawRectSolid(115, 108, 0.5f, 90, 48, pbtn_state == PLAYER_LOADING ? COL_WARN : COL_ACCENT);
-        const char* pstr = (pbtn_state == PLAYER_PLAYING) ? "Pause" : (pbtn_state == PLAYER_LOADING ? "Buffering" : "Play");
-        draw_text_centered(pstr, 122, 320, 0.6f, 0.6f, C2D_Color32(0x12, 0x12, 0x18, 0xFF));
-        if (pbtn_state == PLAYER_LOADING) {
-            draw_loading_spinner(115 + 90 - 16, 108 + 10, 8, NULL);
+        C2D_DrawRectSolid(125, 103, 0.5f, 70, 55, pbtn_state == PLAYER_LOADING ? COL_WARN : COL_ACCENT);
+        if (pbtn_state == PLAYER_PLAYING) {
+            draw_icon_pause(160, 130, 22, dark_icon);
+        } else if (pbtn_state == PLAYER_LOADING) {
+            draw_loading_spinner(160, 130, 14, NULL);
+        } else {
+            draw_icon_play(160, 130, 22, dark_icon);
         }
 
-        C2D_DrawRectSolid(215, 113, 0.5f, 85, 38, COL_SURFACE);
-        draw_text_centered("Next >>", 124, 515, 0.5f, 0.5f, COL_TEXT);
+        C2D_DrawRectSolid(200, 108, 0.5f, 55, 45, COL_SURFACE);
+        draw_icon_skip_next(227, 130, 20, COL_TEXT);
+
+        C2D_DrawRectSolid(260, 108, 0.5f, 45, 45, s_repeat_mode != REPEAT_OFF ? COL_ACCENT : COL_SURFACE);
+        draw_icon_repeat(282, 130, 20, s_repeat_mode != REPEAT_OFF ? dark_icon : COL_TEXT_DIM,
+                          s_repeat_mode == REPEAT_ONE);
 
         // Lower Navigation Buttons: [ Up Next Queue ]  [ Synced Lyrics ]
         C2D_DrawRectSolid(20, 173, 0.5f, 135, 38, COL_HIGHLIGHT);
@@ -1628,17 +1984,9 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
     } else if (s_screen == SCREEN_LYRICS) {
         draw_header("Time-Synced Lyrics");
         int pos_ms = audio_player_get_position_ms();
-        int current_line = find_current_lyric_line(pos_ms);
-
-        float ly = 60;
-        for (int i = current_line - 2; i <= current_line + 2; i++) {
-            if (i >= 0 && i < s_num_lyrics) {
-                u32 lcol = (i == current_line) ? COL_ACCENT : COL_TEXT_DIM;
-                float lscale = (i == current_line) ? 0.65f : 0.45f;
-                draw_text_centered(s_lyrics[i].text, ly, BTM_WIDTH, lscale, lscale, lcol);
-            }
-            ly += 30;
-        }
+        // Fills the header-to-bottom column height: base_y=44, half_window=3,
+        // row_h=30 -> spans 44 to 224, just inside BTM_HEIGHT-15=225.
+        draw_lyrics_block(pos_ms, 10, 44, BTM_WIDTH - 20, 30.0f, 3, 0.65f, 0.45f, COL_ACCENT, COL_TEXT_DIM);
     } else {
         if (s_screen == SCREEN_LIBRARIES) {
             draw_header("Music Libraries");

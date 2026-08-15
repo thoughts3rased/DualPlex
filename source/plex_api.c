@@ -1,5 +1,6 @@
 #include "plex_api.h"
 #include "logger.h"
+#include "audio_player.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -89,6 +90,44 @@ static size_t http_write_cb(void* contents, size_t size, size_t nmemb, void* use
     return realsize;
 }
 
+// Runs a single already-configured curl easy handle to completion, like
+// curl_easy_perform() - but via curl_multi polling instead of one opaque
+// blocking call, pumping audio_player_update() in between so a slow request
+// (browsing a big library, a laggy server, a login) doesn't starve the NDSP
+// wave buffers and audibly interrupt whatever's currently playing. Callers
+// still get a synchronous call that only returns once the request is done;
+// only what happens *during* the wait changes.
+static CURLcode perform_blocking_request(CURL* curl) {
+    CURLM* multi = curl_multi_init();
+    if (!multi) {
+        return curl_easy_perform(curl); // degrade to plain blocking rather than fail outright
+    }
+    curl_multi_add_handle(multi, curl);
+
+    int still_running = 1;
+    CURLMcode mc;
+    do {
+        mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK) break;
+        if (still_running) {
+            audio_player_update();
+            int numfds = 0;
+            curl_multi_wait(multi, NULL, 0, 50, &numfds); // wait up to 50ms for socket activity
+        }
+    } while (still_running);
+
+    CURLcode result = (mc == CURLM_OK) ? CURLE_GOT_NOTHING : CURLE_RECV_ERROR; // overwritten below on normal completion
+    CURLMsg* msg;
+    int msgs_left = 0;
+    while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) result = msg->data.result;
+    }
+
+    curl_multi_remove_handle(multi, curl);
+    curl_multi_cleanup(multi);
+    return result;
+}
+
 static bool plex_http_get(const char* endpoint, char** response_out) {
     if (!s_initialized) return false;
     
@@ -126,7 +165,7 @@ static bool plex_http_get(const char* endpoint, char** response_out) {
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_blocking_request(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     
@@ -173,7 +212,7 @@ static bool plex_http_get_full_url(const char* url, const char* token, char** re
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_blocking_request(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     
@@ -230,7 +269,7 @@ static bool plex_http_post_full_url(const char* url, const char* post_fields, co
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_blocking_request(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (status_out) *status_out = http_code;
@@ -925,7 +964,7 @@ static bool plex_http_get_binary(const char* url, const char* token, u8** respon
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     
-    CURLcode res = curl_easy_perform(curl);
+    CURLcode res = perform_blocking_request(curl);
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     
@@ -1437,6 +1476,14 @@ int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int m
         // ]}]}}
         // Each Line can in principle carry multiple Spans (e.g. word-level
         // timing) - concatenate them to reconstruct the full line text.
+        //
+        // A Line can also have no Span at all: Plex marks known instrumental
+        // breaks this way (a timed entry with nothing to say). Those must be
+        // kept, not dropped - they're what let the UI recognize a break and
+        // stop highlighting a stale line through it (see
+        // find_active_lyric_line() in ui.c). An empty out[].text is exactly
+        // that marker; keep any entry with a real timestamp regardless of
+        // whether it produced text.
         cJSON* ljson = cJSON_Parse(response);
         if (ljson) {
             cJSON* mc = cJSON_GetObjectItem(ljson, "MediaContainer");
@@ -1448,6 +1495,8 @@ int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int m
                 cJSON_ArrayForEach(line_item, line_arr) {
                     if (count >= max) break;
                     cJSON* start = cJSON_GetObjectItem(line_item, "startOffset");
+                    if (!start || !cJSON_IsNumber(start)) continue;
+
                     cJSON* spans = cJSON_GetObjectItem(line_item, "Span");
                     char line_text[128] = "";
                     if (spans && cJSON_IsArray(spans)) {
@@ -1462,12 +1511,10 @@ int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int m
                             }
                         }
                     }
-                    if (line_text[0] != '\0') {
-                        out[count].time_ms = (start && cJSON_IsNumber(start)) ? start->valueint : count * 4000;
-                        strncpy(out[count].text, line_text, sizeof(out[count].text) - 1);
-                        out[count].text[sizeof(out[count].text) - 1] = '\0';
-                        count++;
-                    }
+                    out[count].time_ms = start->valueint;
+                    strncpy(out[count].text, line_text, sizeof(out[count].text) - 1);
+                    out[count].text[sizeof(out[count].text) - 1] = '\0';
+                    count++;
                 }
             }
             cJSON_Delete(ljson);
