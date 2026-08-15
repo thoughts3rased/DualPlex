@@ -14,6 +14,13 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
   Plex's own loudness-normalization gain. Falls back to a plain fixed-length
   crossfade for unanalyzed tracks.
 
+## Screenshots
+| | |
+|---|---|
+| ![Now Playing](screenshots/now-playing-top.png) Now Playing (top screen) | ![Playlists](screenshots/playlists-bottom.png) Playlists (bottom screen) |
+| ![Visualizer](screenshots/visualizer-top.png) Visualizer (top screen) | ![Now Playing Controls](screenshots/now-playing-controls-bottom.png) Now Playing Controls (bottom screen) |
+| ![Lyrics](screenshots/lyrics-top.png) Lyrics (top screen) | |
+
 ## Prerequisites
 To compile this project, you will need `devkitPro` with the following packages installed:
 - `3ds-dev`
