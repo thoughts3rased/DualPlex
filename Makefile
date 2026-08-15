@@ -20,6 +20,9 @@ include $(DEVKITARM)/3ds_rules
 # ROMFS is the directory containing data to be added to RomFS
 #---------------------------------------------------------------------------------
 TARGET      := DualPlex
+APP_TITLE       := DualPlex
+APP_DESCRIPTION := Plex music player for 3DS
+APP_AUTHOR       := Thoughts3rased
 BUILD       := build
 SOURCES     := source source/lib
 DATA        := data
