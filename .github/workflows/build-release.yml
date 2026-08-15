@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Cached across runs, keyed on a fixed version string below - bump it
-      # (v6 -> v7) to force a clean reinstall if the toolchain ever needs
+      # (v7 -> v8) to force a clean reinstall if the toolchain ever needs
       # refreshing. On a cache hit every step below down to (not including)
       # the Build step is skipped entirely: everything the build needs
       # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
@@ -55,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/devkitpro
-          key: devkitpro-3ds-v6
+          key: devkitpro-3ds-v7
 
       # The runner's container has no devkitPro (or anything it needs) baked
       # in, so it's installed here on a cache miss. This is a from-scratch
@@ -113,12 +113,21 @@ jobs:
           # directly (see the git history of the wipe above) without going
           # through apt, so dpkg still considers devkitpro-pacman installed
           # and the plain install above no-ops instead of re-bootstrapping
-          # it. --reinstall forces dpkg to re-run its postinst regardless of
-          # what it thinks is already installed, which is also what
-          # recovers dkp-pacman if this ever happens again for any other
-          # reason.
+          # it. A plain --reinstall isn't enough either: devkitpro-pacman's
+          # postinst assumes /opt/devkitpro/pacman/etc/pacman.conf already
+          # exists (from whatever originally bootstrapped it) and doesn't
+          # recreate it from scratch on a reinstall, so it just fails
+          # instead:
+          #   ==> ERROR: pacman configuration file
+          #   '/opt/devkitpro/pacman/etc/pacman.conf' not found.
+          # Purging first clears every trace dpkg has of this package -
+          # including whatever "already configured" state made it skip
+          # re-bootstrapping - so the following install runs postinst as a
+          # genuine first-time install. This is also what recovers
+          # dkp-pacman if this ever happens again for any other reason.
           if [ ! -x "$DEVKITPRO/pacman/bin/pacman" ]; then
-            $SUDO apt-get install --reinstall -y devkitpro-pacman
+            $SUDO apt-get purge -y devkitpro-pacman
+            $SUDO apt-get install -y devkitpro-pacman
           fi
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-dev 3ds-curl 3ds-mpg123 3ds-mbedtls
