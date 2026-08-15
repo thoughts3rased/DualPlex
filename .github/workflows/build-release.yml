@@ -70,15 +70,29 @@ jobs:
           $SUDO apt-get update
           $SUDO apt-get install -y --no-install-recommends wget unzip
 
-          # Belt-and-suspenders alongside the XferCommand fix below: that
-          # fix only takes effect for wget invocations that go through
-          # *this* pacman.conf's XferCommand line, at the moment this
-          # script sets it. A wget-wide default User-Agent covers any other
-          # unconfigured wget call that hits the same WAF too (there isn't
-          # currently one after this script stopped touching dpkg/apt for
-          # devkitpro-pacman - see below - but this is cheap insurance
-          # against a future one).
-          echo 'user_agent = dkp-pacman' | $SUDO tee -a /etc/wgetrc >/dev/null
+          # apt.devkitpro.org's WAF rule turned out to be satisfied by
+          # *any* non-default UA string, which is why plain "dkp-pacman"
+          # worked fine for it every single time below. pkg.devkitpro.org
+          # is fronted by the same Cloudflare setup but has kept 403ing
+          # that same "dkp-pacman" string intermittently regardless - a
+          # public devkitPro/pacman issue (#62) on this exact 403 confirms
+          # the difference: only a *real browser* User-Agent got a
+          # reporter past it, not just any non-curl/wget-looking string.
+          # Use one everywhere a devkitPro host gets hit, since Cloudflare
+          # bot-scoring apparently checks more than "is this the literal
+          # wget/curl default".
+          BROWSER_UA="Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
+
+          # /etc/wgetrc's user_agent line is parsed by wget itself as the
+          # rest of the line, not shell-tokenized - safe for a UA value
+          # with spaces in it. Set it globally rather than passing
+          # --user-agent on the XferCommand line below: classic pacman
+          # splits XferCommand on whitespace and execs it directly, with no
+          # shell involved, so a quoted multi-word value inline there isn't
+          # guaranteed to survive as one argv token the way the old
+          # single-word "dkp-pacman" string happened to. Every wget call
+          # below (XferCommand's included) just inherits this default.
+          echo "user_agent = $BROWSER_UA" | $SUDO tee -a /etc/wgetrc >/dev/null
 
           # pkg.devkitpro.org 403s plain wget/curl-style User-Agents (same
           # WAF rule apt.devkitpro.org has), which is what broke a bare
@@ -92,7 +106,7 @@ jobs:
           #   'XferCommand' in section 'dkp-linux' not recognized.
           PACMAN_CONF="$DEVKITPRO/pacman/etc/pacman.conf"
           if ! grep -q '^XferCommand' "$PACMAN_CONF"; then
-            $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -O %o %u' "$PACMAN_CONF"
+            $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget -O %o %u' "$PACMAN_CONF"
           fi
 
           # Once the 403 above is out of the way, the sync still fails -
