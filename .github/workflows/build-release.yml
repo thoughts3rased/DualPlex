@@ -135,7 +135,26 @@ jobs:
             $SUDO dkp-pacman-key --lsign-key "$KEYID"
           done
 
-          $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
+          # pkg.devkitpro.org's WAF has now both let this sync through
+          # clean (twice) and 403'd it (three times) across otherwise
+          # identical runs, with no consistent correlation to which UA
+          # workaround was or wasn't in place at the time - genuine
+          # intermittent behavior on Cloudflare's end (IP-based
+          # rate-limiting/reputation on shared GitHub-runner IPs, or
+          # TLS-fingerprint-based bot scoring that a UA header alone can't
+          # fully cover) rather than a deterministic gap this script can
+          # close outright. Retry with backoff rather than chase it further.
+          RETRIES=5
+          n=0
+          until $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls; do
+            n=$((n + 1))
+            if [ "$n" -ge "$RETRIES" ]; then
+              echo "::error::dkp-pacman -Sy failed after $RETRIES attempts (pkg.devkitpro.org WAF/rate-limit)" >&2
+              exit 1
+            fi
+            echo "dkp-pacman -Sy failed (attempt $n/$RETRIES) - retrying in 15s..." >&2
+            sleep 15
+          done
 
           # makerom (used for the .cia build) isn't a devkitPro package at
           # all - it's a separate tool from Project_CTR that devkitPro's own
