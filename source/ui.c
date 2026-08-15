@@ -1081,6 +1081,26 @@ static void seek_to(int target_ms) {
 
 static UIScreen s_prev_screen = SCREEN_HUB;
 
+// Tracks where each browse screen (Libraries/Artists/Albums/Tracks/Playlists)
+// was entered from, so KEY_B can unwind one level at a time instead of
+// jumping straight back to the Hub - e.g. Artist -> Album -> Tracks should
+// pop back to Album, and Playlist -> Tracks should pop back to Playlists.
+static UIScreen s_nav_stack[8];
+static int s_nav_stack_len = 0;
+
+static void nav_push(UIScreen screen) {
+    if (s_nav_stack_len < (int)(sizeof(s_nav_stack) / sizeof(s_nav_stack[0]))) {
+        s_nav_stack[s_nav_stack_len++] = screen;
+    }
+}
+
+static UIScreen nav_pop(UIScreen fallback) {
+    if (s_nav_stack_len > 0) {
+        return s_nav_stack[--s_nav_stack_len];
+    }
+    return fallback;
+}
+
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     album_art_update();
     plex_api_timeline_async_update();
@@ -1631,24 +1651,30 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 if (s_num_libraries > 0) {
                     strncpy(s_current_title, s_libraries[0].title, PLEX_MAX_STR);
                     s_num_artists = plex_api_get_artists(s_libraries[0].key, s_artists, PLEX_MAX_ITEMS);
+                    nav_push(SCREEN_HUB);
                     ui_set_screen(SCREEN_ARTISTS);
                 } else {
+                    nav_push(SCREEN_HUB);
                     ui_set_screen(SCREEN_LIBRARIES);
                 }
             } else if (s_selected_idx == 1) { // Playlists
+                nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_PLAYLISTS);
             } else if (s_selected_idx == 2) { // Search
                 char query[128] = "";
                 if (show_keyboard("Search Music Tracks", query, sizeof(query)) && query[0] != '\0') {
                     strncpy(s_current_title, "Search Results", PLEX_MAX_STR);
                     s_num_tracks = plex_api_search_tracks(query, s_tracks, PLEX_MAX_ITEMS);
+                    nav_push(SCREEN_HUB);
                     ui_set_screen(SCREEN_TRACKS);
                 }
             } else if (s_selected_idx == 3) { // Recently Added
                 strncpy(s_current_title, "Recently Added Tracks", PLEX_MAX_STR);
                 s_num_tracks = plex_api_get_recently_added(s_tracks, PLEX_MAX_ITEMS);
+                nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_TRACKS);
             } else if (s_selected_idx == 4) { // All Libraries
+                nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_LIBRARIES);
             } else if (s_selected_idx == 5) { // Settings
                 ui_set_screen(SCREEN_SETTINGS);
@@ -1752,12 +1778,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
 
     if (kDown & KEY_B) {
-        if (s_screen == SCREEN_ARTISTS) ui_set_screen(SCREEN_HUB);
-        else if (s_screen == SCREEN_PLAYLISTS) ui_set_screen(SCREEN_HUB);
-        else if (s_screen == SCREEN_LIBRARIES) ui_set_screen(SCREEN_HUB);
+        if (s_screen == SCREEN_ARTISTS) ui_set_screen(nav_pop(SCREEN_HUB));
+        else if (s_screen == SCREEN_PLAYLISTS) ui_set_screen(nav_pop(SCREEN_HUB));
+        else if (s_screen == SCREEN_LIBRARIES) ui_set_screen(nav_pop(SCREEN_HUB));
         else if (s_screen == SCREEN_HUB) ui_set_screen(SCREEN_AUTH_CHOICE);
-        else if (s_screen == SCREEN_ALBUMS) ui_set_screen(SCREEN_ARTISTS);
-        else if (s_screen == SCREEN_TRACKS) ui_set_screen(SCREEN_HUB);
+        else if (s_screen == SCREEN_ALBUMS) ui_set_screen(nav_pop(SCREEN_ARTISTS));
+        else if (s_screen == SCREEN_TRACKS) ui_set_screen(nav_pop(SCREEN_HUB));
     }
 
     if (kDown & KEY_A) {
@@ -1766,6 +1792,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_libraries[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_artists_page(s_active_key, s_artists, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_artists = s_loaded_items;
+            nav_push(SCREEN_LIBRARIES);
             ui_set_screen(SCREEN_ARTISTS);
         } else if (s_screen == SCREEN_ARTISTS && s_list_count > 0 && s_selected_idx < s_num_artists) {
             strncpy(s_current_title, s_artists[s_selected_idx].title, PLEX_MAX_STR);
@@ -1778,12 +1805,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_albums[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_tracks = s_loaded_items;
+            nav_push(SCREEN_ALBUMS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0) {
             strncpy(s_current_title, s_playlists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_playlists[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_tracks = s_loaded_items;
+            nav_push(SCREEN_PLAYLISTS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_TRACKS && s_list_count > 0 && s_selected_idx < s_num_tracks) {
             play_track(s_selected_idx);
