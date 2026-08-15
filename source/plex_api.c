@@ -5,12 +5,23 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <curl/curl.h>
+#include <stdint.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "lib/cJSON.h"
 
 static char s_server_url[PLEX_MAX_URL] = {0};
 static char s_auth_token[128] = {0};
 static bool s_initialized = false;
 static PlexQualityTier s_quality_tier = QUALITY_MP3_320;  // Default: highest MP3
+
+// Cached result of the last DNS-backed local/remote classification (see
+// resolve_host_is_local_via_dns() and plex_api_test_connection() below).
+// Invalidated on every plex_api_init()/cleanup() so a stale answer from a
+// previous server never leaks into a new one.
+static bool s_local_override_valid = false;
+static bool s_local_override_value = false;
 
 static int quality_tier_to_bitrate(PlexQualityTier tier) {
     switch (tier) {
@@ -334,13 +345,14 @@ static void sanitize_server_url(const char* in_url, char* out_url, size_t max_le
 bool plex_api_init(const char* server_url, const char* auth_token) {
     sanitize_server_url(server_url, s_server_url, sizeof(s_server_url));
     strncpy(s_auth_token, auth_token, sizeof(s_auth_token) - 1);
-    
+
     // Remove trailing slash if present
     size_t len = strlen(s_server_url);
     if (len > 0 && s_server_url[len - 1] == '/') {
         s_server_url[len - 1] = '\0';
     }
-    
+
+    s_local_override_valid = false; // stale answer from a previous server
     s_initialized = true;
     return true;
 }
@@ -349,6 +361,7 @@ void plex_api_cleanup(void) {
     s_initialized = false;
     s_server_url[0] = '\0';
     s_auth_token[0] = '\0';
+    s_local_override_valid = false;
 }
 
 const char* plex_api_get_token(void) {
@@ -363,24 +376,9 @@ bool plex_api_is_https(void) {
     return strncmp(s_server_url, "https://", 8) == 0;
 }
 
-bool plex_api_is_local_connection(void) {
-    // Parsed straight from the stored, sanitized server URL rather than
-    // relying on PlexServerResource.is_local - that flag only exists when
-    // the server was picked from plex.tv's resource list (plex_api_get_
-    // servers() above), not when the user typed a URL manually in Setup.
-    // Reading it back off the URL itself covers both paths and always
-    // matches the address actually being connected to.
-    const char* host = strstr(s_server_url, "://");
-    host = host ? host + 3 : s_server_url;
-
-    int a, b;
-    if (sscanf(host, "%d.%d.", &a, &b) != 2) {
-        // Not a bare dotted-quad IP (a DNS hostname, e.g. a custom domain
-        // or a plain plex.direct name that sanitize_server_url() didn't
-        // resolve to an IP) - treat as remote, since private ranges are
-        // only ever addressed by literal IP.
-        return false;
-    }
+// Whether an IPv4 address starting with octets `a.b....` falls in a
+// private/local range (RFC1918, loopback, or link-local).
+static bool ip_octets_are_private(int a, int b) {
     if (a == 10) return true;                        // 10.0.0.0/8
     if (a == 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
     if (a == 192 && b == 168) return true;            // 192.168.0.0/16
@@ -389,7 +387,113 @@ bool plex_api_is_local_connection(void) {
     return false;
 }
 
+// Copies just the host portion of `url` (no "scheme://", no trailing
+// ":port" or "/path") into `out`.
+static void extract_host(const char* url, char* out, size_t out_size) {
+    const char* host = strstr(url, "://");
+    host = host ? host + 3 : url;
+    size_t i = 0;
+    while (host[i] && host[i] != ':' && host[i] != '/' && i < out_size - 1) {
+        out[i] = host[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+// Classifies `host` as local/remote without touching the network - only
+// handles the two cases that don't need a lookup: a literal dotted-quad
+// IP, or a *.plex.direct hostname, which dashed-encodes its own target IP
+// right in the name (e.g. 192-168-0-200.abc123.plex.direct - Plex's own
+// DNS just resolves that name back to the same IP, so it can be read
+// straight off the hostname). Returns false - leaving *out_local
+// untouched - for anything else, e.g. a custom domain that needs an
+// actual DNS lookup to classify (see resolve_host_is_local_via_dns()).
+static bool classify_host_without_dns(const char* host, bool* out_local) {
+    int a, b, c, d;
+    if (sscanf(host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+        *out_local = ip_octets_are_private(a, b);
+        return true;
+    }
+    if (strstr(host, ".plex.direct") && sscanf(host, "%d-%d-%d-%d", &a, &b, &c, &d) == 4) {
+        *out_local = ip_octets_are_private(a, b);
+        return true;
+    }
+    return false;
+}
+
+// Resolves `host` via a real (blocking) DNS lookup and classifies the
+// result - the one case classify_host_without_dns() above can't handle on
+// its own: an arbitrary hostname (a user's own reverse proxy domain,
+// say) that isn't a literal IP or a self-describing plex.direct name.
+// Only call this from a context that already expects a blocking network
+// round-trip (plex_api_test_connection(), alongside its own HTTP probe) -
+// never from the render loop; plex_api_is_local_connection() below just
+// reads back whatever that last cached. Not part of the public API
+// (deliberately not in plex_api.h) - given external linkage here only so
+// tests/test_plex_api.c can exercise it directly against "localhost"
+// (loopback, no live network needed) without going through a full
+// plex_api_test_connection() HTTP round-trip.
+bool resolve_host_is_local_via_dns(const char* host) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = NULL;
+    bool is_local = false;
+    if (getaddrinfo(host, NULL, &hints, &result) == 0 && result) {
+        struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+        uint32_t ip = ntohl(addr->sin_addr.s_addr);
+        is_local = ip_octets_are_private((ip >> 24) & 0xFF, (ip >> 16) & 0xFF);
+        freeaddrinfo(result);
+    }
+    return is_local;
+}
+
+bool plex_api_is_local_connection(void) {
+    // A DNS-backed answer from the last plex_api_test_connection() call
+    // takes priority - it's the only path that can classify a plain
+    // hostname (a custom domain, say) correctly. Until a connection test
+    // has actually run, fall back to the network-free literal-IP/
+    // .plex.direct check below (parsed straight from the stored,
+    // sanitized server URL rather than relying on PlexServerResource.
+    // is_local, which only exists when the server was picked from plex.
+    // tv's resource list, not when the user typed a URL manually in
+    // Setup - reading it back off the URL itself covers both paths).
+    if (s_local_override_valid) return s_local_override_value;
+
+    char host[256];
+    extract_host(s_server_url, host, sizeof(host));
+
+    bool is_local = false;
+    if (classify_host_without_dns(host, &is_local)) return is_local;
+
+    // An unresolved hostname with no connection test yet - can't say for
+    // sure without a DNS lookup, so default to "remote" (matches this
+    // function's behavior before DNS resolution existed at all).
+    return false;
+}
+
 bool plex_api_test_connection(void) {
+    // Resolve local-vs-remote once per connection attempt here rather than
+    // from plex_api_is_local_connection() itself - that's called every
+    // frame to draw the top-bar icon, and a plain hostname (the only case
+    // that needs a real lookup) requires a blocking DNS round-trip. This
+    // function already does one blocking network round-trip below, so one
+    // more here doesn't change this call's cost class. Independent of the
+    // HTTP/HTTPS probe that follows - the host doesn't change between
+    // schemes - so it's cached before that can early-return.
+    {
+        char host[256];
+        extract_host(s_server_url, host, sizeof(host));
+        bool is_local;
+        if (!classify_host_without_dns(host, &is_local)) {
+            is_local = resolve_host_is_local_via_dns(host);
+        }
+        s_local_override_valid = true;
+        s_local_override_value = is_local;
+    }
+
     bool tried_https = strncmp(s_server_url, "https://", 8) == 0;
 
     char* response = NULL;
