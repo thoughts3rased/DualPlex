@@ -934,6 +934,12 @@ static void shuffle_order_regenerate(int pin_idx) {
 // path (compute_next_track_idx()) doesn't disturb anything mid-lap.
 static void shuffle_order_sync(int idx) {
     if (s_shuffle_order_count != s_num_tracks) { shuffle_order_regenerate(idx); return; }
+    // idx == -1 means nothing's currently playing (e.g. the Queue screen is
+    // open after playback stopped/errored - reachable regardless of state).
+    // -1 never matches an entry below, so without this the fallthrough would
+    // regenerate a brand-new random order on literally every call - visible
+    // as the "Up Next" list reshuffling every single frame.
+    if (idx < 0) return;
     for (int i = 0; i < s_shuffle_order_count; i++) {
         if (s_shuffle_order[i] == idx) { s_shuffle_pos = i; return; }
     }
