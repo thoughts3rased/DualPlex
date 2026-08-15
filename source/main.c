@@ -67,13 +67,41 @@ int main(int argc, char* argv[]) {
     // If config has valid server info, try to connect
     bool connected = false;
     if (app_config.server_url[0] && app_config.auth_token[0]) {
+        // This can block for several seconds (worst case, the reconnect-
+        // via-account fallback below retrying every address it knows for
+        // the server in turn) - draw one frame first so the console shows
+        // something other than a blank/stale screen while that's happening.
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        ui_render_connecting(top, bottom);
+        C3D_FrameEnd(0);
+
         plex_api_init(app_config.server_url, app_config.auth_token);
         if (plex_api_test_connection()) {
-            ui_set_screen(SCREEN_HUB);
             connected = true;
+        } else {
+            // The saved address didn't work - this happens whenever the
+            // console launches on a different network than last time (a
+            // mobile hotspot, a different WiFi) where that particular
+            // address (typically the server's LAN IP) just isn't reachable,
+            // even though the server itself is still up and has other
+            // addresses that would work fine from here. Re-fetch the
+            // account's server list with the saved token and retry every
+            // address it advertises for the same server, rather than
+            // dropping straight to the login screen as if logged out.
+            LOG_WARN("Saved server address unreachable - attempting reconnect via account");
+            if (plex_api_reconnect_via_account(app_config.auth_token, app_config.server_name)) {
+                connected = true;
+                // Persist whatever address actually worked so the next
+                // launch tries it first instead of repeating this fallback.
+                strncpy(app_config.server_url, plex_api_get_server_url(), sizeof(app_config.server_url) - 1);
+                strncpy(app_config.auth_token, plex_api_get_token(), sizeof(app_config.auth_token) - 1);
+                config_save(&app_config);
+            }
         }
+
+        if (connected) ui_set_screen(SCREEN_HUB);
     }
-    
+
     if (!connected) {
         ui_set_screen(SCREEN_AUTH_CHOICE);
     }

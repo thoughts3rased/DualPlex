@@ -1536,6 +1536,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (kDown & KEY_A && s_num_servers > 0) {
             strncpy(s_config->server_url, s_servers[s_selected_idx].uri, sizeof(s_config->server_url) - 1);
             strncpy(s_config->auth_token, s_servers[s_selected_idx].access_token, sizeof(s_config->auth_token) - 1);
+            strncpy(s_config->server_name, s_servers[s_selected_idx].name, sizeof(s_config->server_name) - 1);
             config_save(s_config);
             plex_api_init(s_config->server_url, s_config->auth_token);
             ui_set_screen(SCREEN_HUB);
@@ -1634,6 +1635,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (kDown & KEY_A || (kDown & KEY_TOUCH)) {
             if (s_setup_field == 0) {
                 if (show_keyboard("Enter Server URL", s_config->server_url, sizeof(s_config->server_url))) {
+                    // A manually-typed URL no longer corresponds to whatever
+                    // named resource server_name (if any) was last picked
+                    // from SCREEN_SERVER_SELECT - clear it so a future
+                    // reconnect attempt doesn't match this account's server
+                    // list back up against a name the user just overrode.
+                    s_config->server_name[0] = '\0';
                     config_save(s_config);
                 }
             } else if (s_setup_field == 1) {
@@ -1978,6 +1985,27 @@ static void draw_top_visualizer(PlexTrack* track, PlayerState state) {
     } else {
         draw_visualizer(s_vis_style, 15, 78, TOP_WIDTH - 30, 130);
     }
+}
+
+// One-off "Connecting..." frame, drawn manually outside the normal per-
+// frame ui_render_top()/ui_render_bottom() cycle (see main()'s startup
+// connection attempt) - reaching the saved server over the network can
+// block for several seconds (worst case, retrying every address a
+// reconnect-via-account falls back to in turn), and with nothing drawn
+// during that window the app would otherwise look hung/crashed rather
+// than just working on it.
+void ui_render_connecting(C3D_RenderTarget* top, C3D_RenderTarget* bottom) {
+    C2D_TextBufClear(s_text_buf);
+
+    C2D_TargetClear(top, COL_BG_TOP);
+    C2D_SceneBegin(top);
+    draw_text_centered("DUALPLEX", 10, TOP_WIDTH, 0.6f, 0.6f, COL_ACCENT);
+    C2D_DrawRectSolid(10, 30, 0.5f, TOP_WIDTH - 20, 2, COL_ACCENT);
+    draw_text_centered("Connecting...", TOP_HEIGHT / 2.0f - 10, TOP_WIDTH, 0.55f, 0.55f, COL_TEXT_DIM);
+
+    C2D_TargetClear(bottom, COL_BG);
+    C2D_SceneBegin(bottom);
+    draw_text_centered("Reaching your Plex server...", BTM_HEIGHT / 2.0f - 10, BTM_WIDTH, 0.45f, 0.45f, COL_TEXT_DIM);
 }
 
 void ui_render_top(C3D_RenderTarget* top) {

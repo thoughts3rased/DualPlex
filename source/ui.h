@@ -40,6 +40,13 @@ void ui_render_top(C3D_RenderTarget* top);
 // Render the bottom screen (navigation/controls).
 void ui_render_bottom(C3D_RenderTarget* bottom);
 
+// One-off "Connecting..." frame for a blocking startup connection attempt,
+// before the main render loop (and its own per-frame ui_render_top()/
+// ui_render_bottom() calls) has started. Unlike those two, this clears and
+// scene-begins both targets itself - call it directly between
+// C3D_FrameBegin()/C3D_FrameEnd(), nothing else needed.
+void ui_render_connecting(C3D_RenderTarget* top, C3D_RenderTarget* bottom);
+
 // Get current screen.
 UIScreen ui_get_screen(void);
 

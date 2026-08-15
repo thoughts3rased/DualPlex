@@ -727,6 +727,143 @@ int plex_api_get_servers(const char* account_token, PlexServerResource* out_serv
     return count;
 }
 
+// Up to this many connection candidates get tried per resource in
+// plex_api_reconnect_via_account() below - real accounts only ever
+// advertise a handful (LAN address, WAN/relay address, maybe a couple
+// more), so this is generous headroom, not a real limit.
+#define PLEX_RECONNECT_MAX_CANDIDATES 6
+
+// Re-establishes a connection using saved account credentials when the
+// previously working server address can no longer be reached at all -
+// e.g. the app launched on a different network (a mobile hotspot, a
+// different WiFi) where that address isn't reachable, but a different
+// address for the very same server (its public/remote address, a Plex
+// Relay connection, etc.) still is.
+//
+// Re-fetches the account's resource list from plex.tv (same endpoint
+// plex_api_get_servers() uses), then - for the resource named
+// `server_name` (or the account's first server if that name is blank or
+// no longer matches, e.g. a config saved before server_name existed) -
+// tries every connection Plex advertises for it in turn, unlike
+// plex_api_get_servers() above, which settles for a single "best" pick
+// per resource. That pick is guided by Plex's own "local" flag, which
+// just describes the address itself (the server's own LAN IP, say) - it
+// says nothing about whether THIS client can currently reach it, so on a
+// hotspot the server's LAN connection is still reported "local" even
+// though it's unreachable from here and there'd be nothing left to fall
+// back to. Local candidates are still tried first since they're typically
+// faster when they do work.
+//
+// On success, plex_api_init() has already been called with whatever
+// candidate worked (readable via plex_api_get_server_url()/
+// plex_api_get_token()) and this returns true, so the caller can persist
+// it via config_save(). On failure, restores whatever connection state
+// was in effect before this was called.
+bool plex_api_reconnect_via_account(const char* account_token, const char* server_name) {
+    if (!account_token || !account_token[0]) return false;
+
+    char saved_url[PLEX_MAX_URL];
+    char saved_token[128];
+    strncpy(saved_url, s_server_url, sizeof(saved_url) - 1);
+    saved_url[sizeof(saved_url) - 1] = '\0';
+    strncpy(saved_token, s_auth_token, sizeof(saved_token) - 1);
+    saved_token[sizeof(saved_token) - 1] = '\0';
+
+    char* response = NULL;
+    if (!plex_http_get_full_url("https://plex.tv/api/v2/resources?includeHttps=1", account_token, &response)) {
+        LOG_WARN("Reconnect: couldn't fetch account server list");
+        return false;
+    }
+
+    bool connected = false;
+    cJSON* json = cJSON_Parse(response);
+    if (json && cJSON_IsArray(json)) {
+        cJSON* fallback_res = NULL; // first server seen, used if no name match
+        cJSON* target_res = NULL;
+
+        cJSON* res_item = NULL;
+        cJSON_ArrayForEach(res_item, json) {
+            cJSON* provides = cJSON_GetObjectItem(res_item, "provides");
+            if (!provides || !cJSON_IsString(provides) || !strstr(provides->valuestring, "server")) continue;
+
+            if (!fallback_res) fallback_res = res_item;
+
+            cJSON* name = cJSON_GetObjectItem(res_item, "name");
+            if (server_name && server_name[0] && name && cJSON_IsString(name) &&
+                strcmp(name->valuestring, server_name) == 0) {
+                target_res = res_item;
+                break;
+            }
+        }
+        if (!target_res) target_res = fallback_res;
+
+        if (target_res) {
+            cJSON* token = cJSON_GetObjectItem(target_res, "accessToken");
+            char resource_token[128];
+            if (token && cJSON_IsString(token)) {
+                strncpy(resource_token, token->valuestring, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
+            } else {
+                strncpy(resource_token, account_token, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
+            }
+
+            char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_MAX_URL];
+            int candidate_count = 0;
+
+            cJSON* connections = cJSON_GetObjectItem(target_res, "connections");
+            if (connections && cJSON_IsArray(connections)) {
+                // Two passes so every "local" candidate sorts before every
+                // non-local one, without needing to actually sort anything.
+                for (int pass = 0; pass < 2 && candidate_count < PLEX_RECONNECT_MAX_CANDIDATES; pass++) {
+                    bool want_local = (pass == 0);
+                    cJSON* conn = NULL;
+                    cJSON_ArrayForEach(conn, connections) {
+                        if (candidate_count >= PLEX_RECONNECT_MAX_CANDIDATES) break;
+
+                        cJSON* uri = cJSON_GetObjectItem(conn, "uri");
+                        cJSON* local = cJSON_GetObjectItem(conn, "local");
+                        cJSON* address = cJSON_GetObjectItem(conn, "address");
+                        cJSON* port = cJSON_GetObjectItem(conn, "port");
+                        bool is_loc = (local && cJSON_IsTrue(local));
+                        if (is_loc != want_local) continue;
+
+                        char target[PLEX_MAX_URL] = "";
+                        if (is_loc && address && cJSON_IsString(address) && port && cJSON_IsNumber(port)) {
+                            snprintf(target, sizeof(target), "http://%s:%d", address->valuestring, port->valueint);
+                        } else if (uri && cJSON_IsString(uri)) {
+                            strncpy(target, uri->valuestring, sizeof(target) - 1);
+                        }
+                        if (target[0]) {
+                            sanitize_server_url(target, candidates[candidate_count], PLEX_MAX_URL);
+                            candidate_count++;
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < candidate_count && !connected; i++) {
+                plex_api_init(candidates[i], resource_token);
+                if (plex_api_test_connection()) {
+                    connected = true;
+                    LOG_INFO("Reconnected via account resource list: %s", candidates[i]);
+                }
+            }
+            if (!connected) {
+                LOG_WARN("Reconnect: none of %d candidate address(es) for '%s' were reachable",
+                         candidate_count, (server_name && server_name[0]) ? server_name : "(unnamed)");
+            }
+        }
+    }
+    if (json) cJSON_Delete(json);
+    if (response) free(response);
+
+    if (!connected) {
+        plex_api_init(saved_url, saved_token);
+    }
+    return connected;
+}
+
 int plex_api_get_music_libraries(PlexLibrary* out, int max) {
     char* response = NULL;
     if (!plex_http_get("/library/sections", &response)) {

@@ -11,6 +11,15 @@
 typedef struct {
     char server_url[PLEX_MAX_URL];  // e.g. "http://192.168.1.100:32400"
     char auth_token[128];            // X-Plex-Token
+    // Name of the Plex server resource server_url/auth_token were picked
+    // from (SCREEN_SERVER_SELECT), e.g. "Living Room Server" - blank if
+    // set up via a manually-typed URL instead. Lets a later launch that
+    // can't reach server_url directly (a different network - a mobile
+    // hotspot, say - where that particular address isn't reachable) match
+    // this same server back up in a re-fetched resource list and retry
+    // its other advertised addresses, rather than just giving up. See
+    // plex_api_reconnect_via_account().
+    char server_name[PLEX_MAX_STR];
     // Whether the top-screen clock displays 24-hour time instead of 12-hour
     // with AM/PM. Not read from the 3DS's own "Display 24-Hour Time" system
     // setting - that isn't exposed through any documented API - so this is

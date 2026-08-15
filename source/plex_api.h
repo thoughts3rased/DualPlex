@@ -131,6 +131,18 @@ int plex_api_login_direct(const char* login, const char* password, const char* c
 // Get list of Plex Media Servers associated with account token.
 int plex_api_get_servers(const char* account_token, PlexServerResource* out_servers, int max);
 
+// Re-establishes a connection using saved account credentials when the
+// previously working server address can no longer be reached at all -
+// e.g. launching on a different network (a mobile hotspot, a different
+// WiFi) where that particular address isn't reachable, but a different
+// address for the same server (its remote/relay address, say) still is.
+// `server_name` should be AppConfig.server_name (blank is fine - falls
+// back to the account's first server). On success, plex_api_init() has
+// already been called with whatever candidate worked (readable via
+// plex_api_get_server_url()/plex_api_get_token()); the caller should
+// persist those via config_save().
+bool plex_api_reconnect_via_account(const char* account_token, const char* server_name);
+
 // Get music libraries.
 int plex_api_get_music_libraries(PlexLibrary* out, int max);
 
