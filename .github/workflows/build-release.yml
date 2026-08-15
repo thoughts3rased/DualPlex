@@ -70,6 +70,21 @@ jobs:
           $SUDO apt-get update
           $SUDO apt-get install -y --no-install-recommends wget unzip
 
+          # Belt-and-suspenders alongside the XferCommand fix below: that
+          # fix only takes effect for wget invocations that go through
+          # *this* pacman.conf's XferCommand line, at the moment this
+          # script sets it. devkitpro-pacman's postinst runs its own
+          # database sync automatically as part of `apt-get install
+          # --reinstall` further down, before this script gets control
+          # back - if that sync's wget call ends up resolving without our
+          # custom UA (stale pacman.conf, a differently-templated one from
+          # the freshly-unpacked package, or anything else not accounted
+          # for above), it hits the same WAF 403 with no chance for this
+          # script to intervene in time. A wget-wide default User-Agent
+          # covers that gap too, since it applies to any wget call that
+          # doesn't set its own.
+          echo 'user_agent = dkp-pacman' | $SUDO tee -a /etc/wgetrc >/dev/null
+
           # pkg.devkitpro.org 403s plain wget/curl-style User-Agents (same
           # WAF rule apt.devkitpro.org has), which is what broke a bare
           # dkp-pacman install on the runner directly - this image's own
@@ -113,7 +128,27 @@ jobs:
           $SUDO cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
           echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
           $SUDO apt-get update
-          $SUDO apt-get install --reinstall -y devkitpro-pacman
+
+          # devkitpro-pacman's postinst runs its own db sync against
+          # pkg.devkitpro.org as part of configuring the package, and
+          # that's hit the same WAF 403 intermittently even with the UA
+          # workarounds above in place - worked clean on one run, 403'd on
+          # a later one with no script change in between, pointing at
+          # rate-limiting/flakiness on shared GitHub-runner IPs rather than
+          # a deterministic gap in the fix. dpkg leaves the package
+          # half-configured on failure; a plain retry re-runs postinst
+          # (and its sync) rather than needing a purge/reinstall cycle.
+          RETRIES=3
+          n=0
+          until $SUDO apt-get install --reinstall -y devkitpro-pacman; do
+            n=$((n + 1))
+            if [ "$n" -ge "$RETRIES" ]; then
+              echo "::error::apt-get install --reinstall devkitpro-pacman failed after $RETRIES attempts" >&2
+              exit 1
+            fi
+            echo "devkitpro-pacman reinstall failed (attempt $n/$RETRIES) - retrying in 10s..." >&2
+            sleep 10
+          done
 
           # --reinstall above still isn't enough on its own:
           #   error: dkp-libs: signature from "... WinterMute ..." is
