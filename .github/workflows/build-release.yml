@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Cached across runs, keyed on a fixed version string below - bump it
-      # (v2 -> v3) to force a clean reinstall if the toolchain ever needs
+      # (v3 -> v4) to force a clean reinstall if the toolchain ever needs
       # refreshing. On a cache hit every step below down to (not including)
       # the Build step is skipped entirely: everything the build needs
       # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/devkitpro
-          key: devkitpro-3ds-v2
+          key: devkitpro-3ds-v3
 
       # The runner's container has no devkitPro (or anything it needs) baked
       # in, so it's installed here on a cache miss. This is a from-scratch
@@ -130,8 +130,20 @@ jobs:
           wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
           dpkg -x /tmp/glibc-deb/libc6.deb "$GLIBC_PREFIX"
 
-          NEWLD="$GLIBC_PREFIX/lib64/ld-linux-x86-64.so.2"
+          # Debian's libc6 .deb ships the dynamic linker as the real file
+          # under lib/x86_64-linux-gnu/, with lib64/ld-linux-x86-64.so.2 as
+          # an *absolute* symlink to it. dpkg -x preserves that absolute
+          # target as-is, so following it inside our private prefix lands
+          # back on the runner's own old system loader instead of this
+          # extracted one - resolving to the real (non-symlink) file avoids
+          # that regardless of exactly how a given release lays it out.
+          NEWLD=$(find "$GLIBC_PREFIX" -name 'ld-linux-x86-64.so.2' -type f | head -1)
           NEWLIBDIR="$GLIBC_PREFIX/lib/x86_64-linux-gnu"
+
+          if [ -z "$NEWLD" ]; then
+            echo "::error::Couldn't find the real ld-linux-x86-64.so.2 inside $GLIBC_PREFIX - libc6 layout may have changed upstream" >&2
+            exit 1
+          fi
 
           # Repoint every dynamically-linked ELF under devkitARM and
           # devkitPro's tools at the bookworm loader + libc - leaves every
