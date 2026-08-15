@@ -91,21 +91,20 @@ jobs:
           #   error: dkp-libs: signature from "... WinterMute ..." is
           #   invalid
           # This image's pacman keyring was bootstrapped once, whenever the
-          # image was last built, and baked into that layer. If devkitPro
-          # has rotated/reissued their signing key since, every subsequent
-          # sync fails verification against the stale local keyring
-          # regardless of how correctly the database itself downloads.
-          # Reinstalling devkitpro-pacman re-runs its postinst, which
-          # re-imports whatever key is bundled in *today's* .deb - the same
-          # bootstrap that worked when this was a bare (non-container)
-          # install earlier. apt doesn't know the image's on-disk keyring
-          # predates its own install record, so --reinstall is needed to
-          # force it rather than a plain install (which just no-ops, same
-          # as the devkitPro pacman-bootstrap issue hit earlier on the
-          # since-abandoned self-hosted runner). The postinst script itself
-          # may also skip re-importing if it sees an existing gnupg dir and
-          # assumes it's already set up, so clear that out first to force a
-          # genuinely fresh import regardless.
+          # image was last built, and baked into that layer. Reinstalling
+          # devkitpro-pacman re-runs its postinst, which re-imports the
+          # keyring bundled in the .deb - the same bootstrap that worked
+          # when this was a bare (non-container) install earlier. apt
+          # doesn't know the image's on-disk keyring predates its own
+          # install record, so --reinstall is needed to force it rather
+          # than a plain install (which just no-ops, same as the devkitPro
+          # pacman-bootstrap issue hit earlier on the since-abandoned
+          # self-hosted runner). The postinst script itself may also skip
+          # re-importing if it sees an existing gnupg dir and assumes it's
+          # already set up, so clear that out first to force a genuinely
+          # fresh import regardless. (Spoiler: even a genuinely fresh
+          # import of the .deb's own bundled keyring isn't sufficient by
+          # itself - see below.)
           $SUDO rm -rf "$DEVKITPRO/pacman/etc/pacman.d/gnupg"
 
           mkdir -p /tmp/devkitpro-keyring
@@ -115,6 +114,29 @@ jobs:
           echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
           $SUDO apt-get update
           $SUDO apt-get install --reinstall -y devkitpro-pacman
+
+          # --reinstall above still isn't enough on its own:
+          #   error: dkp-libs: signature from "... WinterMute ..." is
+          #   invalid
+          # dkp-pacman-key --populate (what devkitpro-pacman's postinst
+          # runs) only ever imports/trusts whatever keyring file happens to
+          # be bundled inside that *specific .deb version's* files on disk.
+          # apt reported this reinstall as the same version already
+          # installed (6.0.1-2 before and after) - so the postinst script
+          # reran, but against byte-identical key data each time. Whichever
+          # of devkitPro's real signing keys fell short of full trust in
+          # that bundle stays short no matter how many times it's
+          # reinstalled; only a rebuilt .deb would actually change it.
+          # Fetch devkitPro's own canonical keyring straight from GitHub
+          # instead - updated independently of the .deb's release cadence -
+          # and fully trust every key in it, rather than whatever the
+          # frozen .deb's own --populate step decided.
+          GNUPGHOME="$DEVKITPRO/pacman/etc/pacman.d/gnupg"
+          wget -q -O /tmp/devkitpro-keyring/devkitpro.gpg https://raw.githubusercontent.com/devkitPro/devkitpro-keyring/master/devkitpro.gpg
+          $SUDO gpg --homedir "$GNUPGHOME" --import /tmp/devkitpro-keyring/devkitpro.gpg
+          for KEYID in $($SUDO gpg --homedir "$GNUPGHOME" --list-keys --with-colons | awk -F: '/^pub/{print $5}'); do
+            $SUDO dkp-pacman-key --lsign-key "$KEYID"
+          done
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
 
