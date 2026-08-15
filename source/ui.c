@@ -1964,16 +1964,18 @@ static void draw_top_now_playing(PlexTrack* track, PlayerState state) {
     draw_scrolling_text(track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", text_x, 76, max_text_w, 0.55f, 0.55f, COL_ACCENT);
     draw_scrolling_text(track->parent_title[0] ? track->parent_title : "", text_x, 98, max_text_w, 0.45f, 0.45f, COL_TEXT_DIM);
 
-    // Track number (within the loaded album/playlist) and stream quality,
-    // in place of what used to be a "Playing | Vol: X%" line duplicated
-    // verbatim just below (state is already visible via the buffering badge
-    // on the album art above and the play/pause button on the bottom
-    // screen; the hardware volume slider doesn't need restating here).
+    // Track's position on its album (Plex's per-track "index") and stream
+    // quality, in place of what used to be a "Playing | Vol: X%" line
+    // duplicated verbatim just below (state is already visible via the
+    // buffering badge on the album art above and the play/pause button on
+    // the bottom screen; the hardware volume slider doesn't need restating
+    // here). Shown only here on the top screen - the bottom screen's
+    // condensed view omits it for space (see ui_render_bottom()).
     char info_line[96];
     char qual_buf[40];
     format_quality_tag(track, qual_buf, sizeof(qual_buf));
-    if (track->index > 0 && s_num_tracks > 0) {
-        snprintf(info_line, sizeof(info_line), "Track %d of %d  %s", track->index, s_num_tracks, qual_buf);
+    if (track->index > 0) {
+        snprintf(info_line, sizeof(info_line), "Track %d  %s", track->index, qual_buf);
     } else {
         snprintf(info_line, sizeof(info_line), "%s", qual_buf);
     }
@@ -2030,18 +2032,12 @@ static void draw_top_lyrics(PlexTrack* track, PlayerState state) {
         next_y += 12;
     }
 
-    // Same track number / quality / star rating shown on the main Now
-    // Playing view (see draw_top_now_playing()), condensed to fit this
-    // view's much narrower details column.
-    char info_line[64];
+    // Same quality / star rating shown on the main Now Playing view (see
+    // draw_top_now_playing()), condensed to fit this view's much narrower
+    // details column. The track number is shown only on the top screen.
     char qual_buf[40];
     format_quality_tag(track, qual_buf, sizeof(qual_buf));
-    if (track->index > 0 && s_num_tracks > 0) {
-        snprintf(info_line, sizeof(info_line), "%d/%d %s", track->index, s_num_tracks, qual_buf);
-    } else {
-        snprintf(info_line, sizeof(info_line), "%s", qual_buf);
-    }
-    draw_scrolling_text(info_line, details_x, next_y, details_w, 0.28f, 0.28f, COL_TEXT_DIM);
+    draw_scrolling_text(qual_buf, details_x, next_y, details_w, 0.28f, 0.28f, COL_TEXT_DIM);
     next_y += 12;
 
     if (track->user_rating > 0.0f) {
