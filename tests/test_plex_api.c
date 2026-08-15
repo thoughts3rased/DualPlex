@@ -26,6 +26,7 @@ extern bool g_stub_is_new3ds;
  * definition for why. */
 extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
 extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
+extern bool resolve_host_is_local_via_dns(const char* host);
 
 /* ---------------------------------------------------------------- test framework */
 
@@ -644,6 +645,115 @@ TEST(parse_loudness_curve_response_empty_input_returns_zero) {
 }
 
 /* ================================================================== */
+/* plex_api_is_local_connection() / plex_api_is_https(): top-bar connection
+ * status icons (house/globe, padlock) read these back off whatever URL
+ * plex_api_init() was last given. */
+
+TEST(is_local_connection_true_for_rfc1918_ranges) {
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://10.1.2.3:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://172.16.0.5:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://172.31.255.254:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://127.0.0.1:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+}
+
+TEST(is_local_connection_false_for_public_ip_or_hostname) {
+    plex_api_init("http://203.0.113.5:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+
+    /* 172.32.x.x is just outside the 172.16.0.0/12 private range. */
+    plex_api_init("http://172.32.0.1:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+}
+
+TEST(is_local_connection_reads_dashed_ip_out_of_plex_direct_hostnames) {
+    /* A *.plex.direct hostname dashed-encodes its own target IP right in
+     * the name - no DNS lookup needed to tell this one's actually local
+     * (this is also the address form a remote client would see for a
+     * server on ITS local network, so this must read the encoded IP, not
+     * guess "remote" just because it's a hostname). */
+    plex_api_init("https://192-168-0-200.abc123.plex.direct:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("https://203-0-113-5.abc123.plex.direct:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+}
+
+TEST(resolve_host_is_local_via_dns_classifies_loopback_hostname_as_local) {
+    /* "localhost" resolves via loopback (no live network needed) and is
+     * exactly the kind of plain hostname classify_host_without_dns() can't
+     * handle on its own - this is the actual DNS-resolving codepath
+     * plex_api_test_connection() calls for a custom domain. */
+    CHECK(resolve_host_is_local_via_dns("localhost"));
+}
+
+TEST(is_local_connection_defaults_to_remote_for_an_unresolved_hostname) {
+    /* A plain custom hostname (not a literal IP, not *.plex.direct) can
+     * only be classified for real by plex_api_test_connection()'s DNS
+     * lookup - which a unit test can't exercise without live network
+     * access. Before that's run at least once, this must fall back to
+     * "remote" rather than block here on its own lookup (this function
+     * is called every frame to draw the top-bar icon). */
+    plex_api_init("http://myserver.example.com:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+}
+
+TEST(is_https_preserved_for_hostnames) {
+    /* Plex Media Server's HTTPS listener validates the request's Host/SNI
+     * against a *.plex.direct name and will reject a bare IP outright, but
+     * has no such problem with an actual hostname - so HTTPS to one is left
+     * alone rather than downgraded on principle. */
+    plex_api_init("https://192-168-0-200.abc123.plex.direct:32400", "TOK");
+    CHECK(plex_api_is_https());
+    CHECK_STR_EQ(plex_api_get_server_url(), "https://192-168-0-200.abc123.plex.direct:32400");
+
+    plex_api_init("https://myserver.example.com:32400", "TOK");
+    CHECK(plex_api_is_https());
+}
+
+TEST(is_https_downgraded_for_bare_ip_addresses) {
+    /* The one case PMS's HTTPS listener can't actually serve - downgrading
+     * this up front (rather than waiting for plex_api_test_connection()'s
+     * fallback) skips a request that would always fail. */
+    plex_api_init("https://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_https());
+    CHECK_STR_EQ(plex_api_get_server_url(), "http://192.168.0.200:32400");
+
+    plex_api_init("https://203.0.113.5:32400", "TOK");
+    CHECK(!plex_api_is_https());
+}
+
+TEST(is_https_false_for_plain_http_input) {
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_https());
+
+    plex_api_init("http://myserver.example.com:32400", "TOK");
+    CHECK(!plex_api_is_https());
+}
+
+TEST(is_connected_false_until_a_connection_test_actually_runs) {
+    /* plex_api_is_connected() gates the top bar's connection-status icons
+     * (a single "disconnected" glyph replaces them otherwise) - it must
+     * default to false right after init(), not just whenever a server_url
+     * happens to be configured, since nothing has actually confirmed
+     * reachability yet at that point. plex_api_test_connection() itself
+     * needs live network to exercise for real (same reason it has no
+     * other unit coverage), so this only checks the state init() alone
+     * leaves behind. */
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_connected());
+}
+
+/* ================================================================== */
 
 int main(void) {
     RUN(transcode_url_flac_direct_tier_falls_back_to_320_bitrate);
@@ -674,6 +784,15 @@ int main(void) {
     RUN(parse_loudness_curve_response_respects_max_cap);
     RUN(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them);
     RUN(parse_loudness_curve_response_empty_input_returns_zero);
+    RUN(is_local_connection_true_for_rfc1918_ranges);
+    RUN(is_local_connection_false_for_public_ip_or_hostname);
+    RUN(is_local_connection_reads_dashed_ip_out_of_plex_direct_hostnames);
+    RUN(resolve_host_is_local_via_dns_classifies_loopback_hostname_as_local);
+    RUN(is_local_connection_defaults_to_remote_for_an_unresolved_hostname);
+    RUN(is_https_preserved_for_hostnames);
+    RUN(is_https_downgraded_for_bare_ip_addresses);
+    RUN(is_https_false_for_plain_http_input);
+    RUN(is_connected_false_until_a_connection_test_actually_runs);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {

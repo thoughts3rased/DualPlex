@@ -458,6 +458,13 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
 #define ICON_CP_BATTERY_QUARTER 0xF243
 #define ICON_CP_BATTERY_EMPTY  0xF244
 #define ICON_CP_BOLT            0xF0E7
+#define ICON_CP_HOUSE           0xF015
+#define ICON_CP_GLOBE           0xF0AC
+#define ICON_CP_LOCK            0xF023
+#define ICON_CP_LOCK_OPEN       0xF3C1
+#define ICON_CP_DISCONNECTED    0xE560 // "plug-circle-xmark"
+#define ICON_CP_WIFI             0xF1EB
+#define ICON_CP_PLANE            0xF072
 
 // Every codepoint above sits in Font Awesome's Private Use Area, always a
 // 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
@@ -616,11 +623,60 @@ static void draw_list_item(int visual_idx, const char* title, const char* subtit
     }
 }
 
+// NETWORK_STATE, documented at 3dbrew's "Configuration Memory" page: a byte
+// in the same shared system page osGetWifiStrength()/osGet3DSliderState()
+// already read from (offset 0x1FF81067 - verified against this struct's
+// own network_state field, which lands at exactly that address), and the
+// literal value the HOME Menu's own WiFi icon decides what to show from.
+// Only specific values are documented: 2 = has real internet access;
+// 3/4/6 = associated with an access point but LAN-only, no internet (still
+// fine for reaching a Plex server on that LAN); 7 = wireless communications
+// switched off entirely (the HOME Menu's Wireless Switch toggle). Anything
+// else is the generic "radio on, not associated with anything yet" state.
+#define NETWORK_STATE_DISABLED 7
+static bool network_state_is_connected(u8 state) {
+    return state == 2 || state == 3 || state == 4 || state == 6;
+}
+
+// FA "wifi" glyph with a diagonal slash through it (composed by hand, same
+// overlay technique as the bolt-over-battery charging badge below) - shown
+// in place of the bar indicator when the radio is on but not associated
+// with any access point yet. Font Awesome Free's solid set has no ready-
+// made "wifi-slash"/"wifi-off" glyph to pull the whole thing from directly.
+static void draw_icon_wifi_off(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_WIFI, cx, cy, size, color);
+    float r = size * 0.5f;
+    C2D_DrawLine(cx - r, cy - r, color, cx + r, cy + r, color, 2.0f, 0.5f);
+}
+
+// Plane glyph ("airplane mode") shown when wireless communications are
+// switched off entirely - the same convention used for this state on
+// basically every other platform.
+static void draw_icon_airplane(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_PLANE, cx, cy, size, color);
+}
+
 // Draws a Home-Menu-style WiFi signal indicator: 3 bars of increasing height,
 // filled left-to-right up to the current signal strength (0-3, straight from
 // the OS - no service init needed, same value the system's own WiFi icon
-// uses). 0 bars filled means no/negligible signal.
+// uses). Only meaningful once actually associated with an access point
+// (network_state_is_connected()) - otherwise swapped out for
+// draw_icon_wifi_off()/draw_icon_airplane() above, centered over the same
+// footprint the 3 bars would occupy, since 0 bars filled would otherwise
+// look identical whether the radio just has no signal yet or is switched
+// off completely.
 static void draw_wifi_indicator(float x, float baseline_y) {
+    u8 state = OS_SharedConfig->network_state;
+    if (!network_state_is_connected(state)) {
+        float cx = x + 6.5f, cy = baseline_y - 6.5f;
+        if (state == NETWORK_STATE_DISABLED) {
+            draw_icon_airplane(cx, cy, 15, COL_TEXT_DIM);
+        } else {
+            draw_icon_wifi_off(cx, cy, 15, COL_TEXT_DIM);
+        }
+        return;
+    }
+
     u8 strength = osGetWifiStrength();
     static const float bar_heights[3] = { 5.0f, 9.0f, 13.0f };
     static const float bar_w = 3.0f;
@@ -633,6 +689,30 @@ static void draw_wifi_indicator(float x, float baseline_y) {
         C2D_DrawRectSolid(bx, baseline_y - h, 0.5f, bar_w, h, col);
         bx += bar_w + bar_gap;
     }
+}
+
+// House glyph for a server connection over the local network in the top
+// HUD, paired with draw_icon_globe() below for the remote case.
+static void draw_icon_house(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_HOUSE, cx, cy, size, color);
+}
+
+// Globe glyph for a server connection reached over the internet.
+static void draw_icon_globe(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_GLOBE, cx, cy, size, color);
+}
+
+// Padlock glyph: closed (HTTPS) or open (HTTP).
+static void draw_icon_padlock(float cx, float cy, float size, u32 color, bool locked) {
+    draw_icon_glyph(locked ? ICON_CP_LOCK : ICON_CP_LOCK_OPEN, cx, cy, size, color);
+}
+
+// "Unplugged" glyph shown in place of the house/globe + padlock pair while
+// a server is configured but plex_api_is_connected() hasn't confirmed a
+// working connection yet (still connecting, or the last attempt failed) -
+// neither of those icons has anything real to report before then.
+static void draw_icon_disconnected(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_DISCONNECTED, cx, cy, size, color);
 }
 
 static void format_time(int ms, char* buf, size_t buf_size) {
@@ -1516,8 +1596,17 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (kDown & KEY_A && s_num_servers > 0) {
             strncpy(s_config->server_url, s_servers[s_selected_idx].uri, sizeof(s_config->server_url) - 1);
             strncpy(s_config->auth_token, s_servers[s_selected_idx].access_token, sizeof(s_config->auth_token) - 1);
+            strncpy(s_config->server_name, s_servers[s_selected_idx].name, sizeof(s_config->server_name) - 1);
             config_save(s_config);
             plex_api_init(s_config->server_url, s_config->auth_token);
+            // Confirms the connection so plex_api_is_connected() (and the
+            // top bar's house/globe + padlock icons, gated on it) reflect
+            // reality on the Hub screen right away, instead of reporting
+            // "disconnected" indefinitely just because nothing had called
+            // this yet - jumping straight to SCREEN_HUB either way since
+            // there's nowhere better to send a failure on this screen; the
+            // icon and normal in-app errors cover it from here.
+            plex_api_test_connection();
             ui_set_screen(SCREEN_HUB);
         }
         return;
@@ -1614,6 +1703,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (kDown & KEY_A || (kDown & KEY_TOUCH)) {
             if (s_setup_field == 0) {
                 if (show_keyboard("Enter Server URL", s_config->server_url, sizeof(s_config->server_url))) {
+                    // A manually-typed URL no longer corresponds to whatever
+                    // named resource server_name (if any) was last picked
+                    // from SCREEN_SERVER_SELECT - clear it so a future
+                    // reconnect attempt doesn't match this account's server
+                    // list back up against a name the user just overrode.
+                    s_config->server_name[0] = '\0';
                     config_save(s_config);
                 }
             } else if (s_setup_field == 1) {
@@ -1960,6 +2055,27 @@ static void draw_top_visualizer(PlexTrack* track, PlayerState state) {
     }
 }
 
+// One-off "Connecting..." frame, drawn manually outside the normal per-
+// frame ui_render_top()/ui_render_bottom() cycle (see main()'s startup
+// connection attempt) - reaching the saved server over the network can
+// block for several seconds (worst case, retrying every address a
+// reconnect-via-account falls back to in turn), and with nothing drawn
+// during that window the app would otherwise look hung/crashed rather
+// than just working on it.
+void ui_render_connecting(C3D_RenderTarget* top, C3D_RenderTarget* bottom) {
+    C2D_TextBufClear(s_text_buf);
+
+    C2D_TargetClear(top, COL_BG_TOP);
+    C2D_SceneBegin(top);
+    draw_text_centered("DUALPLEX", 10, TOP_WIDTH, 0.6f, 0.6f, COL_ACCENT);
+    C2D_DrawRectSolid(10, 30, 0.5f, TOP_WIDTH - 20, 2, COL_ACCENT);
+    draw_text_centered("Connecting...", TOP_HEIGHT / 2.0f - 10, TOP_WIDTH, 0.55f, 0.55f, COL_TEXT_DIM);
+
+    C2D_TargetClear(bottom, COL_BG);
+    C2D_SceneBegin(bottom);
+    draw_text_centered("Reaching your Plex server...", BTM_HEIGHT / 2.0f - 10, BTM_WIDTH, 0.45f, 0.45f, COL_TEXT_DIM);
+}
+
 void ui_render_top(C3D_RenderTarget* top) {
     C2D_TextBufClear(s_text_buf);
 
@@ -1992,6 +2108,29 @@ void ui_render_top(C3D_RenderTarget* top) {
     char bat_str[8];
     snprintf(bat_str, sizeof(bat_str), "%d%%", bat_percent);
     draw_text(bat_str, 54, 10, 0.42f, 0.42f, COL_TEXT_DIM);
+
+    // Connection status, right after the battery readout: house/globe for
+    // local-network vs. remote/internet server address, padlock for plain
+    // HTTP vs. HTTPS. Only shown once a server is actually configured
+    // (plex_api_get_server_url() reads back "" before Setup/Link finishes)
+    // - nothing meaningful to report before then. Neither icon has an
+    // answer worth showing until plex_api_is_connected() confirms an
+    // actual working connection either (mid-reconnect-attempt, or the
+    // last attempt failed) - a single "disconnected" glyph takes both
+    // icons' place instead, centered over the same two slots.
+    const char* conn_url = plex_api_get_server_url();
+    if (conn_url && conn_url[0]) {
+        if (!plex_api_is_connected()) {
+            draw_icon_disconnected(109, 17, 15, COL_TEXT_DIM);
+        } else {
+            if (plex_api_is_local_connection()) {
+                draw_icon_house(96, 17, 14, COL_TEXT_DIM);
+            } else {
+                draw_icon_globe(96, 17, 14, COL_TEXT_DIM);
+            }
+            draw_icon_padlock(122, 17, 14, COL_TEXT_DIM, plex_api_is_https());
+        }
+    }
 
     // Top-Right HUD: Time, right-aligned. 12/24-hour format: the 3DS has a
     // user-facing "Display 24-Hour Time" toggle (System Settings > Other

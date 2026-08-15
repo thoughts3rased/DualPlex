@@ -5,12 +5,32 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <curl/curl.h>
+#include <stdint.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "lib/cJSON.h"
 
 static char s_server_url[PLEX_MAX_URL] = {0};
 static char s_auth_token[128] = {0};
 static bool s_initialized = false;
 static PlexQualityTier s_quality_tier = QUALITY_MP3_320;  // Default: highest MP3
+
+// Whether the most recent plex_api_test_connection() call actually
+// succeeded - distinct from s_initialized, which just means plex_api_init()
+// was called with a non-empty server_url/token, regardless of whether
+// anything has answered back yet. Drives the top bar's connection-status
+// icons (see ui_render_top()): they show nothing useful before a
+// connection has actually been confirmed, so plex_api_is_connected()
+// gates them instead of just "is a server configured at all".
+static bool s_connected = false;
+
+// Cached result of the last DNS-backed local/remote classification (see
+// resolve_host_is_local_via_dns() and plex_api_test_connection() below).
+// Invalidated on every plex_api_init()/cleanup() so a stale answer from a
+// previous server never leaks into a new one.
+static bool s_local_override_valid = false;
+static bool s_local_override_value = false;
 
 static int quality_tier_to_bitrate(PlexQualityTier tier) {
     switch (tier) {
@@ -287,42 +307,46 @@ static bool plex_http_post_full_url(const char* url, const char* post_fields, co
     return false;
 }
 
+// Whether `host` (the part of a URL after "scheme://", so possibly still
+// followed by ":port" or "/path") is a literal dotted-quad IPv4 address
+// rather than a DNS hostname.
+static bool host_is_literal_ipv4(const char* host) {
+    int a, b, c, d, consumed = 0;
+    if (sscanf(host, "%d.%d.%d.%d%n", &a, &b, &c, &d, &consumed) != 4) return false;
+    char next = host[consumed];
+    return next == '\0' || next == ':' || next == '/';
+}
+
 static void sanitize_server_url(const char* in_url, char* out_url, size_t max_len) {
     if (!in_url || !in_url[0]) {
         out_url[0] = '\0';
         return;
     }
-    
+
     char temp[PLEX_MAX_URL];
     strncpy(temp, in_url, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
-    
-    // Check if domain is a .plex.direct address with dashed IP (e.g. 192-168-0-200.xyz.plex.direct:32400)
-    char* direct = strstr(temp, ".plex.direct");
-    if (direct) {
-        char* ip_start = strstr(temp, "http://");
-        if (ip_start) ip_start += 7;
-        else {
-            ip_start = strstr(temp, "https://");
-            if (ip_start) ip_start += 8;
-            else ip_start = temp;
-        }
-        
-        int a, b, c, d, port = 32400;
-        if (sscanf(ip_start, "%d-%d-%d-%d", &a, &b, &c, &d) == 4) {
-            char* port_str = strchr(direct, ':');
-            if (port_str) port = atoi(port_str + 1);
-            snprintf(out_url, max_len, "http://%d.%d.%d.%d:%d", a, b, c, d, port > 0 ? port : 32400);
+
+    // Plex Media Server's built-in HTTPS listener validates the request's
+    // Host/SNI against a *.plex.direct hostname and rejects a bare IP
+    // address outright (a documented PMS restriction, not a certificate-
+    // trust problem - see the CURLOPT_SSL_VERIFYPEER/VERIFYHOST(0) calls
+    // below, so this isn't about client-side cert verification either).
+    // A *.plex.direct hostname - dashed-IP direct connections included,
+    // e.g. 192-168-0-200.xyz.plex.direct:32400 - or any other DNS name
+    // (a user's own reverse proxy, say) doesn't have that problem and is
+    // left as HTTPS untouched. If a given server genuinely can't be
+    // reached over HTTPS for some other reason, plex_api_test_connection()
+    // falls back to HTTP on its own rather than that being decided here.
+    bool is_https = strncmp(temp, "https://", 8) == 0;
+    if (is_https) {
+        const char* host = temp + 8;
+        if (host_is_literal_ipv4(host)) {
+            snprintf(out_url, max_len, "http://%s", host);
             return;
         }
     }
-    
-    // Convert https:// to http:// for local IP connections
-    if (strncmp(temp, "https://", 8) == 0) {
-        snprintf(out_url, max_len, "http://%s", temp + 8);
-        return;
-    }
-    
+
     strncpy(out_url, temp, max_len - 1);
     out_url[max_len - 1] = '\0';
 }
@@ -330,13 +354,15 @@ static void sanitize_server_url(const char* in_url, char* out_url, size_t max_le
 bool plex_api_init(const char* server_url, const char* auth_token) {
     sanitize_server_url(server_url, s_server_url, sizeof(s_server_url));
     strncpy(s_auth_token, auth_token, sizeof(s_auth_token) - 1);
-    
+
     // Remove trailing slash if present
     size_t len = strlen(s_server_url);
     if (len > 0 && s_server_url[len - 1] == '/') {
         s_server_url[len - 1] = '\0';
     }
-    
+
+    s_local_override_valid = false; // stale answer from a previous server
+    s_connected = false; // not yet confirmed against this server/token
     s_initialized = true;
     return true;
 }
@@ -345,6 +371,8 @@ void plex_api_cleanup(void) {
     s_initialized = false;
     s_server_url[0] = '\0';
     s_auth_token[0] = '\0';
+    s_local_override_valid = false;
+    s_connected = false;
 }
 
 const char* plex_api_get_token(void) {
@@ -355,13 +383,184 @@ const char* plex_api_get_server_url(void) {
     return s_server_url;
 }
 
-bool plex_api_test_connection(void) {
-    char* response = NULL;
-    if (plex_http_get("/", &response)) {
-        free(response);
+bool plex_api_is_https(void) {
+    return strncmp(s_server_url, "https://", 8) == 0;
+}
+
+bool plex_api_is_connected(void) {
+    return s_connected;
+}
+
+// Whether an IPv4 address starting with octets `a.b....` falls in a
+// private/local range (RFC1918, loopback, or link-local).
+static bool ip_octets_are_private(int a, int b) {
+    if (a == 10) return true;                        // 10.0.0.0/8
+    if (a == 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
+    if (a == 192 && b == 168) return true;            // 192.168.0.0/16
+    if (a == 127) return true;                        // loopback
+    if (a == 169 && b == 254) return true;            // link-local
+    return false;
+}
+
+// Copies just the host portion of `url` (no "scheme://", no trailing
+// ":port" or "/path") into `out`.
+static void extract_host(const char* url, char* out, size_t out_size) {
+    const char* host = strstr(url, "://");
+    host = host ? host + 3 : url;
+    size_t i = 0;
+    while (host[i] && host[i] != ':' && host[i] != '/' && i < out_size - 1) {
+        out[i] = host[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+// Classifies `host` as local/remote without touching the network - only
+// handles the two cases that don't need a lookup: a literal dotted-quad
+// IP, or a *.plex.direct hostname, which dashed-encodes its own target IP
+// right in the name (e.g. 192-168-0-200.abc123.plex.direct - Plex's own
+// DNS just resolves that name back to the same IP, so it can be read
+// straight off the hostname). Returns false - leaving *out_local
+// untouched - for anything else, e.g. a custom domain that needs an
+// actual DNS lookup to classify (see resolve_host_is_local_via_dns()).
+static bool classify_host_without_dns(const char* host, bool* out_local) {
+    int a, b, c, d;
+    if (sscanf(host, "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+        *out_local = ip_octets_are_private(a, b);
+        return true;
+    }
+    if (strstr(host, ".plex.direct") && sscanf(host, "%d-%d-%d-%d", &a, &b, &c, &d) == 4) {
+        *out_local = ip_octets_are_private(a, b);
         return true;
     }
     return false;
+}
+
+// Resolves `host` via a real (blocking) DNS lookup and classifies the
+// result - the one case classify_host_without_dns() above can't handle on
+// its own: an arbitrary hostname (a user's own reverse proxy domain,
+// say) that isn't a literal IP or a self-describing plex.direct name.
+// Only call this from a context that already expects a blocking network
+// round-trip (plex_api_test_connection(), alongside its own HTTP probe) -
+// never from the render loop; plex_api_is_local_connection() below just
+// reads back whatever that last cached. Not part of the public API
+// (deliberately not in plex_api.h) - given external linkage here only so
+// tests/test_plex_api.c can exercise it directly against "localhost"
+// (loopback, no live network needed) without going through a full
+// plex_api_test_connection() HTTP round-trip.
+bool resolve_host_is_local_via_dns(const char* host) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = NULL;
+    bool is_local = false;
+    if (getaddrinfo(host, NULL, &hints, &result) == 0 && result) {
+        struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
+        uint32_t ip = ntohl(addr->sin_addr.s_addr);
+        is_local = ip_octets_are_private((ip >> 24) & 0xFF, (ip >> 16) & 0xFF);
+        freeaddrinfo(result);
+    }
+    return is_local;
+}
+
+bool plex_api_is_local_connection(void) {
+    // A DNS-backed answer from the last plex_api_test_connection() call
+    // takes priority - it's the only path that can classify a plain
+    // hostname (a custom domain, say) correctly. Until a connection test
+    // has actually run, fall back to the network-free literal-IP/
+    // .plex.direct check below (parsed straight from the stored,
+    // sanitized server URL rather than relying on PlexServerResource.
+    // is_local, which only exists when the server was picked from plex.
+    // tv's resource list, not when the user typed a URL manually in
+    // Setup - reading it back off the URL itself covers both paths).
+    if (s_local_override_valid) return s_local_override_value;
+
+    char host[256];
+    extract_host(s_server_url, host, sizeof(host));
+
+    bool is_local = false;
+    if (classify_host_without_dns(host, &is_local)) return is_local;
+
+    // An unresolved hostname with no connection test yet - can't say for
+    // sure without a DNS lookup, so default to "remote" (matches this
+    // function's behavior before DNS resolution existed at all).
+    return false;
+}
+
+// Does the actual work for plex_api_test_connection() below, which just
+// wraps this to also update s_connected (a single spot handling that
+// regardless of which of this function's several return points is hit,
+// rather than needing every one of them to remember to set it).
+static bool test_connection_impl(void) {
+    // Resolve local-vs-remote once per connection attempt here rather than
+    // from plex_api_is_local_connection() itself - that's called every
+    // frame to draw the top-bar icon, and a plain hostname (the only case
+    // that needs a real lookup) requires a blocking DNS round-trip. This
+    // function already does one blocking network round-trip below, so one
+    // more here doesn't change this call's cost class. Independent of the
+    // HTTP/HTTPS probe that follows - the host doesn't change between
+    // schemes - so it's cached before that can early-return.
+    {
+        char host[256];
+        extract_host(s_server_url, host, sizeof(host));
+        bool is_local;
+        if (!classify_host_without_dns(host, &is_local)) {
+            is_local = resolve_host_is_local_via_dns(host);
+        }
+        s_local_override_valid = true;
+        s_local_override_value = is_local;
+    }
+
+    bool tried_https = strncmp(s_server_url, "https://", 8) == 0;
+
+    char* response = NULL;
+    if (plex_http_get("/", &response)) {
+        free(response);
+        if (tried_https) LOG_INFO("Connected to %s over HTTPS", s_server_url);
+        return true;
+    }
+
+    // If we were trying HTTPS and that didn't work, silently retry once
+    // over HTTP before giving up, and keep s_server_url on whichever one
+    // actually succeeds. Covers servers this platform genuinely can't
+    // reach over HTTPS for some reason (e.g. a TLS version/cipher PMS's
+    // listener wants that this port's mbedtls doesn't support) without
+    // that possibility deciding the scheme up front for every server -
+    // most do work fine over HTTPS and should get the real padlock icon.
+    if (tried_https) {
+        char http_url[PLEX_MAX_URL];
+        snprintf(http_url, sizeof(http_url), "http://%s", s_server_url + 8);
+
+        char saved_https_url[PLEX_MAX_URL];
+        strncpy(saved_https_url, s_server_url, sizeof(saved_https_url) - 1);
+        saved_https_url[sizeof(saved_https_url) - 1] = '\0';
+
+        strncpy(s_server_url, http_url, sizeof(s_server_url) - 1);
+        s_server_url[sizeof(s_server_url) - 1] = '\0';
+
+        if (plex_http_get("/", &response)) {
+            free(response);
+            LOG_WARN("HTTPS connection to %s failed - falling back to HTTP", saved_https_url);
+            return true;
+        }
+
+        // Neither worked - restore the HTTPS URL so error messages/retries
+        // reflect what the user actually configured.
+        strncpy(s_server_url, saved_https_url, sizeof(s_server_url) - 1);
+        s_server_url[sizeof(s_server_url) - 1] = '\0';
+        LOG_ERROR("Connection failed over both HTTPS and HTTP fallback to %s", saved_https_url);
+    } else {
+        LOG_ERROR("Connection failed to %s", s_server_url);
+    }
+
+    return false;
+}
+
+bool plex_api_test_connection(void) {
+    s_connected = test_connection_impl();
+    return s_connected;
 }
 
 bool plex_api_create_pin(PlexPin* out_pin) {
@@ -550,6 +749,143 @@ int plex_api_get_servers(const char* account_token, PlexServerResource* out_serv
     
     if (response) free(response);
     return count;
+}
+
+// Up to this many connection candidates get tried per resource in
+// plex_api_reconnect_via_account() below - real accounts only ever
+// advertise a handful (LAN address, WAN/relay address, maybe a couple
+// more), so this is generous headroom, not a real limit.
+#define PLEX_RECONNECT_MAX_CANDIDATES 6
+
+// Re-establishes a connection using saved account credentials when the
+// previously working server address can no longer be reached at all -
+// e.g. the app launched on a different network (a mobile hotspot, a
+// different WiFi) where that address isn't reachable, but a different
+// address for the very same server (its public/remote address, a Plex
+// Relay connection, etc.) still is.
+//
+// Re-fetches the account's resource list from plex.tv (same endpoint
+// plex_api_get_servers() uses), then - for the resource named
+// `server_name` (or the account's first server if that name is blank or
+// no longer matches, e.g. a config saved before server_name existed) -
+// tries every connection Plex advertises for it in turn, unlike
+// plex_api_get_servers() above, which settles for a single "best" pick
+// per resource. That pick is guided by Plex's own "local" flag, which
+// just describes the address itself (the server's own LAN IP, say) - it
+// says nothing about whether THIS client can currently reach it, so on a
+// hotspot the server's LAN connection is still reported "local" even
+// though it's unreachable from here and there'd be nothing left to fall
+// back to. Local candidates are still tried first since they're typically
+// faster when they do work.
+//
+// On success, plex_api_init() has already been called with whatever
+// candidate worked (readable via plex_api_get_server_url()/
+// plex_api_get_token()) and this returns true, so the caller can persist
+// it via config_save(). On failure, restores whatever connection state
+// was in effect before this was called.
+bool plex_api_reconnect_via_account(const char* account_token, const char* server_name) {
+    if (!account_token || !account_token[0]) return false;
+
+    char saved_url[PLEX_MAX_URL];
+    char saved_token[128];
+    strncpy(saved_url, s_server_url, sizeof(saved_url) - 1);
+    saved_url[sizeof(saved_url) - 1] = '\0';
+    strncpy(saved_token, s_auth_token, sizeof(saved_token) - 1);
+    saved_token[sizeof(saved_token) - 1] = '\0';
+
+    char* response = NULL;
+    if (!plex_http_get_full_url("https://plex.tv/api/v2/resources?includeHttps=1", account_token, &response)) {
+        LOG_WARN("Reconnect: couldn't fetch account server list");
+        return false;
+    }
+
+    bool connected = false;
+    cJSON* json = cJSON_Parse(response);
+    if (json && cJSON_IsArray(json)) {
+        cJSON* fallback_res = NULL; // first server seen, used if no name match
+        cJSON* target_res = NULL;
+
+        cJSON* res_item = NULL;
+        cJSON_ArrayForEach(res_item, json) {
+            cJSON* provides = cJSON_GetObjectItem(res_item, "provides");
+            if (!provides || !cJSON_IsString(provides) || !strstr(provides->valuestring, "server")) continue;
+
+            if (!fallback_res) fallback_res = res_item;
+
+            cJSON* name = cJSON_GetObjectItem(res_item, "name");
+            if (server_name && server_name[0] && name && cJSON_IsString(name) &&
+                strcmp(name->valuestring, server_name) == 0) {
+                target_res = res_item;
+                break;
+            }
+        }
+        if (!target_res) target_res = fallback_res;
+
+        if (target_res) {
+            cJSON* token = cJSON_GetObjectItem(target_res, "accessToken");
+            char resource_token[128];
+            if (token && cJSON_IsString(token)) {
+                strncpy(resource_token, token->valuestring, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
+            } else {
+                strncpy(resource_token, account_token, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
+            }
+
+            char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_MAX_URL];
+            int candidate_count = 0;
+
+            cJSON* connections = cJSON_GetObjectItem(target_res, "connections");
+            if (connections && cJSON_IsArray(connections)) {
+                // Two passes so every "local" candidate sorts before every
+                // non-local one, without needing to actually sort anything.
+                for (int pass = 0; pass < 2 && candidate_count < PLEX_RECONNECT_MAX_CANDIDATES; pass++) {
+                    bool want_local = (pass == 0);
+                    cJSON* conn = NULL;
+                    cJSON_ArrayForEach(conn, connections) {
+                        if (candidate_count >= PLEX_RECONNECT_MAX_CANDIDATES) break;
+
+                        cJSON* uri = cJSON_GetObjectItem(conn, "uri");
+                        cJSON* local = cJSON_GetObjectItem(conn, "local");
+                        cJSON* address = cJSON_GetObjectItem(conn, "address");
+                        cJSON* port = cJSON_GetObjectItem(conn, "port");
+                        bool is_loc = (local && cJSON_IsTrue(local));
+                        if (is_loc != want_local) continue;
+
+                        char target[PLEX_MAX_URL] = "";
+                        if (is_loc && address && cJSON_IsString(address) && port && cJSON_IsNumber(port)) {
+                            snprintf(target, sizeof(target), "http://%s:%d", address->valuestring, port->valueint);
+                        } else if (uri && cJSON_IsString(uri)) {
+                            strncpy(target, uri->valuestring, sizeof(target) - 1);
+                        }
+                        if (target[0]) {
+                            sanitize_server_url(target, candidates[candidate_count], PLEX_MAX_URL);
+                            candidate_count++;
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < candidate_count && !connected; i++) {
+                plex_api_init(candidates[i], resource_token);
+                if (plex_api_test_connection()) {
+                    connected = true;
+                    LOG_INFO("Reconnected via account resource list: %s", candidates[i]);
+                }
+            }
+            if (!connected) {
+                LOG_WARN("Reconnect: none of %d candidate address(es) for '%s' were reachable",
+                         candidate_count, (server_name && server_name[0]) ? server_name : "(unnamed)");
+            }
+        }
+    }
+    if (json) cJSON_Delete(json);
+    if (response) free(response);
+
+    if (!connected) {
+        plex_api_init(saved_url, saved_token);
+    }
+    return connected;
 }
 
 int plex_api_get_music_libraries(PlexLibrary* out, int max) {

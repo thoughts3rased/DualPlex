@@ -109,8 +109,21 @@ void plex_api_cleanup(void);
 const char* plex_api_get_token(void);
 const char* plex_api_get_server_url(void);
 
+// Whether the current connection is HTTPS rather than plain HTTP.
+bool plex_api_is_https(void);
+
+// Whether the current server address is on a private/local network
+// (RFC1918, loopback, or link-local) rather than a public/remote one.
+bool plex_api_is_local_connection(void);
+
 // Test if the server is reachable and the token is valid.
 bool plex_api_test_connection(void);
+
+// Whether the most recent plex_api_test_connection() call succeeded -
+// distinct from just having a server_url/token configured at all. Drives
+// whether the top bar shows the local/remote + HTTP/HTTPS icons or a
+// single "disconnected" one instead (see ui_render_top()).
+bool plex_api_is_connected(void);
 
 // Create a PIN for plex.tv/link authorization flow.
 bool plex_api_create_pin(PlexPin* out_pin);
@@ -123,6 +136,18 @@ int plex_api_login_direct(const char* login, const char* password, const char* c
 
 // Get list of Plex Media Servers associated with account token.
 int plex_api_get_servers(const char* account_token, PlexServerResource* out_servers, int max);
+
+// Re-establishes a connection using saved account credentials when the
+// previously working server address can no longer be reached at all -
+// e.g. launching on a different network (a mobile hotspot, a different
+// WiFi) where that particular address isn't reachable, but a different
+// address for the same server (its remote/relay address, say) still is.
+// `server_name` should be AppConfig.server_name (blank is fine - falls
+// back to the account's first server). On success, plex_api_init() has
+// already been called with whatever candidate worked (readable via
+// plex_api_get_server_url()/plex_api_get_token()); the caller should
+// persist those via config_save().
+bool plex_api_reconnect_via_account(const char* account_token, const char* server_name);
 
 // Get music libraries.
 int plex_api_get_music_libraries(PlexLibrary* out, int max);
