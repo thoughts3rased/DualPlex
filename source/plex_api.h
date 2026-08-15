@@ -59,6 +59,7 @@ typedef struct {
     int bit_depth;
     int duration;
     int index;
+    float user_rating; // Plex's 0.0-10.0 star rating (0 = unrated); each star = 2.0
 } PlexTrack;
 
 typedef struct {
@@ -198,5 +199,48 @@ int plex_api_lyrics_async_take_result(PlexLyricLine* out, int max);
 // best-effort pings - dropping a stale one is fine).
 void plex_api_report_timeline_async(const char* rating_key, const char* state, int time_ms, int duration_ms);
 void plex_api_timeline_async_update(void);
+
+// Fire-and-forget non-blocking star rating. rating_10 is Plex's 0.0-10.0
+// scale (2 points per star; rounded to the nearest whole point), or -1 to
+// clear the rating back to unrated. Shares the same in-flight request slot
+// as plex_api_report_timeline_async() above (a newer call of either
+// replaces whatever's still in flight) - rating happens rarely enough that
+// occasionally dropping a periodic timeline ping in favor of it is a fine
+// tradeoff, same "best-effort" reasoning that already applies to timeline
+// reports colliding with each other.
+void plex_api_rate_track_async(const char* rating_key, float rating_10);
+
+// --- Sonic Analysis (loudness) -------------------------------------------
+// Plex's server-side per-track loudness analysis (Plex Pass "Sonic
+// Analysis"), used to drive smart crossfades: a track-level normalization
+// gain plus a short window of Plex's own short-term-loudness curve (dB,
+// one sample per 100ms) near whichever end of the track is relevant. Not
+// every track has this - unanalyzed tracks (or a server without Plex Pass)
+// come back with .valid = false and callers should fall back to a plain
+// fixed-duration crossfade with no gain adjustment.
+#define PLEX_ANALYSIS_CURVE_SAMPLES 100 // 10s of curve at 100ms/sample
+
+typedef struct {
+    bool valid;                                   // false if this track has no Sonic Analysis data
+    float gain_db;                                 // Stream.gain - normalization offset to apply
+    float loudness_lufs;                            // Stream.loudness - integrated loudness
+    float lra;                                      // Stream.lra - loudness range
+    int curve_count;                                 // valid entries in curve_db
+    float curve_db[PLEX_ANALYSIS_CURVE_SAMPLES];      // short-term loudness, oldest -> newest
+} PlexTrackAnalysis;
+
+// Starts a non-blocking Sonic Analysis fetch for rating_key, replacing any
+// fetch already in progress. want_tail selects which end of the track's
+// loudness curve to return: true for the last ~10s (use when this track is
+// about to end and you're timing a fade-out), false for the first ~10s (use
+// for the track about to start, timing a fade-in). Pump with
+// plex_api_analysis_async_update() every frame, same pattern as lyrics.
+void plex_api_analysis_async_start(const char* rating_key, bool want_tail);
+void plex_api_analysis_async_update(void);
+bool plex_api_analysis_async_is_done(void);
+// Collects the result (resets state back to idle - only call once per
+// start()). Always succeeds once is_done() is true; check out->valid for
+// whether real analysis data was actually found.
+void plex_api_analysis_async_take_result(PlexTrackAnalysis* out);
 
 #endif // PLEX_API_H

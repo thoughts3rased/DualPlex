@@ -89,6 +89,7 @@ plex_api.o: C:/Users/Samuel.Tong/Code/3ds-plex-client/source/plex_api.c \
  C:/devkitPro/libctru/include/3ds/3dslink.h \
  C:/Users/Samuel.Tong/Code/3ds-plex-client/source/config.h \
  C:/Users/Samuel.Tong/Code/3ds-plex-client/source/logger.h \
+ C:/Users/Samuel.Tong/Code/3ds-plex-client/source/audio_player.h \
  C:/devkitPro/portlibs/3ds/include/curl/curl.h \
  C:/devkitPro/portlibs/3ds/include/curl/curlver.h \
  C:/devkitPro/portlibs/3ds/include/curl/system.h \
@@ -191,6 +192,7 @@ C:/devkitPro/libctru/include/3ds/gdbhio_dev.h:
 C:/devkitPro/libctru/include/3ds/3dslink.h:
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/config.h:
 C:/Users/Samuel.Tong/Code/3ds-plex-client/source/logger.h:
+C:/Users/Samuel.Tong/Code/3ds-plex-client/source/audio_player.h:
 C:/devkitPro/portlibs/3ds/include/curl/curl.h:
 C:/devkitPro/portlibs/3ds/include/curl/curlver.h:
 C:/devkitPro/portlibs/3ds/include/curl/system.h:

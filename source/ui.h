@@ -22,6 +22,7 @@ typedef enum {
     SCREEN_NOW_PLAYING,   // Dedicated Now Playing controls screen
     SCREEN_QUEUE,         // Play Queue / Up Next screen
     SCREEN_LYRICS,        // Time-Synced Lyrics screen
+    SCREEN_SETTINGS,      // App-level settings (clock format, etc.)
 } UIScreen;
 
 // Initialize UI resources (text buffers, colors, etc.).

@@ -71,6 +71,8 @@ static void parse_config_file(FILE* f, AppConfig* config) {
                     strncpy(config->server_url, val, sizeof(config->server_url) - 1);
                 } else if (strcmp(key, "auth_token") == 0) {
                     strncpy(config->auth_token, val, sizeof(config->auth_token) - 1);
+                } else if (strcmp(key, "clock_24h") == 0) {
+                    config->clock_24h = (strcmp(val, "1") == 0);
                 }
                 // "volume" is intentionally no longer read: the app has no volume
                 // setting of its own anymore (see config_save() below) - kept
@@ -117,6 +119,7 @@ bool config_save(const AppConfig* config) {
     
     fprintf(f, "server_url=%s\n", config->server_url);
     fprintf(f, "auth_token=%s\n", config->auth_token);
+    fprintf(f, "clock_24h=%d\n", config->clock_24h ? 1 : 0);
     
     fclose(f);
     return true;

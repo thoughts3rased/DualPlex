@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
+#include <time.h>
 
 #include "config.h"
 #include "plex_api.h"
@@ -22,15 +23,22 @@ static AppConfig app_config;
 int main(int argc, char* argv[]) {
     // Enable New 3DS 804MHz CPU Clock Speedup & L2 Cache
     osSetSpeedupEnable(true);
-    
+
+    // Seed rand() (used for shuffle) - without this it produces the exact
+    // same sequence every launch, since nothing else in the app called
+    // srand(). svcGetSystemTick() varies even if the RTC hasn't been set.
+    srand((unsigned int)(time(NULL) ^ svcGetSystemTick()));
+
     // Initialize services
     gfxInitDefault();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
     ndspInit();
-    ptmuInit(); // needed for the battery HUD (PTMU_GetBatteryLevel/ChargeState) -
+    ptmuInit(); // needed for the battery HUD's charging-state read (PTMU_GetBatteryChargeState) -
                 // unlike hid/gfx/apt, ptm:u isn't started by the default runtime init
+    mcuHwcInit(); // needed for the battery HUD's percentage (MCUHWC_GetBatteryLevel) - see
+                  // ui_render_top()'s comment on why this, not PTMU_GetBatteryLevel, is used for it
     
     // Initialize network
     soc_buffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
@@ -135,6 +143,7 @@ int main(int argc, char* argv[]) {
     
     ndspExit();
     ptmuExit();
+    mcuHwcExit();
     C2D_Fini();
     C3D_Fini();
     gfxExit();

@@ -25,6 +25,7 @@ extern bool g_stub_is_new3ds;
  * linkage in plex_api.c only so it can be exercised directly here. See its
  * definition for why. */
 extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
 
 /* ---------------------------------------------------------------- test framework */
 
@@ -52,6 +53,16 @@ static const char* g_current_test = "";
             g_tests_failed++; \
             printf("  FAIL [%s] %s:%d: expected \"%s\", got \"%s\"\n", \
                    g_current_test, __FILE__, __LINE__, _e ? _e : "(null)", _a ? _a : "(null)"); \
+        } \
+    } while (0)
+
+#define CHECK_FLOAT_NEAR(actual, expected, tol) do { \
+        float _a = (actual); float _e = (expected); float _d = _a - _e; \
+        if (_d < 0) _d = -_d; \
+        if (_d > (tol)) { \
+            g_tests_failed++; \
+            printf("  FAIL [%s] %s:%d: expected %g, got %g\n", \
+                   g_current_test, __FILE__, __LINE__, (double)_e, (double)_a); \
         } \
     } while (0)
 
@@ -514,6 +525,124 @@ TEST(parse_lyrics_stream_response_no_lyrics_present_returns_zero) {
     CHECK(count == 0);
 }
 
+/* Regression: instrumental breaks weren't being recognized. Root cause -
+ * Plex marks a known break as a Line entry with a timestamp but no Span at
+ * all (nothing to say), and the parser silently dropped any Line with no
+ * text, losing the marker instead of keeping it as an empty-text entry for
+ * find_active_lyric_line() (ui.c) to recognize. Captured live from PMS for
+ * Vantage - "Like I Like It", which has three such breaks. */
+TEST(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers) {
+    char* fixture = read_fixture("tests/fixtures/vantage_instrumental_break.json");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    PlexLyricLine lines[64];
+    int count = parse_lyrics_stream_response(fixture, lines, 64);
+    CHECK(count > 0);
+
+    /* The break markers themselves: timed, but with empty text. */
+    static const int break_starts[] = {31320, 79380, 159720};
+    for (size_t b = 0; b < sizeof(break_starts) / sizeof(break_starts[0]); b++) {
+        bool found = false;
+        for (int i = 0; i < count; i++) {
+            if (lines[i].time_ms == break_starts[b]) {
+                found = true;
+                CHECK_STR_EQ(lines[i].text, "");
+                break;
+            }
+        }
+        CHECK(found);
+    }
+
+    /* The real lines immediately flanking the first break must have survived
+     * parsing too - this isn't only about the marker itself. */
+    bool found_before = false, found_after = false;
+    for (int i = 0; i < count; i++) {
+        if (lines[i].time_ms == 27410) {
+            found_before = true;
+            CHECK_STR_EQ(lines[i].text, "Like I like it (like I like it)");
+        }
+        if (lines[i].time_ms == 63830) {
+            found_after = true;
+            CHECK_STR_EQ(lines[i].text, "A whole lot more than a little bit");
+        }
+    }
+    CHECK(found_before);
+    CHECK(found_after);
+
+    free(fixture);
+}
+
+/* ================================================================== */
+/* parse_loudness_curve_response() - real captured /library/streams/{id}/
+ * loudness response (plain text, one dB value per line) for $ilkMoney -
+ * "Detour", 1484 lines/samples (148.4s @ 100ms/sample, matches the track's
+ * actual duration). */
+
+TEST(parse_loudness_curve_response_head_mode_returns_first_samples) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out[10];
+    int count = parse_loudness_curve_response(fixture, out, 10, /*want_tail=*/false);
+
+    CHECK(count == 10);
+    /* First 10 lines of the fixture, verbatim. */
+    float expected[10] = { -37.2f, -32.9f, -31.5f, -30.7f, -31.1f, -31.8f, -31.9f, -31.7f, -30.9f, -30.3f };
+    for (int i = 0; i < 10; i++) {
+        CHECK_FLOAT_NEAR(out[i], expected[i], 0.01f);
+    }
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_tail_mode_returns_last_samples) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out[5];
+    int count = parse_loudness_curve_response(fixture, out, 5, /*want_tail=*/true);
+
+    CHECK(count == 5);
+    /* Last 5 lines of the fixture (the file has a trailing newline after the
+     * final value, so these are genuinely the last 5 numbers in the file). */
+    float expected[5] = { -9.1f, -9.2f, -9.2f, -9.4f, -10.4f };
+    for (int i = 0; i < 5; i++) {
+        CHECK_FLOAT_NEAR(out[i], expected[i], 0.01f);
+    }
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_respects_max_cap) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out_head[3];
+    CHECK(parse_loudness_curve_response(fixture, out_head, 3, false) == 3);
+
+    float out_tail[3];
+    CHECK(parse_loudness_curve_response(fixture, out_tail, 3, true) == 3);
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them) {
+    const char* text = "-10.0\n-11.5\n-12.25\n";
+    float out[16];
+    CHECK(parse_loudness_curve_response(text, out, 16, false) == 3);
+    CHECK(parse_loudness_curve_response(text, out, 16, true) == 3);
+}
+
+TEST(parse_loudness_curve_response_empty_input_returns_zero) {
+    float out[8];
+    CHECK(parse_loudness_curve_response("", out, 8, false) == 0);
+    CHECK(parse_loudness_curve_response(NULL, out, 8, true) == 0);
+}
+
 /* ================================================================== */
 
 int main(void) {
@@ -539,6 +668,12 @@ int main(void) {
     RUN(parse_lyrics_stream_response_flat_array_fallback_shape);
     RUN(parse_lyrics_stream_response_raw_lrc_text_fallback_shape);
     RUN(parse_lyrics_stream_response_no_lyrics_present_returns_zero);
+    RUN(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers);
+    RUN(parse_loudness_curve_response_head_mode_returns_first_samples);
+    RUN(parse_loudness_curve_response_tail_mode_returns_last_samples);
+    RUN(parse_loudness_curve_response_respects_max_cap);
+    RUN(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them);
+    RUN(parse_loudness_curve_response_empty_input_returns_zero);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {
