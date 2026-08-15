@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Cached across runs, keyed on a fixed version string below - bump it
-      # (v3 -> v4) to force a clean reinstall if the toolchain ever needs
+      # (v4 -> v5) to force a clean reinstall if the toolchain ever needs
       # refreshing. On a cache hit every step below down to (not including)
       # the Build step is skipped entirely: everything the build needs
       # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/devkitpro
-          key: devkitpro-3ds-v3
+          key: devkitpro-3ds-v4
 
       # The runner's container has no devkitPro (or anything it needs) baked
       # in, so it's installed here on a cache miss. This is a from-scratch
@@ -98,19 +98,23 @@ jobs:
           $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
           $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
 
-      # devkitARM's arm-none-eabi-gcc (and devkitPro's other bundled tools -
-      # picasso, tex3ds, bin2s, etc.) are built on Arch Linux and need glibc
-      # symbols (up to GLIBC_2.36 as of this writing) newer than what this
-      # runner container ships, which fails as:
+      # devkitARM's arm-none-eabi-gcc, devkitPro's other bundled tools
+      # (picasso, tex3ds, bin2s, etc.), and makerom (Project_CTR's separate
+      # .cia tool, downloaded above) are all built on newer bases than this
+      # runner container ships, which fails as e.g.:
       #   arm-none-eabi-gcc: .../libc.so.6: version `GLIBC_2.35' not found
-      # Rather than upgrading the runner's own system libc6 - shared with
-      # the runner agent and everything else in this container - download
-      # Debian 12 (bookworm)'s libc6 into a private prefix under
+      #   makerom: .../libc.so.6: version `GLIBC_2.38' not found
+      # makerom's prebuilt Ubuntu binary needs the newest glibc of the three
+      # (2.38 as of this writing) - Debian 12 (bookworm, glibc 2.36) covers
+      # devkitPro's own tools but not makerom, so this uses Debian 13
+      # (trixie) instead. Rather than upgrading the runner's own system
+      # libc6 - shared with the runner agent and everything else in this
+      # container - download trixie's libc6 into a private prefix under
       # /opt/devkitpro (so it's covered by the cache above too) and use
-      # patchelf to repoint only devkitARM/devkitPro's own binaries at it.
-      # Nothing else on the runner is touched, and it's fully reversible by
-      # deleting GLIBC_PREFIX. If a future devkitPro update needs newer
-      # symbols than bookworm's glibc provides, point BOOKWORM below at a
+      # patchelf to repoint only these binaries at it. Nothing else on the
+      # runner is touched, and it's fully reversible by deleting
+      # GLIBC_PREFIX. If a future devkitPro/makerom update needs newer
+      # symbols than trixie's glibc provides, point DEBIAN_SUITE below at a
       # newer Debian/Ubuntu suite's Packages index instead.
       - name: Provide a newer glibc for devkitARM/devkitPro's prebuilt tools
         if: steps.cache-devkitpro.outputs.cache-hit != 'true'
@@ -120,11 +124,11 @@ jobs:
 
           $SUDO apt-get install -y --no-install-recommends patchelf file
 
-          BOOKWORM="http://deb.debian.org/debian/dists/bookworm/main/binary-amd64/Packages.gz"
-          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-bookworm"
-          rm -rf "$GLIBC_PREFIX" && mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
+          DEBIAN_SUITE="http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz"
+          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-newer"
+          rm -rf "$GLIBC_PREFIX" "$DEVKITPRO/tools/glibc-bookworm" && mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
 
-          wget -q "$BOOKWORM" -O /tmp/glibc-deb/Packages.gz
+          wget -q "$DEBIAN_SUITE" -O /tmp/glibc-deb/Packages.gz
           gunzip -f /tmp/glibc-deb/Packages.gz
           LIBC6_PATH=$(awk '/^Package: libc6$/{f=1} f&&/^Filename:/{print $2; exit} /^$/{f=0}' /tmp/glibc-deb/Packages)
           wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
@@ -146,7 +150,7 @@ jobs:
           fi
 
           # Repoint every dynamically-linked ELF under devkitARM and
-          # devkitPro's tools at the bookworm loader + libc - leaves every
+          # devkitPro's tools at the trixie loader + libc - leaves every
           # other binary on the runner (including the runner agent itself)
           # untouched. Appends NEWLIBDIR to each binary's existing rpath
           # (rather than replacing it) since several of these - cc1/cc1plus
