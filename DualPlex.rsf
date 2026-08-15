@@ -27,9 +27,19 @@ AccessControlInfo:
   SystemMode: 64MB
   MemoryType: Application
 
+  # Virtual Address Mappings
+  IORegisterMapping:
+    - 1ff00000-1ff7ffff   # DSP memory - required for ndsp/dsp::DSP to work; without
+                           # this the DSP window is never mapped into the process and
+                           # ndspInitialize crashes with a data abort the moment it
+                           # writes through an address DSP_ConvertProcessAddressFromDspDram
+                           # handed back.
+
+  MemoryMapping:
+    - 1f000000-1f5fffff:r # VRAM (matches devkitPro's default template; harmless if unused)
+
   ServiceAccessControl:
     - APT:U
-    - ndsp:u
     - soc:U
     - gsp::GPU
     - hid:USER
