@@ -58,7 +58,8 @@ jobs:
           path: |
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
-          key: devkitpro-3ds-extras-v1
+            /opt/devkitpro/tools/glibc-makerom
+          key: devkitpro-3ds-extras-v2
 
       - name: Install missing 3DS portlibs + makerom
         if: steps.cache-extras.outputs.cache-hit != 'true'
@@ -93,6 +94,41 @@ jobs:
           $SUDO mkdir -p /opt/devkitpro/tools/bin
           $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
           $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
+
+          # makerom's prebuilt Ubuntu binary needs GLIBC_2.38, newer than
+          # what devkitpro/devkitarm's own base image ships (unlike
+          # devkitARM/devkitPro's own tools, which are baked into this image
+          # already and match its glibc fine - makerom is the one binary
+          # here that comes from somewhere else entirely):
+          #   makerom: /lib/x86_64-linux-gnu/libc.so.6: version
+          #   `GLIBC_2.38' not found (required by makerom)
+          # Download Debian 13 (trixie)'s libc6 into a private prefix and
+          # patchelf just this one binary at it, rather than touching the
+          # container's own system libc6. Every run gets a fresh container
+          # instance, so there's no persistent state to worry about
+          # compounding across runs here.
+          $SUDO apt-get install -y --no-install-recommends patchelf
+
+          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-makerom"
+          mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
+          wget -q "http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz" -O /tmp/glibc-deb/Packages.gz
+          gunzip -f /tmp/glibc-deb/Packages.gz
+          LIBC6_PATH=$(awk '/^Package: libc6$/{f=1} f&&/^Filename:/{print $2; exit} /^$/{f=0}' /tmp/glibc-deb/Packages)
+          wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
+          dpkg -x /tmp/glibc-deb/libc6.deb "$GLIBC_PREFIX"
+
+          # Debian's libc6 .deb ships the dynamic linker as the real file
+          # under lib/x86_64-linux-gnu/, with lib64/ld-linux-x86-64.so.2 as
+          # an *absolute* symlink to it - following that inside our private
+          # prefix would land back on the container's own old system loader,
+          # so resolve to the real (non-symlink) file instead.
+          NEWLD=$(find "$GLIBC_PREFIX" -name 'ld-linux-x86-64.so.2' -type f | head -1)
+          if [ -z "$NEWLD" ]; then
+            echo "::error::Couldn't find the real ld-linux-x86-64.so.2 inside $GLIBC_PREFIX - libc6 layout may have changed upstream" >&2
+            exit 1
+          fi
+          patchelf --set-interpreter "$NEWLD" /opt/devkitpro/tools/bin/makerom
+          patchelf --set-rpath "$GLIBC_PREFIX/lib/x86_64-linux-gnu" /opt/devkitpro/tools/bin/makerom
 
       - name: Build (.elf, .3dsx, .cia)
         run: |
