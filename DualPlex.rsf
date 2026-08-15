@@ -1,0 +1,97 @@
+BasicInfo:
+  Title: "DualPlex"
+  CompanyCode: "00"
+  ProductCode: "CTR-P-PLX3"
+  ContentType: Application
+  Logo: Nintendo
+
+TitleInfo:
+  UniqueId: 0xEE300
+  Category: Application
+
+Option:
+  UseOnSD: true
+  MediaFootPadding: true
+
+SystemControlInfo:
+  SaveDataSize: 0KB
+  StackSize: 0x40000
+
+AccessControlInfo:
+  CoreVersion: 2
+  HandleTableSize: 512
+  IdealProcessor: 0
+  AffinityMask: 1
+  Priority: 16
+  MaxCpu: 80
+  SystemMode: 64MB
+  MemoryType: Application
+
+  ServiceAccessControl:
+    - APT:U
+    - ndsp:u
+    - soc:U
+    - gsp::GPU
+    - hid:USER
+    - dsp::DSP
+    - fs:USER
+    - cfg:u
+    - ssl:C
+
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadId: 13
+    GetProcessId: 14
+    GetThreadContext: 15
+    Break: 16
+    OutputDebugString: 17
+    ControlPerformanceCounter: 18
+    GetSystemTick: 19
+    GetSharedFont: 20
+    KernelSetState: 21
+    GetThreadCommandBuffer: 22
+    SetThreadArea: 23
+    GetThreadArea: 24
+    CreateMutex: 25
+    ReleaseMutex: 26
+    CreateSemaphore: 27
+    ReleaseSemaphore: 28
+    CreateEvent: 29
+    SignalEvent: 30
+    ClearEvent: 31
+    CreateTimer: 32
+    SetTimer: 33
+    CancelTimer: 34
+    ClearTimer: 35
+    CreateMemoryBlock: 36
+    MapMemoryBlock: 37
+    UnmapMemoryBlock: 38
+    CreateAddressArbiter: 39
+    ArbitrateAddress: 40
+    CloseHandle: 41
+    WaitSynchronization1: 42
+    WaitSynchronizationN: 43
+    SignalAndWait: 44
+    DuplicateHandle: 45
+    GetSystemInfo: 46
+    GetProcessInfo: 47
+    GetThreadInfo: 48
+    ConnectToPort: 49
+    SendSyncRequest1: 50
+    SendSyncRequest2: 51
+    SendSyncRequest3: 52
+    SendSyncRequest4: 53
+    SendSyncRequest: 54
+    OpenProcess: 55
+    OpenThread: 56

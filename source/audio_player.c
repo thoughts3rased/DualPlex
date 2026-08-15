@@ -46,9 +46,21 @@ static CURLM* s_curl_multi = NULL;
 static CURL* s_curl_easy = NULL;
 static int s_duration_ms = 0;
 static int s_samples_played = 0;
-static float s_volume = 0.8f;
+static int s_position_offset_ms = 0; // added to sample-derived position; see audio_player_set_position_offset_ms()
+// The actual sample rate currently being decoded at (mp3 is always fixed at
+// AUDIO_SAMPLE_RATE via mpg123_format(), but FLAC decodes at the source's
+// true native rate - e.g. 48000 or 96000, not necessarily AUDIO_SAMPLE_RATE).
+// audio_player_get_position_ms() must divide by this, not the constant, or
+// the reported position (and therefore the progress bar) runs fast/slow by
+// whatever ratio the two differ by.
+static float s_decode_sample_rate = AUDIO_SAMPLE_RATE;
 static char s_current_url[PLEX_MAX_URL] = {0};
 static struct curl_slist* s_headers = NULL;
+
+// --- Visualizer snapshot: most recently decoded audio, mono-downmixed ---
+#define VIS_SNAPSHOT_SAMPLES 256
+static s16 s_vis_snapshot[VIS_SNAPSHOT_SAMPLES];
+static int s_vis_snapshot_count = 0;
 
 static bool s_initial_buffering = true;
 #define AUDIO_INITIAL_BUFFER_BYTES (48 * 1024)
@@ -136,6 +148,27 @@ static void ring_read(u8* out, size_t len) {
 }
 
 static bool s_curl_paused = false;
+
+// Downmixes the tail of a freshly-decoded s16 PCM chunk into the mono
+// visualizer snapshot. Called right after each successful decode (both the
+// MP3 and FLAC paths) - channels is whatever that decode actually produced
+// (tracks can be mono or stereo), not assumed to always be stereo.
+static void update_vis_snapshot(const s16* pcm, u32 nframes, int channels) {
+    u32 take = nframes < VIS_SNAPSHOT_SAMPLES ? nframes : VIS_SNAPSHOT_SAMPLES;
+    u32 start_frame = nframes - take;
+    if (channels <= 1) {
+        for (u32 i = 0; i < take; i++) {
+            s_vis_snapshot[i] = pcm[start_frame + i];
+        }
+    } else {
+        for (u32 i = 0; i < take; i++) {
+            s16 l = pcm[(start_frame + i) * channels + 0];
+            s16 r = pcm[(start_frame + i) * channels + 1];
+            s_vis_snapshot[i] = (s16)(((s32)l + (s32)r) / 2);
+        }
+    }
+    s_vis_snapshot_count = (int)take;
+}
 
 static size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
     size_t total = size * nmemb;
@@ -249,10 +282,19 @@ bool audio_player_prefetch_url(const char* url) {
         snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
         s_prefetch_headers = curl_slist_append(s_prefetch_headers, token_hdr);
     }
-    s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Client-Identifier: 3ds-plex-client");
-    s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Product: 3DS Plex Client");
+    // NOTE: deliberately no X-Plex-Client-Identifier header here - PMS's universal
+    // transcoder rejects the request with a 400 if that header is present at all
+    // (confirmed against real server, PMS 1.43.3). It's not needed to fetch the
+    // stream since the token alone authenticates the request.
+    s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Product: " PLEX_PRODUCT);
     s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Device: Nintendo 3DS");
-    s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Platform: Nintendo 3DS");
+    // "Chrome" rather than "Nintendo 3DS": PMS's transcoder matches X-Plex-Platform
+    // against its known device-profile list and 400s on anything it doesn't
+    // recognize (confirmed: "Generic" itself has since stopped covering http-
+    // protocol conversion in newer PMS builds - "Chrome" backs Plex Web, one of
+    // Plex's own primary supported clients, and PMS keeps its transcode profile
+    // current for it).
+    s_prefetch_headers = curl_slist_append(s_prefetch_headers, "X-Plex-Platform: Chrome");
     
     curl_easy_setopt(s_prefetch_curl, CURLOPT_URL, s_prefetch_url);
     curl_easy_setopt(s_prefetch_curl, CURLOPT_HTTPHEADER, s_prefetch_headers);
@@ -262,7 +304,7 @@ bool audio_player_prefetch_url(const char* url) {
     curl_easy_setopt(s_prefetch_curl, CURLOPT_NOPROGRESS, 1L);
     curl_easy_setopt(s_prefetch_curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(s_prefetch_curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
-    curl_easy_setopt(s_prefetch_curl, CURLOPT_USERAGENT, "3DS-Plex-Client/1.0 (Nintendo 3DS)");
+    curl_easy_setopt(s_prefetch_curl, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
     
     if (!s_curl_multi) {
         s_curl_multi = curl_multi_init();
@@ -277,8 +319,12 @@ bool audio_player_prefetch_url(const char* url) {
 
 bool audio_player_is_prefetch_ready(void) {
     if (!s_prefetch_active) return false;
-    return prefetch_ring_available_read() >= AUDIO_INITIAL_BUFFER_BYTES || 
+    return prefetch_ring_available_read() >= AUDIO_INITIAL_BUFFER_BYTES ||
            s_prefetch_ring.download_finished;
+}
+
+bool audio_player_is_download_finished(void) {
+    return s_ring.download_finished || s_ring.download_error;
 }
 
 bool audio_player_activate_prefetch(void) {
@@ -406,7 +452,13 @@ bool audio_player_init(void) {
     ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
     ndspChnSetRate(0, AUDIO_SAMPLE_RATE);
     ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
-    audio_player_set_volume(s_volume);
+    // No app-level volume control: the 3DS's physical volume slider already
+    // attenuates audio output in hardware, so a second software gain on top
+    // of it is redundant (and was hiding the case where it's turned all the
+    // way down). Always mix at full scale and let the slider be the only
+    // volume control, same as every other 3DS application.
+    float full_mix[12] = {1.0f, 1.0f};
+    ndspChnSetMix(0, full_mix);
     
     s_curl_multi = curl_multi_init();
     
@@ -524,7 +576,10 @@ bool audio_player_load_url(const char* url) {
     }
     
     s_samples_played = 0;
-    
+    s_position_offset_ms = 0; // callers doing a seek should call
+                              // audio_player_set_position_offset_ms() right after this
+    s_decode_sample_rate = AUDIO_SAMPLE_RATE; // corrected once the real format is known (MP3 NEW_FORMAT / FLAC open)
+
     // Reset adaptive quality state
     s_speed_window_start = svcGetSystemTick();
     s_speed_window_bytes = 0;
@@ -552,10 +607,19 @@ bool audio_player_load_url(const char* url) {
         snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
         s_headers = curl_slist_append(s_headers, token_hdr);
     }
-    s_headers = curl_slist_append(s_headers, "X-Plex-Client-Identifier: 3ds-plex-client");
-    s_headers = curl_slist_append(s_headers, "X-Plex-Product: 3DS Plex Client");
+    // NOTE: deliberately no X-Plex-Client-Identifier header here - PMS's universal
+    // transcoder rejects the request with a 400 if that header is present at all
+    // (confirmed against real server, PMS 1.43.3). It's not needed to fetch the
+    // stream since the token alone authenticates the request.
+    s_headers = curl_slist_append(s_headers, "X-Plex-Product: " PLEX_PRODUCT);
     s_headers = curl_slist_append(s_headers, "X-Plex-Device: Nintendo 3DS");
-    s_headers = curl_slist_append(s_headers, "X-Plex-Platform: Nintendo 3DS");
+    // "Chrome" rather than "Nintendo 3DS": PMS's transcoder matches X-Plex-Platform
+    // against its known device-profile list and 400s on anything it doesn't
+    // recognize (confirmed: "Generic" itself has since stopped covering http-
+    // protocol conversion in newer PMS builds - "Chrome" backs Plex Web, one of
+    // Plex's own primary supported clients, and PMS keeps its transcode profile
+    // current for it).
+    s_headers = curl_slist_append(s_headers, "X-Plex-Platform: Chrome");
     
     curl_easy_setopt(s_curl_easy, CURLOPT_URL, s_current_url);
     curl_easy_setopt(s_curl_easy, CURLOPT_HTTPHEADER, s_headers);
@@ -565,14 +629,17 @@ bool audio_player_load_url(const char* url) {
     curl_easy_setopt(s_curl_easy, CURLOPT_NOPROGRESS, 1L);
     curl_easy_setopt(s_curl_easy, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(s_curl_easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
-    curl_easy_setopt(s_curl_easy, CURLOPT_USERAGENT, "3DS-Plex-Client/1.0 (Nintendo 3DS)");
+    curl_easy_setopt(s_curl_easy, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
     
     if (!s_curl_multi) {
         s_curl_multi = curl_multi_init();
     }
     curl_multi_add_handle(s_curl_multi, s_curl_easy);
-    
-    s_state = PLAYER_PLAYING;
+
+    // Not PLAYER_PLAYING yet - there's no buffered audio to actually play
+    // until the initial-buffering wait below finishes. Reporting PLAYING
+    // immediately was why the UI never showed any buffering indicator.
+    s_state = PLAYER_LOADING;
     ndspChnSetPaused(0, false);
     return true;
 }
@@ -727,10 +794,11 @@ void audio_player_update(void) {
     
     // Initial buffering: wait until we have enough data before starting decode
     if (s_initial_buffering) {
-        if (ring_available_read() >= AUDIO_INITIAL_BUFFER_BYTES || 
+        if (ring_available_read() >= AUDIO_INITIAL_BUFFER_BYTES ||
             s_ring.download_finished || s_ring.download_error) {
             s_initial_buffering = false;
-            LOG_INFO("Initial buffering complete (%d bytes ready), starting decode", 
+            if (s_state == PLAYER_LOADING) s_state = PLAYER_PLAYING;
+            LOG_INFO("Initial buffering complete (%d bytes ready), starting decode",
                      (int)ring_available_read());
         } else {
             return; // Still buffering, don't try to decode yet
@@ -756,6 +824,7 @@ void audio_player_update(void) {
                     int channels = 2, enc = 0;
                     mpg123_getformat(s_mpg, &rate, &channels, &enc);
                     ndspChnSetRate(0, (u32)rate);
+                    s_decode_sample_rate = (float)rate;
                     ndspChnSetFormat(0, channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
                 }
                 
@@ -764,6 +833,7 @@ void audio_player_update(void) {
                     DSP_FlushDataCache(s_wave_bufs[i].data_vaddr, bytes_decoded);
                     ndspChnWaveBufAdd(0, &s_wave_bufs[i]);
                     s_samples_played += s_wave_bufs[i].nsamples;
+                    update_vis_snapshot((const s16*)s_wave_bufs[i].data_vaddr, s_wave_bufs[i].nsamples, AUDIO_NUM_CHANNELS);
                     playing_audio = true;
                 }
             } else {
@@ -804,6 +874,7 @@ void audio_player_update(void) {
                 s_flac = drflac_open(flac_read_proc, flac_seek_proc, flac_tell_proc, NULL, NULL);
                 if (s_flac) {
                     ndspChnSetRate(0, s_flac->sampleRate);
+                    s_decode_sample_rate = (float)s_flac->sampleRate;
                     ndspChnSetFormat(0, s_flac->channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
                     LOG_INFO("⚡ N3DS Hardware FLAC Decoder Active: %uHz, %uch, %ubit", s_flac->sampleRate, s_flac->channels, s_flac->bitsPerSample);
                 } else {
@@ -825,6 +896,7 @@ void audio_player_update(void) {
                         DSP_FlushDataCache(s_wave_bufs[i].data_vaddr, bytes_decoded);
                         ndspChnWaveBufAdd(0, &s_wave_bufs[i]);
                         s_samples_played += (int)frames_read;
+                        update_vis_snapshot((const s16*)s_wave_bufs[i].data_vaddr, (u32)frames_read, s_flac->channels);
                         playing_audio = true;
                     }
                 } else {
@@ -870,23 +942,22 @@ float audio_player_get_progress(void) {
 }
 
 int audio_player_get_position_ms(void) {
-    return (int)(((float)s_samples_played / (float)AUDIO_SAMPLE_RATE) * 1000.0f);
+    return s_position_offset_ms + (int)(((float)s_samples_played / s_decode_sample_rate) * 1000.0f);
 }
 
 void audio_player_set_duration(int duration_ms) {
     s_duration_ms = duration_ms;
 }
 
-void audio_player_set_volume(float vol) {
-    s_volume = vol;
-    if (s_volume < 0.0f) s_volume = 0.0f;
-    if (s_volume > 1.0f) s_volume = 1.0f;
-    float mix[12] = {s_volume, s_volume};
-    ndspChnSetMix(0, mix);
+void audio_player_set_position_offset_ms(int offset_ms) {
+    s_position_offset_ms = offset_ms;
 }
 
-float audio_player_get_volume(void) {
-    return s_volume;
+int audio_player_get_visualizer_samples(s16* out, int max_samples) {
+    if (!out || max_samples <= 0) return 0;
+    int n = s_vis_snapshot_count < max_samples ? s_vis_snapshot_count : max_samples;
+    if (n > 0) memcpy(out, s_vis_snapshot, (size_t)n * sizeof(s16));
+    return n;
 }
 
 int audio_player_get_download_speed(void) {

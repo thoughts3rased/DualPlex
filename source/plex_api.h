@@ -8,8 +8,8 @@
 
 #define PLEX_MAX_ITEMS 500
 #define PLEX_PAGE_SIZE 30
-#define PLEX_CLIENT_ID "3ds-plex-client"
-#define PLEX_PRODUCT "3DS Plex Client"
+#define PLEX_CLIENT_ID "dualplex-3ds"
+#define PLEX_PRODUCT "DualPlex"
 #define PLEX_VERSION "0.1.0"
 #define PLEX_DEVICE "Nintendo 3DS"
 
@@ -156,6 +156,11 @@ bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_m
 // Build a transcode-to-MP3 URL for a track into url_out.
 bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max);
 
+// Build a transcode-to-MP3 URL that starts at seek_ms into the track, for
+// implementing seeking (the player reloads from this URL and calls
+// audio_player_set_position_offset_ms(seek_ms) to match).
+bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, size_t url_max);
+
 typedef struct {
     int time_ms;
     char text[128];
@@ -164,10 +169,34 @@ typedef struct {
 // Download album cover art image bytes
 bool plex_api_get_album_art(const char* thumb_path, u8** out_data, size_t* out_size);
 
-// Fetch time-synced lyrics for a track
+// Fetch time-synced lyrics for a track. Blocks the caller for the duration
+// of two HTTP round-trips - do not call this while a track is actively
+// loading/playing (freezes rendering and input for however long that takes).
+// Use the async version below in that context instead.
 int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max);
 
-// Report session timeline to Plex Media Server
+// Report session timeline to Plex Media Server. Blocks the caller for one
+// HTTP round-trip - same caution as plex_api_get_lyrics() above.
 void plex_api_report_timeline(const char* rating_key, const char* state, int time_ms, int duration_ms);
+
+// --- Non-blocking equivalents ------------------------------------------
+// Both need their *_async_update() pumped once per frame (same pattern as
+// album_art_update()) regardless of whether a fetch is currently in flight.
+
+// Starts a non-blocking lyrics fetch for rating_key, replacing any fetch
+// already in progress. Call plex_api_lyrics_async_update() every frame to
+// pump it, then plex_api_lyrics_async_is_done() to check readiness and
+// plex_api_lyrics_async_take_result() once to collect it (that call resets
+// state back to idle - only take the result once per start()).
+void plex_api_lyrics_async_start(const char* rating_key);
+void plex_api_lyrics_async_update(void);
+bool plex_api_lyrics_async_is_done(void);
+int plex_api_lyrics_async_take_result(PlexLyricLine* out, int max);
+
+// Fire-and-forget non-blocking timeline report. A newer call replaces an
+// older one still in flight rather than queuing (these are periodic
+// best-effort pings - dropping a stale one is fine).
+void plex_api_report_timeline_async(const char* rating_key, const char* state, int time_ms, int duration_ms);
+void plex_api_timeline_async_update(void);
 
 #endif // PLEX_API_H

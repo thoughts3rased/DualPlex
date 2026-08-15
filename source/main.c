@@ -29,6 +29,8 @@ int main(int argc, char* argv[]) {
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
     ndspInit();
+    ptmuInit(); // needed for the battery HUD (PTMU_GetBatteryLevel/ChargeState) -
+                // unlike hid/gfx/apt, ptm:u isn't started by the default runtime init
     
     // Initialize network
     soc_buffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
@@ -49,9 +51,8 @@ int main(int argc, char* argv[]) {
     
     // Initialize subsystems
     logger_init();
-    LOG_INFO("3DS Plex Client starting up...");
+    LOG_INFO("DualPlex starting up...");
     audio_player_init();
-    audio_player_set_volume(app_config.volume / 100.0f);
     ui_init();
     ui_set_config(&app_config);
     
@@ -70,6 +71,8 @@ int main(int argc, char* argv[]) {
     }
     
     // Main loop
+    bool sleep_allowed = true; // libctru's own default, tracked so we only call
+                                // aptSetSleepAllowed() on actual transitions
     while (aptMainLoop()) {
         // Input
         hidScanInput();
@@ -77,10 +80,24 @@ int main(int argc, char* argv[]) {
         u32 kHeld = hidKeysHeld();
         touchPosition touch;
         hidTouchRead(&touch);
-        
+
         // Exit on START+SELECT
         if ((kDown & KEY_START) && (kHeld & KEY_SELECT)) break;
-        
+
+        // Keep playback going with the lid closed: closing the lid always cuts
+        // the screen backlights (that's hardware, not something we control),
+        // but by default it also tells the OS to fully suspend the console -
+        // which would stop NDSP audio and the network stream mid-track. Disable
+        // that suspend only while a track is actively playing, so closing the
+        // lid works like a phone with the screen off instead of pausing the
+        // console; sleep behaves normally the rest of the time (idle on a menu,
+        // paused, stopped) to not cost battery for no reason.
+        bool should_allow_sleep = (audio_player_get_state() != PLAYER_PLAYING);
+        if (should_allow_sleep != sleep_allowed) {
+            aptSetSleepAllowed(should_allow_sleep);
+            sleep_allowed = should_allow_sleep;
+        }
+
         // Update
         audio_player_update();
         ui_update(kDown, kHeld, touch);
@@ -98,9 +115,11 @@ int main(int argc, char* argv[]) {
         
         C3D_FrameEnd(0);
     }
-    
+
+    // Restore normal sleep behavior in case we're exiting mid-playback with it disabled
+    if (!sleep_allowed) aptSetSleepAllowed(true);
+
     // Save config before exit
-    app_config.volume = (int)(audio_player_get_volume() * 100);
     config_save(&app_config);
     
     // Cleanup (reverse order)
@@ -115,6 +134,7 @@ int main(int argc, char* argv[]) {
     }
     
     ndspExit();
+    ptmuExit();
     C2D_Fini();
     C3D_Fini();
     gfxExit();

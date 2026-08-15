@@ -944,9 +944,14 @@ static bool plex_http_get_binary(const char* url, const char* token, u8** respon
     return false;
 }
 
-bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
+// Shared by plex_api_get_transcode_url() (offset_sec=0) and
+// plex_api_get_seek_url() (offset_sec = where the user scrubbed to) - a seek
+// is just a fresh transcode reload starting from a different point in the
+// track, using Plex's own "offset" param so the server does the real seeking
+// (accurate regardless of codec/bitrate, unlike guessing a byte offset).
+static bool build_transcode_url(const PlexTrack* track, int offset_sec, char* url_out, size_t url_max) {
     if (!s_initialized || !track) return false;
-    
+
     char raw_path[512];
     if (track->rating_key[0] != '\0') {
         if (strncmp(track->rating_key, "/library/metadata/", 18) == 0) {
@@ -976,21 +981,47 @@ bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t ur
         return false;
     }
     
-    // Encode the token for use as a query parameter
-    char* encoded_token = curl_easy_escape(curl, s_auth_token, 0);
-    
     int bitrate = quality_tier_to_bitrate(s_quality_tier);
-    
-    snprintf(url_out, url_max, 
-        "%s/music/:/transcode/universal/start.mp3?path=%s&mediaIndex=0&partIndex=0&protocol=http&fastSeek=1&directPlay=0&directStream=0&directStreamAudio=0&audioCodec=mp3&container=mp3&maxAudioBitrate=%d&audioBitrate=%d&session=3ds-plex-client&X-Plex-Token=%s&X-Plex-Client-Identifier=" PLEX_CLIENT_ID "&X-Plex-Product=3DS%%20Plex%%20Client", 
-        s_server_url, encoded_path, bitrate, bitrate, encoded_token ? encoded_token : s_auth_token);
-        
-    if (encoded_token) curl_free(encoded_token);
+    if (bitrate <= 0) {
+        // QUALITY_FLAC_DIRECT has no bitrate cap (it means "don't transcode at all"),
+        // but we only get here when a transcode is actually unavoidable (e.g. non-N3DS
+        // device or non-FLAC file). Sending audioBitrate=0 makes Plex reject the request
+        // with a 400, so fall back to the highest MP3 quality instead.
+        bitrate = 320;
+    }
+
+    // Give this request its own transcode session id instead of reusing a single
+    // hardcoded value for every track. PMS keys concurrent transcode sessions by
+    // this id, and the app runs two transcodes concurrently by design (the
+    // current track playing while the next track is prefetched) - sharing one
+    // session id between them makes PMS treat the prefetch as re-targeting the
+    // playing track's session, which 400s both requests.
+    const char* rkey_tail = strrchr(track->rating_key, '/');
+    rkey_tail = (rkey_tail && rkey_tail[1]) ? rkey_tail + 1 : track->rating_key;
+    char session_id[PLEX_MAX_STR + 32];
+    snprintf(session_id, sizeof(session_id), PLEX_CLIENT_ID "-%s", rkey_tail[0] ? rkey_tail : "0");
+
+    // Auth and client identity go on the request as X-Plex-* headers (set by
+    // audio_player.c when it fetches this URL), not as query params here -
+    // Plex's transcode decision endpoint 400s if the same identity is asserted
+    // both ways and they don't line up exactly.
+    snprintf(url_out, url_max,
+        "%s/music/:/transcode/universal/start.mp3?path=%s&mediaIndex=0&partIndex=0&protocol=http&fastSeek=1&directPlay=0&directStream=0&directStreamAudio=0&audioCodec=mp3&container=mp3&maxAudioBitrate=%d&audioBitrate=%d&offset=%d&session=%s",
+        s_server_url, encoded_path, bitrate, bitrate, offset_sec > 0 ? offset_sec : 0, session_id);
+
     curl_free(encoded_path);
     curl_easy_cleanup(curl);
-    
-    LOG_INFO("Built Transcode URL (rkey='%s'): %s", track->rating_key, url_out);
+
+    LOG_INFO("Built Transcode URL (rkey='%s', offset=%ds): %s", track->rating_key, offset_sec, url_out);
     return true;
+}
+
+bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
+    return build_transcode_url(track, 0, url_out, url_max);
+}
+
+bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, size_t url_max) {
+    return build_transcode_url(track, seek_ms / 1000, url_out, url_max);
 }
 
 bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_max) {
@@ -1001,12 +1032,22 @@ bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_m
     
     int tier_bitrate = quality_tier_to_bitrate(s_quality_tier);
     
-    // N3DS FLAC direct streaming: only if quality tier allows it
-    if (s_quality_tier == QUALITY_FLAC_DIRECT && is_n3ds && 
-        track->part_key[0] != '\0' && 
-        (strstr(track->part_key, ".flac") || strstr(track->part_key, ".FLAC"))) {
+    // N3DS FLAC direct streaming: only if quality tier allows it, AND the
+    // source's native sample rate is one the 3DS's DSP handles reliably.
+    // The DSP's actual internal mixing rate is a fixed ~32728Hz
+    // (NDSP_SAMPLE_RATE = SYSCLOCK_SOC/512); ndspChnSetRate() has it resample
+    // from whatever rate we claim. That works fine for standard rates
+    // (44100/48000, both well short of 2x the native rate), but hi-res
+    // masters (88.2/96/176.4/192kHz - not rare on well-tagged FLAC libraries)
+    // push the resampling ratio far enough to audibly speed up and pitch-shift
+    // playback. Anything above 48000Hz falls through to a transcode instead,
+    // which normalizes to a safe rate automatically.
+    if (s_quality_tier == QUALITY_FLAC_DIRECT && is_n3ds &&
+        track->part_key[0] != '\0' &&
+        (strstr(track->part_key, ".flac") || strstr(track->part_key, ".FLAC")) &&
+        (track->sampling_rate <= 0 || track->sampling_rate <= 48000)) {
         snprintf(url_out, url_max, "%s%s", s_server_url, track->part_key);
-        LOG_INFO("⚡ N3DS FLAC Direct Stream (tier=%s) for %s: %s", 
+        LOG_INFO("⚡ N3DS FLAC Direct Stream (tier=%s) for %s: %s",
                  plex_api_get_quality_label(s_quality_tier), track->title, url_out);
         return true;
     }
@@ -1053,6 +1094,283 @@ void plex_api_report_timeline(const char* rating_key, const char* state, int tim
     char* resp = NULL;
     plex_http_get(endpoint, &resp);
     if (resp) free(resp);
+}
+
+// --- Async lyrics fetch --------------------------------------------------
+// Same two-request flow as plex_api_get_lyrics() (metadata -> find the lrc
+// stream's key -> fetch its content), but pumped non-blockingly via its own
+// curl_multi handle instead of curl_easy_perform(), so callers can start it
+// right when a track begins playing without freezing the frame.
+
+// Defined later in this file (next to plex_api_get_lyrics(), which shares
+// it); forward-declared here since this section runs before that point.
+int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+
+typedef enum {
+    LYR_ASYNC_IDLE,
+    LYR_ASYNC_FETCHING_METADATA,
+    LYR_ASYNC_FETCHING_LYRICS,
+    LYR_ASYNC_DONE
+} LyricsAsyncState;
+
+#define PLEX_LYRICS_ASYNC_MAX 64
+
+static LyricsAsyncState s_lyr_state = LYR_ASYNC_IDLE;
+static CURLM* s_lyr_multi = NULL;
+static CURL* s_lyr_easy = NULL;
+static struct curl_slist* s_lyr_headers = NULL;
+static HttpBuffer s_lyr_buf = {0};
+static char s_lyr_rating_key[PLEX_MAX_STR] = {0};
+static char s_lyr_stream_key[512] = {0};
+static PlexLyricLine s_lyr_result[PLEX_LYRICS_ASYNC_MAX];
+static int s_lyr_result_count = 0;
+
+static void lyr_async_cleanup_request(void) {
+    if (s_lyr_multi && s_lyr_easy) {
+        curl_multi_remove_handle(s_lyr_multi, s_lyr_easy);
+        curl_easy_cleanup(s_lyr_easy);
+        s_lyr_easy = NULL;
+    }
+    if (s_lyr_headers) {
+        curl_slist_free_all(s_lyr_headers);
+        s_lyr_headers = NULL;
+    }
+    if (s_lyr_buf.data) {
+        free(s_lyr_buf.data);
+        s_lyr_buf.data = NULL;
+    }
+    s_lyr_buf.size = 0;
+    s_lyr_buf.capacity = 0;
+}
+
+static bool lyr_async_start_request(const char* endpoint) {
+    if (!s_lyr_multi) s_lyr_multi = curl_multi_init();
+    s_lyr_easy = curl_easy_init();
+    if (!s_lyr_easy) return false;
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s%s", s_server_url, endpoint);
+
+    s_lyr_buf.data = malloc(1);
+    s_lyr_buf.size = 0;
+    s_lyr_buf.capacity = 1;
+    if (s_lyr_buf.data) s_lyr_buf.data[0] = 0;
+
+    s_lyr_headers = curl_slist_append(NULL, "Accept: application/json");
+    char token_header[256];
+    snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
+    s_lyr_headers = curl_slist_append(s_lyr_headers, token_header);
+    s_lyr_headers = curl_slist_append(s_lyr_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_lyr_headers = curl_slist_append(s_lyr_headers, "X-Plex-Product: " PLEX_PRODUCT);
+
+    curl_easy_setopt(s_lyr_easy, CURLOPT_URL, url);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_HTTPHEADER, s_lyr_headers);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_WRITEDATA, (void*)&s_lyr_buf);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(s_lyr_easy, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    curl_multi_add_handle(s_lyr_multi, s_lyr_easy);
+    return true;
+}
+
+static void lyr_async_finish_with_no_lyrics(void) {
+    s_lyr_result[0].time_ms = 0;
+    strncpy(s_lyr_result[0].text, "No time-synced lyrics available", sizeof(s_lyr_result[0].text) - 1);
+    s_lyr_result[0].text[sizeof(s_lyr_result[0].text) - 1] = '\0';
+    s_lyr_result_count = 1;
+    s_lyr_state = LYR_ASYNC_DONE;
+}
+
+void plex_api_lyrics_async_start(const char* rating_key) {
+    lyr_async_cleanup_request();
+    s_lyr_state = LYR_ASYNC_IDLE;
+    s_lyr_result_count = 0;
+    s_lyr_stream_key[0] = '\0';
+
+    if (!s_initialized || !rating_key || !rating_key[0]) return;
+    snprintf(s_lyr_rating_key, sizeof(s_lyr_rating_key), "%s", rating_key);
+
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/library/metadata/%s", rating_key);
+    if (lyr_async_start_request(endpoint)) {
+        s_lyr_state = LYR_ASYNC_FETCHING_METADATA;
+    }
+}
+
+void plex_api_lyrics_async_update(void) {
+    if (s_lyr_state == LYR_ASYNC_IDLE || s_lyr_state == LYR_ASYNC_DONE) return;
+    if (!s_lyr_multi || !s_lyr_easy) return;
+
+    int running = 0;
+    CURLMcode mres = curl_multi_perform(s_lyr_multi, &running);
+    if (mres == CURLM_OK && running > 0) return; // still in flight, check again next frame
+
+    long http_code = 0;
+    curl_easy_getinfo(s_lyr_easy, CURLINFO_RESPONSE_CODE, &http_code);
+    bool ok = (mres == CURLM_OK && http_code == 200 && s_lyr_buf.data && s_lyr_buf.size > 0);
+
+    if (s_lyr_state == LYR_ASYNC_FETCHING_METADATA) {
+        char fallback_key[512] = "";
+        if (ok) {
+            cJSON* json = cJSON_Parse(s_lyr_buf.data);
+            if (json) {
+                cJSON* container = cJSON_GetObjectItem(json, "MediaContainer");
+                cJSON* metadata = container ? cJSON_GetObjectItem(container, "Metadata") : NULL;
+                cJSON* item = (metadata && cJSON_IsArray(metadata)) ? cJSON_GetArrayItem(metadata, 0) : NULL;
+                cJSON* media = item ? cJSON_GetObjectItem(item, "Media") : NULL;
+                cJSON* media_item = (media && cJSON_IsArray(media)) ? cJSON_GetArrayItem(media, 0) : NULL;
+                cJSON* part = media_item ? cJSON_GetObjectItem(media_item, "Part") : NULL;
+                cJSON* part_item = (part && cJSON_IsArray(part)) ? cJSON_GetArrayItem(part, 0) : NULL;
+                cJSON* stream = part_item ? cJSON_GetObjectItem(part_item, "Stream") : NULL;
+                if (stream && cJSON_IsArray(stream)) {
+                    cJSON* s_item = NULL;
+                    cJSON_ArrayForEach(s_item, stream) {
+                        cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
+                        cJSON* key = cJSON_GetObjectItem(s_item, "key");
+                        if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4 &&
+                            key && cJSON_IsString(key)) {
+                            if (fallback_key[0] == '\0') {
+                                strncpy(fallback_key, key->valuestring, sizeof(fallback_key) - 1);
+                            }
+                            cJSON* format = cJSON_GetObjectItem(s_item, "format");
+                            if (format && cJSON_IsString(format) && strcmp(format->valuestring, "lrc") == 0) {
+                                strncpy(s_lyr_stream_key, key->valuestring, sizeof(s_lyr_stream_key) - 1);
+                                break;
+                            }
+                        }
+                    }
+                }
+                cJSON_Delete(json);
+            }
+        }
+        lyr_async_cleanup_request();
+
+        if (s_lyr_stream_key[0] == '\0' && fallback_key[0] != '\0') {
+            strncpy(s_lyr_stream_key, fallback_key, sizeof(s_lyr_stream_key) - 1);
+        }
+        if (s_lyr_stream_key[0] == '\0') {
+            snprintf(s_lyr_stream_key, sizeof(s_lyr_stream_key), "/library/metadata/%s/subtitles", s_lyr_rating_key);
+        }
+
+        if (lyr_async_start_request(s_lyr_stream_key)) {
+            s_lyr_state = LYR_ASYNC_FETCHING_LYRICS;
+        } else {
+            lyr_async_finish_with_no_lyrics();
+        }
+        return;
+    }
+
+    if (s_lyr_state == LYR_ASYNC_FETCHING_LYRICS) {
+        int count = ok ? parse_lyrics_stream_response(s_lyr_buf.data, s_lyr_result, PLEX_LYRICS_ASYNC_MAX) : 0;
+        lyr_async_cleanup_request();
+
+        if (count == 0) {
+            lyr_async_finish_with_no_lyrics();
+        } else {
+            s_lyr_result_count = count;
+            s_lyr_state = LYR_ASYNC_DONE;
+        }
+        LOG_INFO("Loaded %d lyric lines (async) for track %s", s_lyr_result_count, s_lyr_rating_key);
+    }
+}
+
+bool plex_api_lyrics_async_is_done(void) {
+    return s_lyr_state == LYR_ASYNC_DONE;
+}
+
+int plex_api_lyrics_async_take_result(PlexLyricLine* out, int max) {
+    if (s_lyr_state != LYR_ASYNC_DONE || !out || max <= 0) return 0;
+    int n = s_lyr_result_count < max ? s_lyr_result_count : max;
+    memcpy(out, s_lyr_result, (size_t)n * sizeof(PlexLyricLine));
+    s_lyr_state = LYR_ASYNC_IDLE; // consumed
+    return n;
+}
+
+// --- Async (fire-and-forget) timeline reporting --------------------------
+
+static CURLM* s_tl_multi = NULL;
+static CURL* s_tl_easy = NULL;
+static struct curl_slist* s_tl_headers = NULL;
+static HttpBuffer s_tl_buf = {0};
+static bool s_tl_active = false;
+
+static void tl_async_cleanup(void) {
+    if (s_tl_multi && s_tl_easy) {
+        curl_multi_remove_handle(s_tl_multi, s_tl_easy);
+        curl_easy_cleanup(s_tl_easy);
+        s_tl_easy = NULL;
+    }
+    if (s_tl_headers) {
+        curl_slist_free_all(s_tl_headers);
+        s_tl_headers = NULL;
+    }
+    if (s_tl_buf.data) {
+        free(s_tl_buf.data);
+        s_tl_buf.data = NULL;
+    }
+    s_tl_buf.size = 0;
+    s_tl_buf.capacity = 0;
+    s_tl_active = false;
+}
+
+void plex_api_report_timeline_async(const char* rating_key, const char* state, int time_ms, int duration_ms) {
+    if (!s_initialized || !rating_key || !rating_key[0]) return;
+
+    // A newer report replaces whatever's still in flight rather than queuing.
+    tl_async_cleanup();
+
+    const char* clean_rkey = rating_key;
+    const char* p = strrchr(rating_key, '/');
+    if (p && strlen(p + 1) > 0) clean_rkey = p + 1;
+
+    char endpoint[512];
+    snprintf(endpoint, sizeof(endpoint),
+        "/:/timeline?ratingKey=%s&key=%%2Flibrary%%2Fmetadata%%2F%s&state=%s&time=%d&duration=%d&hasSample=0",
+        clean_rkey, clean_rkey, state ? state : "playing", time_ms > 0 ? time_ms : 0, duration_ms > 0 ? duration_ms : 0);
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s%s", s_server_url, endpoint);
+
+    if (!s_tl_multi) s_tl_multi = curl_multi_init();
+    s_tl_easy = curl_easy_init();
+    if (!s_tl_easy) return;
+
+    s_tl_buf.data = malloc(1);
+    s_tl_buf.size = 0;
+    s_tl_buf.capacity = 1;
+    if (s_tl_buf.data) s_tl_buf.data[0] = 0;
+
+    s_tl_headers = curl_slist_append(NULL, "Accept: application/json");
+    char token_header[256];
+    snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
+    s_tl_headers = curl_slist_append(s_tl_headers, token_header);
+    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Product: " PLEX_PRODUCT);
+
+    curl_easy_setopt(s_tl_easy, CURLOPT_URL, url);
+    curl_easy_setopt(s_tl_easy, CURLOPT_HTTPHEADER, s_tl_headers);
+    curl_easy_setopt(s_tl_easy, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(s_tl_easy, CURLOPT_WRITEDATA, (void*)&s_tl_buf);
+    curl_easy_setopt(s_tl_easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    curl_multi_add_handle(s_tl_multi, s_tl_easy);
+    s_tl_active = true;
+}
+
+void plex_api_timeline_async_update(void) {
+    if (!s_tl_active || !s_tl_multi || !s_tl_easy) return;
+    int running = 0;
+    CURLMcode mres = curl_multi_perform(s_tl_multi, &running);
+    if (mres == CURLM_OK && running > 0) return;
+    tl_async_cleanup(); // done (success or failure - fire-and-forget either way)
 }
 
 bool plex_api_get_album_art(const char* thumb_path, u8** out_data, size_t* out_size) {
@@ -1103,6 +1421,84 @@ static int parse_lrc_lyrics(const char* lrc_text, PlexLyricLine* out, int max) {
     return count;
 }
 
+// Parses the body of a GET to a lyric stream's key (e.g. "/library/streams/<id>").
+// Not declared in plex_api.h - it's an internal implementation detail of
+// plex_api_get_lyrics(), given external linkage only so tests/test_plex_api.c
+// can exercise it directly against real captured server responses.
+int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max) {
+    if (!response || !out || max <= 0) return 0;
+    int count = 0;
+
+    if (response[0] == '{') {
+        // The actual shape Plex returns for a lyrics stream:
+        // {"MediaContainer":{"Lyrics":[{"timed":true,"Line":[
+        //   {"startOffset":41650,"endOffset":47280,"Span":[{"text":"We're both on holiday", ...}]},
+        //   ...
+        // ]}]}}
+        // Each Line can in principle carry multiple Spans (e.g. word-level
+        // timing) - concatenate them to reconstruct the full line text.
+        cJSON* ljson = cJSON_Parse(response);
+        if (ljson) {
+            cJSON* mc = cJSON_GetObjectItem(ljson, "MediaContainer");
+            cJSON* lyrics_arr = mc ? cJSON_GetObjectItem(mc, "Lyrics") : NULL;
+            cJSON* lyrics_obj = (lyrics_arr && cJSON_IsArray(lyrics_arr)) ? cJSON_GetArrayItem(lyrics_arr, 0) : NULL;
+            cJSON* line_arr = lyrics_obj ? cJSON_GetObjectItem(lyrics_obj, "Line") : NULL;
+            if (line_arr && cJSON_IsArray(line_arr)) {
+                cJSON* line_item = NULL;
+                cJSON_ArrayForEach(line_item, line_arr) {
+                    if (count >= max) break;
+                    cJSON* start = cJSON_GetObjectItem(line_item, "startOffset");
+                    cJSON* spans = cJSON_GetObjectItem(line_item, "Span");
+                    char line_text[128] = "";
+                    if (spans && cJSON_IsArray(spans)) {
+                        cJSON* span_item = NULL;
+                        cJSON_ArrayForEach(span_item, spans) {
+                            cJSON* text = cJSON_GetObjectItem(span_item, "text");
+                            if (text && cJSON_IsString(text)) {
+                                size_t used = strlen(line_text);
+                                if (used < sizeof(line_text) - 1) {
+                                    strncat(line_text, text->valuestring, sizeof(line_text) - used - 1);
+                                }
+                            }
+                        }
+                    }
+                    if (line_text[0] != '\0') {
+                        out[count].time_ms = (start && cJSON_IsNumber(start)) ? start->valueint : count * 4000;
+                        strncpy(out[count].text, line_text, sizeof(out[count].text) - 1);
+                        out[count].text[sizeof(out[count].text) - 1] = '\0';
+                        count++;
+                    }
+                }
+            }
+            cJSON_Delete(ljson);
+        }
+    } else if (response[0] == '[' && response[1] == '{') {
+        // Older/alternate flat-array shape, kept for compatibility:
+        // [{"text": "...", "time": 1234}, ...]
+        cJSON* ljson = cJSON_Parse(response);
+        if (ljson && cJSON_IsArray(ljson)) {
+            cJSON* line_item = NULL;
+            cJSON_ArrayForEach(line_item, ljson) {
+                if (count >= max) break;
+                cJSON* text = cJSON_GetObjectItem(line_item, "text");
+                cJSON* time = cJSON_GetObjectItem(line_item, "time");
+                if (text && cJSON_IsString(text)) {
+                    out[count].time_ms = (time && cJSON_IsNumber(time)) ? time->valueint : count * 4000;
+                    strncpy(out[count].text, text->valuestring, sizeof(out[count].text) - 1);
+                    count++;
+                }
+            }
+            cJSON_Delete(ljson);
+        }
+    } else {
+        // Raw LRC text ("[mm:ss.xx] lyric line" per line), in case a provider
+        // ever serves it unwrapped instead of as JSON.
+        count = parse_lrc_lyrics(response, out, max);
+    }
+
+    return count;
+}
+
 int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
     if (!s_initialized || !rating_key || !rating_key[0] || !out || max <= 0) return 0;
     
@@ -1110,6 +1506,7 @@ int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
     snprintf(endpoint, sizeof(endpoint), "/library/metadata/%s", rating_key);
     
     char lyric_stream_key[512] = "";
+    char lyric_stream_key_fallback[512] = "";
     char* response = NULL;
     
     if (plex_http_get(endpoint, &response)) {
@@ -1131,12 +1528,21 @@ int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
                                     if (part_item) {
                                         cJSON* stream = cJSON_GetObjectItem(part_item, "Stream");
                                         if (stream && cJSON_IsArray(stream)) {
+                                            // A track can carry more than one streamType==4 (lyric)
+                                            // stream at once - e.g. an "lrc" (time-synced) one and a
+                                            // plain "txt" one. Prefer "lrc" explicitly rather than
+                                            // whichever happens to come first in the array.
                                             cJSON* s_item = NULL;
                                             cJSON_ArrayForEach(s_item, stream) {
                                                 cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
                                                 cJSON* key = cJSON_GetObjectItem(s_item, "key");
-                                                if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4) {
-                                                    if (key && cJSON_IsString(key)) {
+                                                if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4 &&
+                                                    key && cJSON_IsString(key)) {
+                                                    if (lyric_stream_key_fallback[0] == '\0') {
+                                                        strncpy(lyric_stream_key_fallback, key->valuestring, sizeof(lyric_stream_key_fallback) - 1);
+                                                    }
+                                                    cJSON* format = cJSON_GetObjectItem(s_item, "format");
+                                                    if (format && cJSON_IsString(format) && strcmp(format->valuestring, "lrc") == 0) {
                                                         strncpy(lyric_stream_key, key->valuestring, sizeof(lyric_stream_key) - 1);
                                                         break;
                                                     }
@@ -1156,38 +1562,19 @@ int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
     }
     
     if (lyric_stream_key[0] == '\0') {
+        strncpy(lyric_stream_key, lyric_stream_key_fallback, sizeof(lyric_stream_key) - 1);
+    }
+    if (lyric_stream_key[0] == '\0') {
         snprintf(lyric_stream_key, sizeof(lyric_stream_key), "/library/metadata/%s/subtitles", rating_key);
     }
     
     char* lrc_response = NULL;
     int count = 0;
     if (plex_http_get(lyric_stream_key, &lrc_response)) {
-        if (lrc_response[0] == '[') {
-            if (lrc_response[1] == '{') {
-                cJSON* ljson = cJSON_Parse(lrc_response);
-                if (ljson && cJSON_IsArray(ljson)) {
-                    cJSON* line_item = NULL;
-                    cJSON_ArrayForEach(line_item, ljson) {
-                        if (count >= max) break;
-                        cJSON* text = cJSON_GetObjectItem(line_item, "text");
-                        cJSON* time = cJSON_GetObjectItem(line_item, "time");
-                        if (text && cJSON_IsString(text)) {
-                            out[count].time_ms = (time && cJSON_IsNumber(time)) ? time->valueint : count * 4000;
-                            strncpy(out[count].text, text->valuestring, sizeof(out[count].text) - 1);
-                            count++;
-                        }
-                    }
-                    cJSON_Delete(ljson);
-                }
-            } else {
-                count = parse_lrc_lyrics(lrc_response, out, max);
-            }
-        } else {
-            count = parse_lrc_lyrics(lrc_response, out, max);
-        }
+        count = parse_lyrics_stream_response(lrc_response, out, max);
         free(lrc_response);
     }
-    
+
     if (count == 0) {
         out[0].time_ms = 0;
         strncpy(out[0].text, "No time-synced lyrics available", sizeof(out[0].text) - 1);

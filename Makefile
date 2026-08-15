@@ -19,7 +19,7 @@ include $(DEVKITARM)/3ds_rules
 # GFXBUILD is the directory where converted graphics files will be placed
 # ROMFS is the directory containing data to be added to RomFS
 #---------------------------------------------------------------------------------
-TARGET      := 3ds-plex-client
+TARGET      := DualPlex
 BUILD       := build
 SOURCES     := source source/lib
 DATA        := data

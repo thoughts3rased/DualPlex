@@ -15,10 +15,10 @@ static int s_log_head = 0;
 void logger_init(void) {
     s_log_count = 0;
     s_log_head = 0;
-    s_log_file = fopen("sdmc:/3ds-plex-client.log", "w");
+    s_log_file = fopen("sdmc:/dualplex.log", "w");
     if (s_log_file) {
         time_t t = time(NULL);
-        fprintf(s_log_file, "=== 3DS Plex Client Log Started: %s", ctime(&t));
+        fprintf(s_log_file, "=== DualPlex Log Started: %s", ctime(&t));
         fflush(s_log_file);
     }
 }

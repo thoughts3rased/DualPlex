@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 // Compile-time constant color macro (C2D_Color32 is not constexpr)
 #define RGBA8(r, g, b, a) ((u32)((((a)&0xFF)<<24) | (((b)&0xFF)<<16) | (((g)&0xFF)<<8) | ((r)&0xFF)))
@@ -66,6 +67,28 @@ static bool s_is_lazy_loading = false;
 static char s_current_title[PLEX_MAX_STR] = "";
 static int s_current_track_idx = -1;
 static bool s_auto_advance = true;
+// Index of the track to prefetch once it's safe to do so (-1 = none pending).
+// Some Plex servers only permit one concurrent transcode session, so we hold
+// off starting the next track's prefetch until the current track's own
+// stream has finished downloading - see audio_player_is_download_finished().
+static int s_pending_prefetch_idx = -1;
+
+// Top-screen view mode, cycled with L/R (see ui_update()).
+typedef enum {
+    TOPVIEW_NOW_PLAYING,
+    TOPVIEW_LYRICS,
+    TOPVIEW_VISUALIZER,
+    TOPVIEW_COUNT
+} TopView;
+static TopView s_top_view = TOPVIEW_NOW_PLAYING;
+
+// Visualizer style, cycled with X while TOPVIEW_VISUALIZER is active.
+typedef enum {
+    VIS_STYLE_BARS,
+    VIS_STYLE_OSCILLOSCOPE,
+    VIS_STYLE_COUNT
+} VisStyle;
+static VisStyle s_vis_style = VIS_STYLE_BARS;
 
 // Setup & Auth fields
 static AppConfig* s_config = NULL;
@@ -181,6 +204,19 @@ static void draw_text_centered(const char* str, float y, float width, float scal
     float tw, th;
     C2D_TextGetDimensions(&text, scaleX, scaleY, &tw, &th);
     float x = (width - tw) / 2.0f;
+    C2D_DrawText(&text, C2D_WithColor, x, y, 0.5f, scaleX, scaleY, color);
+}
+
+// Like draw_text_centered(), but centers within [region_x, region_x+width]
+// instead of always starting at 0 - for centering within a column rather
+// than the full screen.
+static void draw_text_centered_at(const char* str, float region_x, float y, float width, float scaleX, float scaleY, u32 color) {
+    C2D_Text text;
+    C2D_TextParse(&text, s_text_buf, str);
+    C2D_TextOptimize(&text);
+    float tw, th;
+    C2D_TextGetDimensions(&text, scaleX, scaleY, &tw, &th);
+    float x = region_x + (width - tw) / 2.0f;
     C2D_DrawText(&text, C2D_WithColor, x, y, 0.5f, scaleX, scaleY, color);
 }
 
@@ -318,6 +354,36 @@ static void draw_list_item(int visual_idx, const char* title, const char* subtit
     }
 }
 
+// Reads the physical volume slider's position (0-63 on real hardware),
+// not the app's own playback volume - shown in the HUD so it reflects what
+// the slider is actually set to, the way the system UI does.
+static int get_hw_volume_percent(void) {
+    u8 slider = 0;
+    if (R_SUCCEEDED(HIDUSER_GetSoundVolume(&slider))) {
+        return (int)((slider * 100) / 63);
+    }
+    return 0;
+}
+
+// Draws a Home-Menu-style WiFi signal indicator: 3 bars of increasing height,
+// filled left-to-right up to the current signal strength (0-3, straight from
+// the OS - no service init needed, same value the system's own WiFi icon
+// uses). 0 bars filled means no/negligible signal.
+static void draw_wifi_indicator(float x, float baseline_y) {
+    u8 strength = osGetWifiStrength();
+    static const float bar_heights[3] = { 5.0f, 9.0f, 13.0f };
+    static const float bar_w = 3.0f;
+    static const float bar_gap = 2.0f;
+
+    float bx = x;
+    for (int i = 0; i < 3; i++) {
+        float h = bar_heights[i];
+        u32 col = (i < strength) ? COL_ACCENT : COL_PROGRESS_BG;
+        C2D_DrawRectSolid(bx, baseline_y - h, 0.5f, bar_w, h, col);
+        bx += bar_w + bar_gap;
+    }
+}
+
 static void format_time(int ms, char* buf, size_t buf_size) {
     int total_sec = ms / 1000;
     int min = total_sec / 60;
@@ -353,6 +419,19 @@ static void format_quality_tag(const PlexTrack* track, char* buf, size_t max) {
     }
     
     snprintf(buf, max, "[%s]", codec_str);
+}
+
+// Index into s_lyrics of the line active at pos_ms, or 0 if there are none/
+// none have started yet. Shared by the bottom-screen Lyrics screen and the
+// top-screen Lyrics view.
+static int find_current_lyric_line(int pos_ms) {
+    int current_line = 0;
+    for (int i = 0; i < s_num_lyrics; i++) {
+        if (pos_ms >= s_lyrics[i].time_ms) {
+            current_line = i;
+        }
+    }
+    return current_line;
 }
 
 static bool show_keyboard(const char* hint, char* buf, size_t buf_size) {
@@ -395,7 +474,7 @@ static void play_track(int idx) {
                 s_auto_advance = true;
                 
                 LOG_INFO("⚡ Seamless transition to track %d: %s", idx, s_tracks[idx].title);
-                plex_api_report_timeline(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
+                plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
                 
                 if (s_tracks[idx].thumb[0] != '\0' && s_config) {
                     album_art_load_async(s_tracks[idx].thumb, s_config->server_url, s_config->auth_token);
@@ -403,15 +482,12 @@ static void play_track(int idx) {
                     album_art_cleanup();
                 }
                 
-                s_num_lyrics = plex_api_get_lyrics(s_tracks[idx].rating_key, s_lyrics, PLEX_MAX_LYRICS);
-                
-                // Prefetch the NEXT track
-                if (idx + 1 < s_num_tracks) {
-                    char next_url[PLEX_MAX_URL];
-                    if (plex_api_get_stream_url(&s_tracks[idx + 1], next_url, sizeof(next_url))) {
-                        audio_player_prefetch_url(next_url);
-                    }
-                }
+                s_num_lyrics = 0;
+                plex_api_lyrics_async_start(s_tracks[idx].rating_key);
+
+                // Defer prefetching the NEXT track until this one's stream has
+                // finished downloading (see s_pending_prefetch_idx above).
+                s_pending_prefetch_idx = (idx + 1 < s_num_tracks) ? (idx + 1) : -1;
                 return;  // Done - seamless transition complete
             }
         }
@@ -425,7 +501,7 @@ static void play_track(int idx) {
         s_auto_advance = true;
         
         LOG_INFO("Playing track %d: %s", idx, s_tracks[idx].title);
-        plex_api_report_timeline(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
+        plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
         
         // Start non-blocking async background download of album cover art
         if (s_tracks[idx].thumb[0] != '\0' && s_config) {
@@ -434,23 +510,48 @@ static void play_track(int idx) {
             album_art_cleanup();
         }
         
-        s_num_lyrics = plex_api_get_lyrics(s_tracks[idx].rating_key, s_lyrics, PLEX_MAX_LYRICS);
-        
-        // Prefetch the NEXT track
-        if (idx + 1 < s_num_tracks) {
-            char next_url[PLEX_MAX_URL];
-            if (plex_api_get_stream_url(&s_tracks[idx + 1], next_url, sizeof(next_url))) {
-                audio_player_prefetch_url(next_url);
-            }
-        }
+        s_num_lyrics = 0;
+        plex_api_lyrics_async_start(s_tracks[idx].rating_key);
+
+        // Defer prefetching the NEXT track until this one's stream has
+        // finished downloading (see s_pending_prefetch_idx above).
+        s_pending_prefetch_idx = (idx + 1 < s_num_tracks) ? (idx + 1) : -1;
     }
+}
+
+// Seeks the currently-playing track to target_ms by reloading its stream from
+// that offset (Plex handles the actual seeking server-side - see
+// plex_api_get_seek_url()). Any in-flight prefetch for the next track is
+// unaffected since it uses a different session id.
+static void seek_to(int target_ms) {
+    if (s_current_track_idx < 0 || s_current_track_idx >= s_num_tracks) return;
+    PlexTrack* track = &s_tracks[s_current_track_idx];
+
+    if (target_ms < 0) target_ms = 0;
+    if (track->duration > 0 && target_ms > track->duration) target_ms = track->duration;
+
+    char url[PLEX_MAX_URL];
+    if (!plex_api_get_seek_url(track, target_ms, url, sizeof(url))) return;
+
+    audio_player_set_duration(track->duration);
+    audio_player_load_url(url);
+    audio_player_set_position_offset_ms(target_ms);
+    s_auto_advance = true;
+
+    LOG_INFO("Seeked track %d to %dms", s_current_track_idx, target_ms);
+    plex_api_report_timeline_async(track->rating_key, "playing", target_ms, track->duration);
 }
 
 static UIScreen s_prev_screen = SCREEN_HUB;
 
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     album_art_update();
-    
+    plex_api_timeline_async_update();
+    plex_api_lyrics_async_update();
+    if (plex_api_lyrics_async_is_done()) {
+        s_num_lyrics = plex_api_lyrics_async_take_result(s_lyrics, PLEX_MAX_LYRICS);
+    }
+
     // Toggle live log viewer overlay with L + R combo
     if (((kHeld & KEY_L) && (kDown & KEY_R)) || ((kHeld & KEY_R) && (kDown & KEY_L))) {
         s_show_logs = !s_show_logs;
@@ -504,7 +605,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         u64 now_tick = svcGetSystemTick();
         if (now_tick - s_last_timeline_tick >= 1340617400ULL) { // 5 sec @ 268MHz
             s_last_timeline_tick = now_tick;
-            plex_api_report_timeline(
+            plex_api_report_timeline_async(
                 s_tracks[s_current_track_idx].rating_key,
                 "playing",
                 audio_player_get_position_ms(),
@@ -513,6 +614,21 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     }
     
+    // Fire the deferred next-track prefetch once the current track's own
+    // stream has finished downloading (see s_pending_prefetch_idx above) -
+    // starting it any earlier would race the current track for the server's
+    // single transcode slot and can 400 either request.
+    if (s_pending_prefetch_idx >= 0 && audio_player_is_download_finished()) {
+        int next_idx = s_pending_prefetch_idx;
+        s_pending_prefetch_idx = -1;
+        if (next_idx < s_num_tracks) {
+            char next_url[PLEX_MAX_URL];
+            if (plex_api_get_stream_url(&s_tracks[next_idx], next_url, sizeof(next_url))) {
+                audio_player_prefetch_url(next_url);
+            }
+        }
+    }
+
     // Adaptive quality: handle quality downgrade requests
     if (pstate == PLAYER_PLAYING && audio_player_needs_quality_downgrade()) {
         audio_player_clear_downgrade_flag();
@@ -541,7 +657,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         snprintf(s_status_msg, sizeof(s_status_msg), "Track %d failed (HTTP 400). Skipping...", s_current_track_idx + 1);
         s_status_color = COL_ERROR;
         
-        plex_api_report_timeline(s_tracks[s_current_track_idx].rating_key, "stopped", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
+        plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
         
         if (s_auto_advance && s_current_track_idx + 1 < s_num_tracks) {
             play_track(s_current_track_idx + 1);
@@ -552,7 +668,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     } else if (pstate == PLAYER_STOPPED && s_current_track_idx >= 0 && s_auto_advance) {
         if (audio_player_get_position_ms() > 1000 && s_current_track_idx + 1 < s_num_tracks) {
-            plex_api_report_timeline(s_tracks[s_current_track_idx].rating_key, "stopped", s_tracks[s_current_track_idx].duration, s_tracks[s_current_track_idx].duration);
+            plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", s_tracks[s_current_track_idx].duration, s_tracks[s_current_track_idx].duration);
             play_track(s_current_track_idx + 1);
         } else {
             s_auto_advance = false;
@@ -581,7 +697,21 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     }
 
-    // New 3DS C-Stick Navigation & Volume
+    // L/R alone cycle the top-screen view (Now Playing / Lyrics / Visualizer).
+    // Guarded against the other shoulder button being held so this doesn't
+    // also fire on the L+R combo used above to toggle the log viewer.
+    if ((kDown & KEY_R) && !(kHeld & KEY_L)) {
+        s_top_view = (TopView)((s_top_view + 1) % TOPVIEW_COUNT);
+    }
+    if ((kDown & KEY_L) && !(kHeld & KEY_R)) {
+        s_top_view = (TopView)((s_top_view + TOPVIEW_COUNT - 1) % TOPVIEW_COUNT);
+    }
+    // X cycles which visualizer style is shown, only meaningful in that view.
+    if ((kDown & KEY_X) && s_top_view == TOPVIEW_VISUALIZER) {
+        s_vis_style = (VisStyle)((s_vis_style + 1) % VIS_STYLE_COUNT);
+    }
+
+    // New 3DS C-Stick Navigation
     if (kDown & KEY_CSTICK_UP) {
         if (s_selected_idx > 0) {
             s_selected_idx--;
@@ -594,28 +724,11 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
         }
     }
-    if (kDown & KEY_CSTICK_LEFT) {
-        float v = audio_player_get_volume();
-        audio_player_set_volume(v > 0.05f ? v - 0.05f : 0.0f);
-    }
-    if (kDown & KEY_CSTICK_RIGHT) {
-        float v = audio_player_get_volume();
-        audio_player_set_volume(v < 0.95f ? v + 0.05f : 1.0f);
-    }
-
-    if (kDown & KEY_L) {
-        float v = audio_player_get_volume();
-        audio_player_set_volume(v > 0.1f ? v - 0.1f : 0.0f);
-    }
-    if (kDown & KEY_R) {
-        float v = audio_player_get_volume();
-        audio_player_set_volume(v < 0.9f ? v + 0.1f : 1.0f);
-    }
     if (kDown & KEY_Y) {
         audio_player_toggle();
         PlayerState new_st = audio_player_get_state();
         if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
-            plex_api_report_timeline(s_tracks[s_current_track_idx].rating_key, new_st == PLAYER_PAUSED ? "paused" : "playing", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
+            plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, new_st == PLAYER_PAUSED ? "paused" : "playing", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
         }
         if (new_st == PLAYER_STOPPED) {
             s_auto_advance = false;
@@ -638,19 +751,27 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             return;
         }
         if ((kDown & KEY_TOUCH) && touch.px > 0 && touch.py > 0) {
-            if (touch.px >= 20 && touch.px <= 105 && touch.py >= 100 && touch.py <= 145) {
+            if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks &&
+                touch.px >= 20 && touch.px <= BTM_WIDTH - 20 && touch.py >= 78 && touch.py <= 96) {
+                // Tap on the seek bar - jump to that position in the track.
+                float frac = (float)(touch.px - 20) / (float)(BTM_WIDTH - 40);
+                if (frac < 0.0f) frac = 0.0f;
+                if (frac > 1.0f) frac = 1.0f;
+                seek_to((int)(frac * s_tracks[s_current_track_idx].duration));
+            }
+            else if (touch.px >= 20 && touch.px <= 105 && touch.py >= 108 && touch.py <= 153) {
                 if (s_current_track_idx > 0) play_track(s_current_track_idx - 1);
             }
-            else if (touch.px >= 115 && touch.px <= 205 && touch.py >= 95 && touch.py <= 150) {
+            else if (touch.px >= 115 && touch.px <= 205 && touch.py >= 103 && touch.py <= 158) {
                 audio_player_toggle();
             }
-            else if (touch.px >= 215 && touch.px <= 300 && touch.py >= 100 && touch.py <= 145) {
+            else if (touch.px >= 215 && touch.px <= 300 && touch.py >= 108 && touch.py <= 153) {
                 if (s_current_track_idx + 1 < s_num_tracks) play_track(s_current_track_idx + 1);
             }
-            else if (touch.px >= 20 && touch.px <= 155 && touch.py >= 160 && touch.py <= 205) {
+            else if (touch.px >= 20 && touch.px <= 155 && touch.py >= 168 && touch.py <= 213) {
                 ui_set_screen(SCREEN_QUEUE);
             }
-            else if (touch.px >= 165 && touch.px <= 300 && touch.py >= 160 && touch.py <= 205) {
+            else if (touch.px >= 165 && touch.px <= 300 && touch.py >= 168 && touch.py <= 213) {
                 ui_set_screen(SCREEN_LYRICS);
             }
         }
@@ -987,11 +1108,229 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
 }
 
+// --- Visualizers: driven by audio_player_get_visualizer_samples() ------
+
+#define VIS_MAX_SAMPLES 256
+
+// VU-style bars: splits the latest decoded samples into buckets, plots each
+// bucket's RMS amplitude as a bar. Bars rise instantly to a loud moment and
+// decay slowly afterward, for the usual "bouncing levels" look.
+static void draw_visualizer_bars(float x, float y, float w, float h) {
+    s16 samples[VIS_MAX_SAMPLES];
+    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+
+    #define VIS_NUM_BARS 24
+    static float s_bar_level[VIS_NUM_BARS] = {0};
+
+    float bar_w = w / VIS_NUM_BARS;
+    float baseline = y + h;
+
+    for (int b = 0; b < VIS_NUM_BARS; b++) {
+        float target = 0.0f;
+        if (n > 1) {
+            int start = (b * n) / VIS_NUM_BARS;
+            int end = ((b + 1) * n) / VIS_NUM_BARS;
+            if (end <= start) end = start + 1;
+            if (end > n) end = n;
+
+            double sum_sq = 0.0;
+            int count = 0;
+            for (int i = start; i < end; i++) {
+                double v = samples[i];
+                sum_sq += v * v;
+                count++;
+            }
+            if (count > 0) {
+                float rms = (float)sqrt(sum_sq / count);
+                target = rms / 32768.0f;
+                if (target > 1.0f) target = 1.0f;
+            }
+        }
+
+        if (target > s_bar_level[b]) {
+            s_bar_level[b] = target;       // rise instantly
+        } else {
+            s_bar_level[b] *= 0.85f;       // decay each frame
+        }
+
+        float bh = s_bar_level[b] * h;
+        if (bh < 3.0f) bh = 3.0f;          // always show a sliver so it doesn't look dead
+
+        float bx = x + b * bar_w;
+        C2D_DrawRectSolid(bx + 1, baseline - bh, 0.5f, bar_w - 2, bh, COL_ACCENT);
+    }
+}
+
+// Oscilloscope: plots the latest decoded samples as a connected waveform.
+static void draw_visualizer_oscilloscope(float x, float y, float w, float h) {
+    s16 samples[VIS_MAX_SAMPLES];
+    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+    if (n < 2) return;
+
+    float mid_y = y + h / 2.0f;
+    float half_h = h / 2.0f;
+
+    float prev_x = x;
+    float prev_y = mid_y - ((float)samples[0] / 32768.0f) * half_h;
+
+    for (int i = 1; i < n; i++) {
+        float px = x + ((float)i / (float)(n - 1)) * w;
+        float py = mid_y - ((float)samples[i] / 32768.0f) * half_h;
+        C2D_DrawLine(prev_x, prev_y, COL_ACCENT, px, py, COL_ACCENT, 2.0f, 0.5f);
+        prev_x = px;
+        prev_y = py;
+    }
+}
+
+static void draw_visualizer(VisStyle style, float x, float y, float w, float h) {
+    C2D_DrawRectSolid(x, y, 0.4f, w, h, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
+    switch (style) {
+        case VIS_STYLE_OSCILLOSCOPE: draw_visualizer_oscilloscope(x, y, w, h); break;
+        case VIS_STYLE_BARS:
+        default:                     draw_visualizer_bars(x, y, w, h); break;
+    }
+}
+
+// --- Top-screen views: Now Playing / Lyrics / Visualizer ---------------
+
+static void draw_top_now_playing(PlexTrack* track, PlayerState state) {
+    // Left Side: Album Art Frame (110x110)
+    float art_x = 20;
+    float art_y = 45;
+    float art_size = 110;
+
+    C2D_DrawRectSolid(art_x - 2, art_y - 2, 0.5f, art_size + 4, art_size + 4, COL_ACCENT);
+    C2D_DrawRectSolid(art_x, art_y, 0.5f, art_size, art_size, COL_SURFACE);
+
+    if (album_art_has_texture()) {
+        album_art_draw(art_x, art_y, art_size, art_size);
+    } else {
+        C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 42, C2D_Color32(0x28, 0x28, 0x38, 0xFF));
+        C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 34, C2D_Color32(0x18, 0x18, 0x24, 0xFF));
+
+        if (album_art_is_loading()) {
+            draw_loading_spinner(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 14, NULL);
+        } else {
+            C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 14, COL_ACCENT);
+            C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 4, C2D_Color32(0x12, 0x12, 0x24, 0xFF));
+        }
+    }
+
+    // Buffering badge: separate from the album-art spinner above (that one's
+    // for the *image* download) - this one means the audio stream itself
+    // doesn't have enough data yet to play.
+    if (state == PLAYER_LOADING) {
+        draw_loading_spinner(art_x + art_size - 12, art_y + 12, 11, NULL);
+    }
+
+    // Right Side: Track Details with Marquee Scrolling
+    float text_x = 145;
+    float max_text_w = TOP_WIDTH - text_x - 15;
+
+    draw_scrolling_text(track->title, text_x, 48, max_text_w, 0.65f, 0.65f, COL_TEXT);
+    draw_scrolling_text(track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", text_x, 76, max_text_w, 0.55f, 0.55f, COL_ACCENT);
+    draw_scrolling_text(track->parent_title[0] ? track->parent_title : "", text_x, 98, max_text_w, 0.45f, 0.45f, COL_TEXT_DIM);
+
+    char status_line[128];
+    const char* state_str = (state == PLAYER_PLAYING) ? "Playing" : (state == PLAYER_PAUSED ? "Paused" : "Buffering...");
+    u32 state_col = (state == PLAYER_LOADING) ? COL_WARN : COL_TEXT_DARK;
+    snprintf(status_line, sizeof(status_line), "%s  |  Vol: %d%%", state_str, get_hw_volume_percent());
+    draw_text(status_line, text_x, 122, 0.45f, 0.45f, state_col);
+
+    // The seekable progress bar lives on the bottom screen's Now Playing
+    // Controls now (touch can't reach the top screen) - see ui_render_bottom().
+    char status_line2[128];
+    snprintf(status_line2, sizeof(status_line2), "%s  |  Vol: %d%%", state_str, get_hw_volume_percent());
+    draw_text_centered(status_line2, 190, TOP_WIDTH, 0.55f, 0.55f, (state == PLAYER_LOADING) ? COL_WARN : COL_TEXT);
+}
+
+// Compact album art + details on the left, big time-synced lyrics on the right.
+static void draw_top_lyrics(PlexTrack* track, PlayerState state) {
+    float art_x = 15;
+    float art_y = 42;
+    float art_size = 90;
+
+    C2D_DrawRectSolid(art_x - 2, art_y - 2, 0.5f, art_size + 4, art_size + 4, COL_ACCENT);
+    C2D_DrawRectSolid(art_x, art_y, 0.5f, art_size, art_size, COL_SURFACE);
+
+    if (album_art_has_texture()) {
+        album_art_draw(art_x, art_y, art_size, art_size);
+    } else {
+        C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 30, C2D_Color32(0x28, 0x28, 0x38, 0xFF));
+        C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 22, C2D_Color32(0x18, 0x18, 0x24, 0xFF));
+    }
+
+    float details_x = 15;
+    float details_w = art_size;
+    float details_y = art_y + art_size + 10;
+    draw_scrolling_text(track->title, details_x, details_y, details_w, 0.4f, 0.4f, COL_TEXT);
+    draw_scrolling_text(track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist",
+                         details_x, details_y + 18, details_w, 0.35f, 0.35f, COL_ACCENT);
+
+    int pos_ms = audio_player_get_position_ms();
+    char tbuf1[32], tbuf2[32];
+    format_time(pos_ms, tbuf1, sizeof(tbuf1));
+    format_time(track->duration, tbuf2, sizeof(tbuf2));
+    char time_str[80];
+    snprintf(time_str, sizeof(time_str), "%s / %s", tbuf1, tbuf2);
+    draw_text(time_str, details_x, details_y + 40, 0.32f, 0.32f, COL_TEXT_DIM);
+
+    if (state == PLAYER_LOADING) {
+        draw_text("Buffering...", details_x, details_y + 56, 0.3f, 0.3f, COL_WARN);
+    }
+
+    // Right column: big lyrics, several lines centered on the current one.
+    float lyr_x = 150;
+    float lyr_w = TOP_WIDTH - lyr_x - 15;
+
+    if (s_num_lyrics == 0) {
+        draw_text_centered_at("Loading lyrics...", lyr_x, 120, lyr_w, 0.45f, 0.45f, COL_TEXT_DIM);
+        return;
+    }
+
+    int current_line = find_current_lyric_line(pos_ms);
+    float ly = 55;
+    for (int i = current_line - 3; i <= current_line + 3; i++) {
+        if (i >= 0 && i < s_num_lyrics) {
+            bool is_current = (i == current_line);
+            u32 lcol = is_current ? COL_ACCENT : COL_TEXT_DIM;
+            float lscale = is_current ? 0.55f : 0.4f;
+            draw_text_centered_at(s_lyrics[i].text, lyr_x, ly, lyr_w, lscale, lscale, lcol);
+        }
+        ly += 24;
+    }
+}
+
+// Track details in small text at top, visualizer filling the rest.
+static void draw_top_visualizer(PlexTrack* track, PlayerState state) {
+    char info_line[128];
+    const char* state_str = (state == PLAYER_PLAYING) ? "Playing" : (state == PLAYER_PAUSED ? "Paused" : "Buffering...");
+    snprintf(info_line, sizeof(info_line), "%s - %s  |  %s",
+             track->title, track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", state_str);
+    draw_text_centered(info_line, 40, TOP_WIDTH, 0.45f, 0.45f, state == PLAYER_LOADING ? COL_WARN : COL_TEXT);
+
+    const char* style_name = (s_vis_style == VIS_STYLE_OSCILLOSCOPE) ? "Oscilloscope" : "VU Bars";
+    char style_line[64];
+    snprintf(style_line, sizeof(style_line), "%s  (X: change style)", style_name);
+    draw_text_centered(style_line, 58, TOP_WIDTH, 0.35f, 0.35f, COL_TEXT_DIM);
+
+    if (state == PLAYER_LOADING) {
+        // Nothing's decoded yet to visualize - say so instead of drawing a dead/flat plot.
+        C2D_DrawRectSolid(15, 78, 0.4f, TOP_WIDTH - 30, 130, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
+        draw_loading_spinner(TOP_WIDTH / 2.0f, 78 + 65, 20, NULL);
+    } else {
+        draw_visualizer(s_vis_style, 15, 78, TOP_WIDTH - 30, 130);
+    }
+}
+
 void ui_render_top(C3D_RenderTarget* top) {
     C2D_TextBufClear(s_text_buf);
 
-    draw_text_centered("3DS PLEX CLIENT", 10, TOP_WIDTH, 0.6f, 0.6f, COL_ACCENT);
+    draw_text_centered("DUALPLEX", 10, TOP_WIDTH, 0.6f, 0.6f, COL_ACCENT);
     C2D_DrawRectSolid(10, 30, 0.5f, TOP_WIDTH - 20, 2, COL_ACCENT);
+
+    // Top-Left HUD: WiFi Signal Indicator
+    draw_wifi_indicator(10, 23);
 
     // Top-Right HUD: Time & Battery Indicator
     time_t rawtime = time(NULL);
@@ -1036,73 +1375,13 @@ void ui_render_top(C3D_RenderTarget* top) {
     if (state == PLAYER_PLAYING || state == PLAYER_PAUSED || state == PLAYER_LOADING) {
         if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
             PlexTrack* track = &s_tracks[s_current_track_idx];
-            
-            // Left Side: Album Art Frame (110x110)
-            float art_x = 20;
-            float art_y = 45;
-            float art_size = 110;
-            
-            // Outer accent border & container
-            C2D_DrawRectSolid(art_x - 2, art_y - 2, 0.5f, art_size + 4, art_size + 4, COL_ACCENT);
-            C2D_DrawRectSolid(art_x, art_y, 0.5f, art_size, art_size, COL_SURFACE);
-            
-            if (album_art_has_texture()) {
-                album_art_draw(art_x, art_y, art_size, art_size);
-            } else {
-                C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 42, C2D_Color32(0x28, 0x28, 0x38, 0xFF));
-                C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 34, C2D_Color32(0x18, 0x18, 0x24, 0xFF));
-                
-                if (album_art_is_loading()) {
-                    draw_loading_spinner(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 14, NULL);
-                } else {
-                    C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 14, COL_ACCENT);
-                    C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 4, C2D_Color32(0x12, 0x12, 0x24, 0xFF));
-                }
+            switch (s_top_view) {
+                case TOPVIEW_LYRICS:     draw_top_lyrics(track, state); break;
+                case TOPVIEW_VISUALIZER: draw_top_visualizer(track, state); break;
+                case TOPVIEW_NOW_PLAYING:
+                default:                 draw_top_now_playing(track, state); break;
             }
-            
-            // Right Side: Track Details with Marquee Scrolling
-            float text_x = 145;
-            float max_text_w = TOP_WIDTH - text_x - 15;
-            
-            draw_scrolling_text(track->title, text_x, 48, max_text_w, 0.65f, 0.65f, COL_TEXT);
-            draw_scrolling_text(track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", text_x, 76, max_text_w, 0.55f, 0.55f, COL_ACCENT);
-            draw_scrolling_text(track->parent_title[0] ? track->parent_title : "", text_x, 98, max_text_w, 0.45f, 0.45f, COL_TEXT_DIM);
-            
-            char status_line[128];
-            const char* state_str = (state == PLAYER_PLAYING) ? "Playing" : (state == PLAYER_PAUSED ? "Paused" : "Loading...");
-            snprintf(status_line, sizeof(status_line), "%s  |  Vol: %d%%", state_str, (int)(audio_player_get_volume() * 100));
-            draw_text(status_line, text_x, 122, 0.45f, 0.45f, COL_TEXT_DARK);
-            
-            // Bottom Section: Progress Bar & Time
-            float progress = audio_player_get_progress();
-            int pos_ms = audio_player_get_position_ms();
-            int dur_ms = track->duration;
-            
-            float bar_x = 25;
-            float bar_y = 175;
-            float bar_w = TOP_WIDTH - 50;
-            
-            C2D_DrawRectSolid(bar_x, bar_y, 0.5f, bar_w, 4, COL_PROGRESS_BG);
-            C2D_DrawRectSolid(bar_x, bar_y, 0.5f, bar_w * progress, 4, COL_ACCENT);
-            C2D_DrawCircleSolid(bar_x + bar_w * progress, bar_y + 2, 0.5f, 5, COL_ACCENT);
-            
-            char tbuf1[32], tbuf2[32];
-            format_time(pos_ms, tbuf1, sizeof(tbuf1));
-            format_time(dur_ms, tbuf2, sizeof(tbuf2));
-            draw_text(tbuf1, bar_x, bar_y + 10, 0.45f, 0.45f, COL_TEXT_DIM);
-            
-            float t2_w, t2_h;
-            C2D_Text txt2;
-            C2D_TextParse(&txt2, s_text_buf, tbuf2);
-            C2D_TextOptimize(&txt2);
-            C2D_TextGetDimensions(&txt2, 0.45f, 0.45f, &t2_w, &t2_h);
-            C2D_DrawText(&txt2, C2D_WithColor, bar_x + bar_w - t2_w, bar_y + 10, 0.5f, 0.45f, 0.45f, COL_TEXT_DIM);
         }
-        
-        char status_line[128];
-        const char* state_str = (state == PLAYER_PLAYING) ? "Playing" : (state == PLAYER_PAUSED ? "Paused" : "Loading");
-        snprintf(status_line, sizeof(status_line), "%s  |  Vol: %d%%", state_str, (int)(audio_player_get_volume() * 100));
-        draw_text_centered(status_line, 190, TOP_WIDTH, 0.55f, 0.55f, COL_TEXT);
     } else {
         float art_x = (TOP_WIDTH - 80) / 2.0f;
         float art_y = 50;
@@ -1125,7 +1404,7 @@ void ui_render_top(C3D_RenderTarget* top) {
     }
     
     // Bottom of Top Screen: Build Timestamp & Live Log Hint
-    draw_text_centered("Build: " __DATE__ " " __TIME__ " | Press L+R for Logs", TOP_HEIGHT - 16, TOP_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+    draw_text_centered("L/R: Change View  |  L+R Together: Logs", TOP_HEIGHT - 16, TOP_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
 }
 
 static void draw_log_entry_wrapped(const char* line, float x, float* y, float max_w, u32 color) {
@@ -1235,7 +1514,7 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
             }
         }
     } else if (s_screen == SCREEN_HUB) {
-        draw_header("PlexAmp Music Hub");
+        draw_header("DualPlex Music Hub");
         draw_list_item(0, "Artists", "Browse all artists", s_selected_idx == 0, false);
         draw_list_item(1, "Playlists", "View music playlists", s_selected_idx == 1, false);
         draw_list_item(2, "Search Library", "Search tracks, artists & albums", s_selected_idx == 2, false);
@@ -1271,32 +1550,58 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         draw_text_centered("Use D-Pad to navigate, A to edit/connect", BTM_HEIGHT - 20, BTM_WIDTH, 0.4f, 0.4f, COL_TEXT_DIM);
     } else if (s_screen == SCREEN_NOW_PLAYING) {
         draw_header("Now Playing Controls");
-        
+
         if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
-            draw_text_centered(s_tracks[s_current_track_idx].title, 55, BTM_WIDTH, 0.65f, 0.65f, COL_TEXT);
-            draw_text_centered(s_tracks[s_current_track_idx].grandparent_title, 75, BTM_WIDTH, 0.5f, 0.5f, COL_ACCENT);
+            PlexTrack* track = &s_tracks[s_current_track_idx];
+            draw_text_centered(track->title, 50, BTM_WIDTH, 0.6f, 0.6f, COL_TEXT);
+            draw_text_centered(track->grandparent_title, 68, BTM_WIDTH, 0.45f, 0.45f, COL_ACCENT);
+
+            // Seekable progress bar - tap anywhere on it to jump there.
+            float progress = audio_player_get_progress();
+            int pos_ms = audio_player_get_position_ms();
+            float bar_x = 20, bar_y = 84, bar_w = BTM_WIDTH - 40, bar_h = 5;
+
+            C2D_DrawRectSolid(bar_x, bar_y, 0.5f, bar_w, bar_h, COL_PROGRESS_BG);
+            C2D_DrawRectSolid(bar_x, bar_y, 0.5f, bar_w * progress, bar_h, COL_ACCENT);
+            C2D_DrawCircleSolid(bar_x + bar_w * progress, bar_y + bar_h / 2.0f, 0.5f, 6, COL_ACCENT);
+
+            char tbuf1[32], tbuf2[32];
+            format_time(pos_ms, tbuf1, sizeof(tbuf1));
+            format_time(track->duration, tbuf2, sizeof(tbuf2));
+            draw_text(tbuf1, bar_x, bar_y + 8, 0.35f, 0.35f, COL_TEXT_DIM);
+
+            float t2_w, t2_h;
+            C2D_Text txt2;
+            C2D_TextParse(&txt2, s_text_buf, tbuf2);
+            C2D_TextOptimize(&txt2);
+            C2D_TextGetDimensions(&txt2, 0.35f, 0.35f, &t2_w, &t2_h);
+            C2D_DrawText(&txt2, C2D_WithColor, bar_x + bar_w - t2_w, bar_y + 8, 0.5f, 0.35f, 0.35f, COL_TEXT_DIM);
         } else {
             draw_text_centered("No track playing", 65, BTM_WIDTH, 0.6f, 0.6f, COL_TEXT_DIM);
         }
-        
+
         // Large Playback Buttons: [ Prev ]  [ Play/Pause ]  [ Next ]
-        C2D_DrawRectSolid(20, 105, 0.5f, 85, 38, COL_SURFACE);
-        draw_text_centered("<< Prev", 116, 125, 0.5f, 0.5f, COL_TEXT);
-        
-        C2D_DrawRectSolid(115, 100, 0.5f, 90, 48, COL_ACCENT);
-        const char* pstr = (audio_player_get_state() == PLAYER_PLAYING) ? "Pause" : "Play";
-        draw_text_centered(pstr, 114, 320, 0.65f, 0.65f, C2D_Color32(0x12, 0x12, 0x18, 0xFF));
-        
-        C2D_DrawRectSolid(215, 105, 0.5f, 85, 38, COL_SURFACE);
-        draw_text_centered("Next >>", 116, 515, 0.5f, 0.5f, COL_TEXT);
-        
+        C2D_DrawRectSolid(20, 113, 0.5f, 85, 38, COL_SURFACE);
+        draw_text_centered("<< Prev", 124, 125, 0.5f, 0.5f, COL_TEXT);
+
+        PlayerState pbtn_state = audio_player_get_state();
+        C2D_DrawRectSolid(115, 108, 0.5f, 90, 48, pbtn_state == PLAYER_LOADING ? COL_WARN : COL_ACCENT);
+        const char* pstr = (pbtn_state == PLAYER_PLAYING) ? "Pause" : (pbtn_state == PLAYER_LOADING ? "Buffering" : "Play");
+        draw_text_centered(pstr, 122, 320, 0.6f, 0.6f, C2D_Color32(0x12, 0x12, 0x18, 0xFF));
+        if (pbtn_state == PLAYER_LOADING) {
+            draw_loading_spinner(115 + 90 - 16, 108 + 10, 8, NULL);
+        }
+
+        C2D_DrawRectSolid(215, 113, 0.5f, 85, 38, COL_SURFACE);
+        draw_text_centered("Next >>", 124, 515, 0.5f, 0.5f, COL_TEXT);
+
         // Lower Navigation Buttons: [ Up Next Queue ]  [ Synced Lyrics ]
-        C2D_DrawRectSolid(20, 165, 0.5f, 135, 38, COL_HIGHLIGHT);
-        draw_text_centered("Queue", 175, 175, 0.5f, 0.5f, COL_TEXT);
-        
-        C2D_DrawRectSolid(165, 165, 0.5f, 135, 38, COL_HIGHLIGHT);
-        draw_text_centered("Lyrics", 175, 465, 0.5f, 0.5f, COL_ACCENT);
-        
+        C2D_DrawRectSolid(20, 173, 0.5f, 135, 38, COL_HIGHLIGHT);
+        draw_text_centered("Queue", 183, 175, 0.5f, 0.5f, COL_TEXT);
+
+        C2D_DrawRectSolid(165, 173, 0.5f, 135, 38, COL_HIGHLIGHT);
+        draw_text_centered("Lyrics", 183, 465, 0.5f, 0.5f, COL_ACCENT);
+
         draw_text_centered("Press SELECT or B to close", BTM_HEIGHT - 20, BTM_WIDTH, 0.4f, 0.4f, COL_TEXT_DIM);
     } else if (s_screen == SCREEN_QUEUE) {
         draw_header("Play Queue / Up Next");
@@ -1323,13 +1628,8 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
     } else if (s_screen == SCREEN_LYRICS) {
         draw_header("Time-Synced Lyrics");
         int pos_ms = audio_player_get_position_ms();
-        int current_line = 0;
-        for (int i = 0; i < s_num_lyrics; i++) {
-            if (pos_ms >= s_lyrics[i].time_ms) {
-                current_line = i;
-            }
-        }
-        
+        int current_line = find_current_lyric_line(pos_ms);
+
         float ly = 60;
         for (int i = current_line - 2; i <= current_line + 2; i++) {
             if (i >= 0 && i < s_num_lyrics) {
