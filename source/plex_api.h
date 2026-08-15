@@ -109,6 +109,13 @@ void plex_api_cleanup(void);
 const char* plex_api_get_token(void);
 const char* plex_api_get_server_url(void);
 
+// Whether the current connection is HTTPS rather than plain HTTP.
+bool plex_api_is_https(void);
+
+// Whether the current server address is on a private/local network
+// (RFC1918, loopback, or link-local) rather than a public/remote one.
+bool plex_api_is_local_connection(void);
+
 // Test if the server is reachable and the token is valid.
 bool plex_api_test_connection(void);
 

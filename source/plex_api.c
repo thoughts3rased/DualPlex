@@ -355,6 +355,36 @@ const char* plex_api_get_server_url(void) {
     return s_server_url;
 }
 
+bool plex_api_is_https(void) {
+    return strncmp(s_server_url, "https://", 8) == 0;
+}
+
+bool plex_api_is_local_connection(void) {
+    // Parsed straight from the stored, sanitized server URL rather than
+    // relying on PlexServerResource.is_local - that flag only exists when
+    // the server was picked from plex.tv's resource list (plex_api_get_
+    // servers() above), not when the user typed a URL manually in Setup.
+    // Reading it back off the URL itself covers both paths and always
+    // matches the address actually being connected to.
+    const char* host = strstr(s_server_url, "://");
+    host = host ? host + 3 : s_server_url;
+
+    int a, b;
+    if (sscanf(host, "%d.%d.", &a, &b) != 2) {
+        // Not a bare dotted-quad IP (a DNS hostname, e.g. a custom domain
+        // or a plain plex.direct name that sanitize_server_url() didn't
+        // resolve to an IP) - treat as remote, since private ranges are
+        // only ever addressed by literal IP.
+        return false;
+    }
+    if (a == 10) return true;                        // 10.0.0.0/8
+    if (a == 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
+    if (a == 192 && b == 168) return true;            // 192.168.0.0/16
+    if (a == 127) return true;                        // loopback
+    if (a == 169 && b == 254) return true;            // link-local
+    return false;
+}
+
 bool plex_api_test_connection(void) {
     char* response = NULL;
     if (plex_http_get("/", &response)) {

@@ -635,6 +635,64 @@ static void draw_wifi_indicator(float x, float baseline_y) {
     }
 }
 
+// House glyph (peaked roof + walls), hand-drawn from plain triangle/rect
+// primitives rather than pulled from the bundled icon font - same reasoning
+// as draw_icon_back_arrow()/draw_star() above: it's not in the font's baked
+// glyph whitelist, and adding a codepoint means re-baking the whole .bcfnt
+// with an external tool this repo doesn't carry (see the icon font block's
+// comment for how data/iconfont.bin was built). Represents a server
+// connection over the local network in the top HUD - paired with
+// draw_icon_globe() below for the remote case.
+static void draw_icon_house(float cx, float cy, float size, u32 color) {
+    float roof_h = size * 0.45f;
+    float wall_h = size - roof_h;
+    float wall_w = size * 0.85f;
+    float roof_w = size * 1.05f; // slight eave overhang past the walls
+
+    float top_y = cy - size / 2.0f;
+    float wall_top = top_y + roof_h;
+
+    C2D_DrawTriangle(cx, top_y, color,
+                      cx - roof_w / 2.0f, wall_top, color,
+                      cx + roof_w / 2.0f, wall_top, color, 0.5f);
+    C2D_DrawRectSolid(cx - wall_w / 2.0f, wall_top, 0.5f, wall_w, wall_h, color);
+}
+
+// Globe glyph (ring + crossed equator/meridian) for a server connection
+// reached over the internet, paired with draw_icon_house() above. Same
+// hand-drawn approach - see that function's comment for why. The ring is a
+// filled circle with a slightly smaller filled circle punched out of it in
+// the top screen's background color, same layering trick the Now Playing
+// screen's disc-art placeholder uses for its own rings.
+static void draw_icon_globe(float cx, float cy, float size, u32 color) {
+    float r = size / 2.0f;
+    C2D_DrawCircleSolid(cx, cy, 0.5f, r, color);
+    C2D_DrawCircleSolid(cx, cy, 0.5f, r - size * 0.16f, COL_BG_TOP);
+    C2D_DrawRectSolid(cx - r, cy - size * 0.06f, 0.5f, r * 2.0f, size * 0.12f, color);
+    C2D_DrawRectSolid(cx - size * 0.06f, cy - r, 0.5f, size * 0.12f, r * 2.0f, color);
+}
+
+// Padlock glyph: a shackle ring drawn first, then a solid body on top of
+// it so the body's top edge swallows the ring's lower half - reads as "the
+// shackle passes through the lock", same ring layering as draw_icon_globe()
+// above. `locked` toggles between a closed padlock (HTTPS - shackle
+// centered and fully seated) and an open one (HTTP - shackle swung up and
+// to the side, leaving a visible gap on the body's other side).
+static void draw_icon_padlock(float cx, float cy, float size, u32 color, bool locked) {
+    float body_w = size * 0.85f;
+    float body_h = size * 0.52f;
+    float body_top = cy + size * 0.02f;
+    float shackle_r = size * 0.3f;
+
+    float shackle_cx = locked ? cx : cx + size * 0.2f;
+    float shackle_cy = locked ? body_top - shackle_r * 0.5f : body_top - shackle_r * 1.1f;
+
+    C2D_DrawCircleSolid(shackle_cx, shackle_cy, 0.5f, shackle_r, color);
+    C2D_DrawCircleSolid(shackle_cx, shackle_cy, 0.5f, shackle_r - size * 0.16f, COL_BG_TOP);
+
+    C2D_DrawRectSolid(cx - body_w / 2.0f, body_top, 0.5f, body_w, body_h, color);
+}
+
 static void format_time(int ms, char* buf, size_t buf_size) {
     int total_sec = ms / 1000;
     int min = total_sec / 60;
@@ -1992,6 +2050,21 @@ void ui_render_top(C3D_RenderTarget* top) {
     char bat_str[8];
     snprintf(bat_str, sizeof(bat_str), "%d%%", bat_percent);
     draw_text(bat_str, 54, 10, 0.42f, 0.42f, COL_TEXT_DIM);
+
+    // Connection status, right after the battery readout: house/globe for
+    // local-network vs. remote/internet server address, padlock for plain
+    // HTTP vs. HTTPS. Only shown once a server is actually configured
+    // (plex_api_get_server_url() reads back "" before Setup/Link finishes)
+    // - nothing meaningful to report before then.
+    const char* conn_url = plex_api_get_server_url();
+    if (conn_url && conn_url[0]) {
+        if (plex_api_is_local_connection()) {
+            draw_icon_house(96, 17, 14, COL_TEXT_DIM);
+        } else {
+            draw_icon_globe(96, 17, 14, COL_TEXT_DIM);
+        }
+        draw_icon_padlock(122, 17, 14, COL_TEXT_DIM, plex_api_is_https());
+    }
 
     // Top-Right HUD: Time, right-aligned. 12/24-hour format: the 3DS has a
     // user-facing "Display 24-Hour Time" toggle (System Settings > Other

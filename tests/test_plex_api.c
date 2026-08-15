@@ -644,6 +644,51 @@ TEST(parse_loudness_curve_response_empty_input_returns_zero) {
 }
 
 /* ================================================================== */
+/* plex_api_is_local_connection() / plex_api_is_https(): top-bar connection
+ * status icons (house/globe, padlock) read these back off whatever URL
+ * plex_api_init() was last given. */
+
+TEST(is_local_connection_true_for_rfc1918_ranges) {
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://10.1.2.3:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://172.16.0.5:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://172.31.255.254:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+
+    plex_api_init("http://127.0.0.1:32400", "TOK");
+    CHECK(plex_api_is_local_connection());
+}
+
+TEST(is_local_connection_false_for_public_ip_or_hostname) {
+    plex_api_init("http://203.0.113.5:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+
+    /* 172.32.x.x is just outside the 172.16.0.0/12 private range. */
+    plex_api_init("http://172.32.0.1:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+
+    plex_api_init("http://myserver.example.com:32400", "TOK");
+    CHECK(!plex_api_is_local_connection());
+}
+
+TEST(is_https_reflects_the_stored_url_scheme) {
+    /* sanitize_server_url() downgrades any https:// input to http://, so a
+     * fresh init() should always read back as plain HTTP regardless of what
+     * scheme was passed in. */
+    plex_api_init("https://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_https());
+
+    plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_https());
+}
+
+/* ================================================================== */
 
 int main(void) {
     RUN(transcode_url_flac_direct_tier_falls_back_to_320_bitrate);
@@ -674,6 +719,9 @@ int main(void) {
     RUN(parse_loudness_curve_response_respects_max_cap);
     RUN(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them);
     RUN(parse_loudness_curve_response_empty_input_returns_zero);
+    RUN(is_local_connection_true_for_rfc1918_ranges);
+    RUN(is_local_connection_false_for_public_ip_or_hostname);
+    RUN(is_https_reflects_the_stored_url_scheme);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {
