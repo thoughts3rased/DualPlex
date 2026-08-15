@@ -59,7 +59,7 @@ jobs:
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
             /opt/devkitpro/tools/glibc-makerom
-          key: devkitpro-3ds-extras-v3
+          key: devkitpro-3ds-extras-v4
 
       - name: Install missing 3DS portlibs + makerom
         if: steps.cache-extras.outputs.cache-hit != 'true'
@@ -80,9 +80,19 @@ jobs:
           # warns and ignores it:
           #   warning: config file .../pacman.conf, line 84: directive
           #   'XferCommand' in section 'dkp-linux' not recognized.
+          # No -c (resume): this image already ships with these exact .db
+          # files baked in from whenever it was itself built, so a resumed
+          # download lands on top of that stale file. pkg.devkitpro.org
+          # doesn't reliably honor the resulting Range request either (a
+          # plain 200 came back, not 206), so wget appended the fresh
+          # content onto the old file instead of restarting clean -
+          # corrupting it in a way that fails signature verification, not a
+          # download error:
+          #   error: dkp-libs: signature from "... WinterMute ..." is
+          #   invalid
           PACMAN_CONF="$DEVKITPRO/pacman/etc/pacman.conf"
           if ! grep -q '^XferCommand' "$PACMAN_CONF"; then
-            $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -c -O %o %u' "$PACMAN_CONF"
+            $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -O %o %u' "$PACMAN_CONF"
           fi
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
