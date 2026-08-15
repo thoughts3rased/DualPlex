@@ -463,6 +463,8 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
 #define ICON_CP_LOCK            0xF023
 #define ICON_CP_LOCK_OPEN       0xF3C1
 #define ICON_CP_DISCONNECTED    0xE560 // "plug-circle-xmark"
+#define ICON_CP_WIFI             0xF1EB
+#define ICON_CP_PLANE            0xF072
 
 // Every codepoint above sits in Font Awesome's Private Use Area, always a
 // 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
@@ -621,11 +623,60 @@ static void draw_list_item(int visual_idx, const char* title, const char* subtit
     }
 }
 
+// NETWORK_STATE, documented at 3dbrew's "Configuration Memory" page: a byte
+// in the same shared system page osGetWifiStrength()/osGet3DSliderState()
+// already read from (offset 0x1FF81067 - verified against this struct's
+// own network_state field, which lands at exactly that address), and the
+// literal value the HOME Menu's own WiFi icon decides what to show from.
+// Only specific values are documented: 2 = has real internet access;
+// 3/4/6 = associated with an access point but LAN-only, no internet (still
+// fine for reaching a Plex server on that LAN); 7 = wireless communications
+// switched off entirely (the HOME Menu's Wireless Switch toggle). Anything
+// else is the generic "radio on, not associated with anything yet" state.
+#define NETWORK_STATE_DISABLED 7
+static bool network_state_is_connected(u8 state) {
+    return state == 2 || state == 3 || state == 4 || state == 6;
+}
+
+// FA "wifi" glyph with a diagonal slash through it (composed by hand, same
+// overlay technique as the bolt-over-battery charging badge below) - shown
+// in place of the bar indicator when the radio is on but not associated
+// with any access point yet. Font Awesome Free's solid set has no ready-
+// made "wifi-slash"/"wifi-off" glyph to pull the whole thing from directly.
+static void draw_icon_wifi_off(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_WIFI, cx, cy, size, color);
+    float r = size * 0.5f;
+    C2D_DrawLine(cx - r, cy - r, color, cx + r, cy + r, color, 2.0f, 0.5f);
+}
+
+// Plane glyph ("airplane mode") shown when wireless communications are
+// switched off entirely - the same convention used for this state on
+// basically every other platform.
+static void draw_icon_airplane(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_PLANE, cx, cy, size, color);
+}
+
 // Draws a Home-Menu-style WiFi signal indicator: 3 bars of increasing height,
 // filled left-to-right up to the current signal strength (0-3, straight from
 // the OS - no service init needed, same value the system's own WiFi icon
-// uses). 0 bars filled means no/negligible signal.
+// uses). Only meaningful once actually associated with an access point
+// (network_state_is_connected()) - otherwise swapped out for
+// draw_icon_wifi_off()/draw_icon_airplane() above, centered over the same
+// footprint the 3 bars would occupy, since 0 bars filled would otherwise
+// look identical whether the radio just has no signal yet or is switched
+// off completely.
 static void draw_wifi_indicator(float x, float baseline_y) {
+    u8 state = OS_SharedConfig->network_state;
+    if (!network_state_is_connected(state)) {
+        float cx = x + 6.5f, cy = baseline_y - 6.5f;
+        if (state == NETWORK_STATE_DISABLED) {
+            draw_icon_airplane(cx, cy, 15, COL_TEXT_DIM);
+        } else {
+            draw_icon_wifi_off(cx, cy, 15, COL_TEXT_DIM);
+        }
+        return;
+    }
+
     u8 strength = osGetWifiStrength();
     static const float bar_heights[3] = { 5.0f, 9.0f, 13.0f };
     static const float bar_w = 3.0f;
