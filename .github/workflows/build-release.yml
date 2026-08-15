@@ -1,0 +1,89 @@
+name: Build and Release
+
+# Rebuilds DualPlex on every push to main and republishes a single rolling
+# "nightly" GitHub Release with the .3dsx/.cia attached, plus a QR code that
+# points at the .cia's download URL for FBI's "Remote Install (QR)" feature
+# on real 3DS hardware. Re-running (either via a new push or manually below)
+# updates that same release/tag in place rather than accumulating a new one
+# per commit - see the "Publish" step if you'd rather have one release per
+# build instead.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# A second push landing mid-build would otherwise race the first over the
+# same working tree and the same "nightly" release/tag.
+concurrency:
+  group: build-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write # required to create/update the release and its tag
+
+env:
+  # Assumes devkitPro is installed at its standard default location on the
+  # runner. Adjust these two if your self-hosted runner has it elsewhere -
+  # everything below only depends on these, not on any shell profile/rc file
+  # having set them up already (self-hosted runners commonly run as a
+  # service account whose non-interactive environment won't have picked up
+  # anything exported in your own interactive login shell).
+  DEVKITPRO: /opt/devkitpro
+  DEVKITARM: /opt/devkitpro/devkitARM
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # source/lib/cJSON.{c,h} are committed to the repo already (not
+      # fetched by setup.sh at build time), so there's nothing else to
+      # provision here - devkitPro itself is expected to already be present
+      # on the runner (see the env: block above), same reasoning as not
+      # re-installing it from scratch on every build.
+      - name: Build (.elf, .3dsx, .cia)
+        run: |
+          export PATH="$DEVKITPRO/tools/bin:$PATH"
+          make clean
+          make
+          ls -la DualPlex.elf DualPlex.3dsx DualPlex.cia
+
+      # Points at the exact URL this same release publishes DualPlex.cia at
+      # (predictable from the tag name below, independent of upload order -
+      # constructing it doesn't require the upload to have happened yet,
+      # only for the QR to actually resolve once it has). Uses a public
+      # QR-generation API (goqr.me) via plain curl rather than installing a
+      # QR tool locally (e.g. qrencode), since that'd need apt/sudo access
+      # this workflow can't assume your self-hosted runner grants it -
+      # swap this step for `qrencode` directly if you'd rather not depend
+      # on a third party (the URL itself is already public once released,
+      # so there's nothing sensitive being sent).
+      - name: Generate QR code (CIA remote-install link)
+        run: |
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/nightly/DualPlex.cia"
+          curl -sf -G "https://api.qrserver.com/v1/create-qr-code/" \
+            --data-urlencode "size=300x300" \
+            --data-urlencode "data=${DOWNLOAD_URL}" \
+            -o DualPlex-qr.png
+
+      - name: Publish rolling "nightly" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "DualPlex (nightly build)"
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: true
+          body: |
+            Automated build from commit ${{ github.sha }}, replaces the previous nightly build.
+
+            - **DualPlex.cia**: install with [FBI](https://github.com/Steveice10/FBI) - either sideload the file directly, or open FBI's "Remote Install" QR scanner on your 3DS and scan `DualPlex-qr.png` below to fetch and install it directly, no PC transfer needed.
+            - **DualPlex.3dsx**: copy to `/3ds/` on your SD card to run via the Homebrew Launcher.
+          files: |
+            DualPlex.cia
+            DualPlex.3dsx
+            DualPlex-qr.png
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
