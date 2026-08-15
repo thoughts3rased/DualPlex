@@ -458,6 +458,10 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
 #define ICON_CP_BATTERY_QUARTER 0xF243
 #define ICON_CP_BATTERY_EMPTY  0xF244
 #define ICON_CP_BOLT            0xF0E7
+#define ICON_CP_HOUSE           0xF015
+#define ICON_CP_GLOBE           0xF0AC
+#define ICON_CP_LOCK            0xF023
+#define ICON_CP_LOCK_OPEN       0xF3C1
 
 // Every codepoint above sits in Font Awesome's Private Use Area, always a
 // 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
@@ -635,62 +639,20 @@ static void draw_wifi_indicator(float x, float baseline_y) {
     }
 }
 
-// House glyph (peaked roof + walls), hand-drawn from plain triangle/rect
-// primitives rather than pulled from the bundled icon font - same reasoning
-// as draw_icon_back_arrow()/draw_star() above: it's not in the font's baked
-// glyph whitelist, and adding a codepoint means re-baking the whole .bcfnt
-// with an external tool this repo doesn't carry (see the icon font block's
-// comment for how data/iconfont.bin was built). Represents a server
-// connection over the local network in the top HUD - paired with
-// draw_icon_globe() below for the remote case.
+// House glyph for a server connection over the local network in the top
+// HUD, paired with draw_icon_globe() below for the remote case.
 static void draw_icon_house(float cx, float cy, float size, u32 color) {
-    float roof_h = size * 0.45f;
-    float wall_h = size - roof_h;
-    float wall_w = size * 0.85f;
-    float roof_w = size * 1.05f; // slight eave overhang past the walls
-
-    float top_y = cy - size / 2.0f;
-    float wall_top = top_y + roof_h;
-
-    C2D_DrawTriangle(cx, top_y, color,
-                      cx - roof_w / 2.0f, wall_top, color,
-                      cx + roof_w / 2.0f, wall_top, color, 0.5f);
-    C2D_DrawRectSolid(cx - wall_w / 2.0f, wall_top, 0.5f, wall_w, wall_h, color);
+    draw_icon_glyph(ICON_CP_HOUSE, cx, cy, size, color);
 }
 
-// Globe glyph (ring + crossed equator/meridian) for a server connection
-// reached over the internet, paired with draw_icon_house() above. Same
-// hand-drawn approach - see that function's comment for why. The ring is a
-// filled circle with a slightly smaller filled circle punched out of it in
-// the top screen's background color, same layering trick the Now Playing
-// screen's disc-art placeholder uses for its own rings.
+// Globe glyph for a server connection reached over the internet.
 static void draw_icon_globe(float cx, float cy, float size, u32 color) {
-    float r = size / 2.0f;
-    C2D_DrawCircleSolid(cx, cy, 0.5f, r, color);
-    C2D_DrawCircleSolid(cx, cy, 0.5f, r - size * 0.16f, COL_BG_TOP);
-    C2D_DrawRectSolid(cx - r, cy - size * 0.06f, 0.5f, r * 2.0f, size * 0.12f, color);
-    C2D_DrawRectSolid(cx - size * 0.06f, cy - r, 0.5f, size * 0.12f, r * 2.0f, color);
+    draw_icon_glyph(ICON_CP_GLOBE, cx, cy, size, color);
 }
 
-// Padlock glyph: a shackle ring drawn first, then a solid body on top of
-// it so the body's top edge swallows the ring's lower half - reads as "the
-// shackle passes through the lock", same ring layering as draw_icon_globe()
-// above. `locked` toggles between a closed padlock (HTTPS - shackle
-// centered and fully seated) and an open one (HTTP - shackle swung up and
-// to the side, leaving a visible gap on the body's other side).
+// Padlock glyph: closed (HTTPS) or open (HTTP).
 static void draw_icon_padlock(float cx, float cy, float size, u32 color, bool locked) {
-    float body_w = size * 0.85f;
-    float body_h = size * 0.52f;
-    float body_top = cy + size * 0.02f;
-    float shackle_r = size * 0.3f;
-
-    float shackle_cx = locked ? cx : cx + size * 0.2f;
-    float shackle_cy = locked ? body_top - shackle_r * 0.5f : body_top - shackle_r * 1.1f;
-
-    C2D_DrawCircleSolid(shackle_cx, shackle_cy, 0.5f, shackle_r, color);
-    C2D_DrawCircleSolid(shackle_cx, shackle_cy, 0.5f, shackle_r - size * 0.16f, COL_BG_TOP);
-
-    C2D_DrawRectSolid(cx - body_w / 2.0f, body_top, 0.5f, body_w, body_h, color);
+    draw_icon_glyph(locked ? ICON_CP_LOCK : ICON_CP_LOCK_OPEN, cx, cy, size, color);
 }
 
 static void format_time(int ms, char* buf, size_t buf_size) {
