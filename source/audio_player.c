@@ -348,6 +348,20 @@ static bool deck_start_stream(Deck* d, const char* url) {
     d->codec = (strstr(url, ".flac") || strstr(url, ".FLAC")) ? CODEC_FLAC : CODEC_MP3;
     if (d->codec == CODEC_MP3 && d->mpg) {
         mpg123_open_feed(d->mpg);
+        // Decks are reused across tracks without reallocation, so this deck's
+        // NDSP channel may still be clocked at whatever rate a *previous*
+        // track left it at - e.g. a FLAC track's native 48000/96000Hz (set
+        // directly from drflac's sampleRate, see below). mpg123 is pinned to
+        // always decode to AUDIO_SAMPLE_RATE via mpg123_format() in
+        // deck_init_static(), but it only reports MPG123_NEW_FORMAT when its
+        // *output* format actually changes - since that output format is a
+        // fixed constant, it may not re-announce it for this new feed, so
+        // deck_decode_and_feed()'s MPG123_NEW_FORMAT handler can't be relied
+        // on alone to bring the channel rate back down. Set it explicitly
+        // here so MP3 always starts out clocked correctly, regardless of
+        // whether NEW_FORMAT fires again.
+        ndspChnSetRate(d->ndsp_channel, AUDIO_SAMPLE_RATE);
+        ndspChnSetFormat(d->ndsp_channel, NDSP_FORMAT_STEREO_PCM16);
     }
 
     d->samples_played = 0;
