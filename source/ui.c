@@ -84,6 +84,19 @@ static bool s_crossfade_enabled = true;
 #define SHUFFLE_HISTORY_MAX 32
 static int s_shuffle_history[SHUFFLE_HISTORY_MAX];
 static int s_shuffle_history_count = 0;
+// Persistent shuffle order: a permutation of [0, s_num_tracks) that both
+// decides what plays next and is what the Play Queue screen (SCREEN_QUEUE)
+// displays while shuffle is on. Without this, shuffle only ever knew the
+// *next* track (re-rolled fresh each call, see the old compute_next_track_idx),
+// so the Play Queue screen - which just lists s_tracks in raw library order -
+// never had anything shuffle-aware to show and kept displaying pre-shuffle
+// order no matter how far playback had advanced. s_current_track_idx always
+// sits at s_shuffle_order[s_shuffle_pos]; kept in sync via shuffle_order_sync()
+// any time the current track changes, and rebuilt via shuffle_order_regenerate()
+// when the track list changes size or a lap through it completes.
+static int s_shuffle_order[PLEX_MAX_ITEMS];
+static int s_shuffle_order_count = 0;
+static int s_shuffle_pos = -1;
 // --- Smart crossfade state -------------------------------------------------
 // Sonic-Analysis-driven crossfade (see audio_player_start_crossfade()):
 // s_current_analysis is the track NOW PLAYING's tail loudness curve (fetched
@@ -891,6 +904,56 @@ static void shuffle_history_push(int idx) {
     s_shuffle_history[s_shuffle_history_count++] = idx;
 }
 
+// Rebuilds s_shuffle_order as a fresh Fisher-Yates permutation of every
+// track, with pin_idx (usually s_current_track_idx) swapped to the front so
+// everything after it is exactly what the Play Queue screen should show as
+// "up next". Called whenever the order is missing/stale (track list size
+// changed) or a full lap through it has been played.
+static void shuffle_order_regenerate(int pin_idx) {
+    s_shuffle_order_count = s_num_tracks;
+    for (int i = 0; i < s_num_tracks; i++) s_shuffle_order[i] = i;
+    for (int i = s_num_tracks - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = s_shuffle_order[i]; s_shuffle_order[i] = s_shuffle_order[j]; s_shuffle_order[j] = tmp;
+    }
+    s_shuffle_pos = 0;
+    if (pin_idx >= 0 && pin_idx < s_num_tracks) {
+        for (int i = 0; i < s_shuffle_order_count; i++) {
+            if (s_shuffle_order[i] == pin_idx) {
+                int tmp = s_shuffle_order[0]; s_shuffle_order[0] = s_shuffle_order[i]; s_shuffle_order[i] = tmp;
+                break;
+            }
+        }
+    }
+}
+
+// Keeps s_shuffle_pos pointing at idx's slot in s_shuffle_order, rebuilding
+// the order around idx if it's stale (track list resized) or idx isn't in
+// it (e.g. a manual jump right after the list was reloaded). Idempotent when
+// idx is already at s_shuffle_pos, so calling this from a prediction-only
+// path (compute_next_track_idx()) doesn't disturb anything mid-lap.
+static void shuffle_order_sync(int idx) {
+    if (s_shuffle_order_count != s_num_tracks) { shuffle_order_regenerate(idx); return; }
+    for (int i = 0; i < s_shuffle_order_count; i++) {
+        if (s_shuffle_order[i] == idx) { s_shuffle_pos = i; return; }
+    }
+    shuffle_order_regenerate(idx);
+}
+
+// Maps a Play Queue screen row (top-to-bottom screen position) to the track
+// it shows/selects: raw library order normally, or the "up next"-relative
+// shuffle order while shuffle is on (see s_shuffle_order above) - keeps a
+// tap/A on a given row playing the track actually drawn there.
+static int queue_row_to_track_idx(int row) {
+    if (s_shuffle_enabled) {
+        shuffle_order_sync(s_current_track_idx);
+        if (s_shuffle_order_count == s_num_tracks && row >= 0 && row < s_shuffle_order_count) {
+            return s_shuffle_order[row];
+        }
+    }
+    return row;
+}
+
 // Track to advance to going forward from s_current_track_idx, respecting
 // shuffle and repeat. -1 means stop (end of queue, repeat off).
 static int compute_next_track_idx(void) {
@@ -899,11 +962,15 @@ static int compute_next_track_idx(void) {
 
     if (s_shuffle_enabled) {
         if (s_num_tracks == 1) return s_current_track_idx;
-        int idx, tries = 0;
-        do {
-            idx = rand() % s_num_tracks;
-        } while (idx == s_current_track_idx && ++tries < 20);
-        return idx;
+        shuffle_order_sync(s_current_track_idx);
+        if (s_shuffle_pos + 1 >= s_shuffle_order_count) {
+            // End of this lap through the shuffle order - start a new one.
+            // Shuffle mode keeps going regardless of repeat (matches the
+            // previous "infinite random, no explicit stop" behavior), it
+            // just no longer loses track of what that next lap looks like.
+            shuffle_order_regenerate(s_current_track_idx);
+        }
+        return s_shuffle_order[s_shuffle_pos + 1];
     }
 
     if (s_current_track_idx + 1 < s_num_tracks) return s_current_track_idx + 1;
@@ -958,6 +1025,11 @@ static void play_track(int idx) {
 
     s_current_track_idx = idx;
     s_auto_advance = true;
+    // Re-anchor the shuffle order on whatever just became current, whether
+    // that's a normal shuffle advance, a manual jump (Queue/Tracks screen),
+    // or a same-track quality restart - so the Play Queue screen's "up next"
+    // list is always relative to what's actually playing now.
+    if (s_shuffle_enabled) shuffle_order_sync(idx);
 
     LOG_INFO("Playing track %d: %s", idx, s_tracks[idx].title);
     plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
@@ -1209,6 +1281,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (idx >= 0 && idx < s_num_tracks) {
             s_current_track_idx = idx;
             s_auto_advance = true;
+            if (s_shuffle_enabled) shuffle_order_sync(idx);
 
             LOG_INFO("Crossfade complete - now playing track %d: %s", idx, s_tracks[idx].title);
             plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
@@ -1400,6 +1473,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     if (kDown & KEY_CSTICK_LEFT) {
         s_shuffle_enabled = !s_shuffle_enabled;
         s_shuffle_history_count = 0; // stale once shuffle state changes
+        if (s_shuffle_enabled) shuffle_order_regenerate(s_current_track_idx);
     }
     if (kDown & KEY_CSTICK_RIGHT) {
         s_repeat_mode = (RepeatMode)((s_repeat_mode + 1) % REPEAT_MODE_COUNT);
@@ -1442,6 +1516,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             else if (touch.px >= 8 && touch.px <= 66 && touch.py >= 80 && touch.py <= 120) {
                 s_shuffle_enabled = !s_shuffle_enabled;
                 s_shuffle_history_count = 0;
+                if (s_shuffle_enabled) shuffle_order_regenerate(s_current_track_idx);
             }
             else if (touch.px >= 69 && touch.px <= 127 && touch.py >= 80 && touch.py <= 120) {
                 play_prev_track();
@@ -1501,14 +1576,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             }
         }
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
-            int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT + s_list_offset;
-            if (idx >= 0 && idx < s_list_count) {
-                s_selected_idx = idx;
-                play_track(idx);
+            int row = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT + s_list_offset;
+            if (row >= 0 && row < s_list_count) {
+                s_selected_idx = row;
+                play_track(queue_row_to_track_idx(row));
             }
         }
         if (kDown & KEY_A && s_selected_idx >= 0 && s_selected_idx < s_list_count) {
-            play_track(s_selected_idx);
+            play_track(queue_row_to_track_idx(s_selected_idx));
         }
         return;
     }
@@ -2496,16 +2571,21 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
 
         draw_text_centered("Press SELECT or B to close", BTM_HEIGHT - 12, BTM_WIDTH, 0.35f, 0.35f, COL_TEXT_DIM);
     } else if (s_screen == SCREEN_QUEUE) {
-        draw_header("Play Queue / Up Next");
+        // While shuffle is on, rows are drawn in shuffle order (see
+        // queue_row_to_track_idx()) rather than raw library order, so this
+        // screen actually shows what's coming up instead of a static list
+        // that never reflected shuffle being on at all.
+        draw_header(s_shuffle_enabled ? "Play Queue / Up Next (Shuffled)" : "Play Queue / Up Next");
         s_list_count = s_num_tracks;
         for (int i = 0; i < LIST_VISIBLE_ITEMS; i++) {
-            int idx = s_list_offset + i;
-            if (idx >= s_list_count) break;
+            int row = s_list_offset + i;
+            if (row >= s_list_count) break;
+            int idx = queue_row_to_track_idx(row);
             char dur_buf[32];
             format_time(s_tracks[idx].duration, dur_buf, sizeof(dur_buf));
             char qual_buf[32];
             format_quality_tag(&s_tracks[idx], qual_buf, sizeof(qual_buf));
-            
+
             char sub_buf[96];
             if (s_tracks[idx].grandparent_title[0]) {
                 if (qual_buf[0]) snprintf(sub_buf, sizeof(sub_buf), "%s  |  %s  |  %s", s_tracks[idx].grandparent_title, qual_buf, dur_buf);
@@ -2515,7 +2595,7 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                 else snprintf(sub_buf, sizeof(sub_buf), "%s", dur_buf);
             }
             bool playing = (idx == s_current_track_idx);
-            draw_list_item(i, s_tracks[idx].title, sub_buf, idx == s_selected_idx, playing);
+            draw_list_item(i, s_tracks[idx].title, sub_buf, row == s_selected_idx, playing);
         }
     } else if (s_screen == SCREEN_LYRICS) {
         draw_header("Time-Synced Lyrics");
