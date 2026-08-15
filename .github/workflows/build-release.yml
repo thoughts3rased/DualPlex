@@ -59,7 +59,7 @@ jobs:
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
             /opt/devkitpro/tools/glibc-makerom
-          key: devkitpro-3ds-extras-v4
+          key: devkitpro-3ds-extras-v5
 
       - name: Install missing 3DS portlibs + makerom
         if: steps.cache-extras.outputs.cache-hit != 'true'
@@ -80,20 +80,41 @@ jobs:
           # warns and ignores it:
           #   warning: config file .../pacman.conf, line 84: directive
           #   'XferCommand' in section 'dkp-linux' not recognized.
-          # No -c (resume): this image already ships with these exact .db
-          # files baked in from whenever it was itself built, so a resumed
-          # download lands on top of that stale file. pkg.devkitpro.org
-          # doesn't reliably honor the resulting Range request either (a
-          # plain 200 came back, not 206), so wget appended the fresh
-          # content onto the old file instead of restarting clean -
-          # corrupting it in a way that fails signature verification, not a
-          # download error:
-          #   error: dkp-libs: signature from "... WinterMute ..." is
-          #   invalid
           PACMAN_CONF="$DEVKITPRO/pacman/etc/pacman.conf"
           if ! grep -q '^XferCommand' "$PACMAN_CONF"; then
             $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -O %o %u' "$PACMAN_CONF"
           fi
+
+          # Once the 403 above is out of the way, the sync still fails -
+          # consistently, on byte-identical downloads each time, so it's not
+          # a corrupted-transfer problem:
+          #   error: dkp-libs: signature from "... WinterMute ..." is
+          #   invalid
+          # This image's pacman keyring was bootstrapped once, whenever the
+          # image was last built, and baked into that layer. If devkitPro
+          # has rotated/reissued their signing key since, every subsequent
+          # sync fails verification against the stale local keyring
+          # regardless of how correctly the database itself downloads.
+          # Reinstalling devkitpro-pacman re-runs its postinst, which
+          # re-imports whatever key is bundled in *today's* .deb - the same
+          # bootstrap that worked when this was a bare (non-container)
+          # install earlier. apt doesn't know the image's on-disk keyring
+          # predates its own install record, so --reinstall is needed to
+          # force it rather than a plain install (which just no-ops, same
+          # as the devkitPro pacman-bootstrap issue hit earlier on the
+          # since-abandoned self-hosted runner). The postinst script itself
+          # may also skip re-importing if it sees an existing gnupg dir and
+          # assumes it's already set up, so clear that out first to force a
+          # genuinely fresh import regardless.
+          $SUDO rm -rf "$DEVKITPRO/pacman/etc/pacman.d/gnupg"
+
+          mkdir -p /tmp/devkitpro-keyring
+          wget -q -U "dkp-apt" -O /tmp/devkitpro-keyring/devkitpro-pub.gpg https://apt.devkitpro.org/devkitpro-pub.gpg
+          $SUDO mkdir -p /usr/share/keyring
+          $SUDO cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
+          echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
+          $SUDO apt-get update
+          $SUDO apt-get install --reinstall -y devkitpro-pacman
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
 
