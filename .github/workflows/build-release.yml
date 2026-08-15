@@ -22,115 +22,56 @@ permissions:
   contents: write # required to create/update the release and its tag
 
 env:
-  # Assumes devkitPro is installed at its standard default location on the
-  # runner. Adjust these two if your self-hosted runner has it elsewhere -
-  # everything below only depends on these, not on any shell profile/rc file
-  # having set them up already (self-hosted runners commonly run as a
-  # service account whose non-interactive environment won't have picked up
-  # anything exported in your own interactive login shell).
   DEVKITPRO: /opt/devkitpro
   DEVKITARM: /opt/devkitpro/devkitARM
 
 jobs:
   build:
-    runs-on: [self-hosted, linux]
+    # GitHub-hosted, not self-hosted: a fresh VM per run means no leftover
+    # state from a previous job to worry about, and Ubuntu 24.04's glibc
+    # (2.39) is new enough for devkitARM's Arch-built toolchain and
+    # makerom's prebuilt Ubuntu binary out of the box - no glibc-patching
+    # workaround needed, unlike on the old self-hosted runner this used to
+    # target (see git history if that's ever relevant again).
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Cached across runs, keyed on a fixed version string below - bump it
-      # (v7 -> v8) to force a clean reinstall if the toolchain ever needs
-      # refreshing. On a cache hit every step below down to (not including)
-      # the Build step is skipped entirely: everything the build needs
-      # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
-      # under /opt/devkitpro, so a restored cache is immediately usable
-      # without dkp-pacman, apt, or the internet being reachable at all. This
-      # runner is persistent though, so a *miss* here (e.g. right after a
-      # version bump) also wipes /opt/devkitpro before reinstalling - see the
-      # "Install devkitPro toolchain" step - so every cache generation starts
-      # from a genuinely clean install rather than re-patching whatever an
-      # earlier generation already left on disk.
+      # Every run gets a fresh VM, so this is what actually saves the ~2
+      # minutes of apt/dkp-pacman work below across runs - bump the key
+      # (v1 -> v2) if the toolchain ever needs a forced refresh.
       - name: Cache devkitPro toolchain
         id: cache-devkitpro
         uses: actions/cache@v4
         with:
           path: /opt/devkitpro
-          key: devkitpro-3ds-v7
+          key: devkitpro-3ds-v1
 
-      # The runner's container has no devkitPro (or anything it needs) baked
-      # in, so it's installed here on a cache miss. This is a from-scratch
-      # reimplementation of devkitPro's own install-devkitpro-pacman script
-      # rather than curl | bash-ing it directly - that script (a) has no -y
-      # on any of its apt-get calls, so it hangs/fails waiting for input
-      # with no TTY attached (exactly what CI is), and (b) apt.devkitpro.org
-      # 403s any request without a "dkp-apt"-ish User-Agent, which curl/wget
-      # don't send by default. Sets DEBIAN_FRONTEND=noninteractive too, for
-      # any transitive package that pops a debconf prompt.
-      # Needs root: runs bare if already root (common for a minimal CI
-      # container image), otherwise via sudo (assumed passwordless, as is
-      # standard for CI runners) - adjust if your runner needs something
-      # else here.
+      # This is a from-scratch reimplementation of devkitPro's own
+      # install-devkitpro-pacman script rather than curl | bash-ing it
+      # directly - that script (a) has no -y on any of its apt-get calls, so
+      # it hangs/fails waiting for input with no TTY attached (exactly what
+      # CI is), and (b) apt.devkitpro.org 403s any request without a
+      # "dkp-apt"-ish User-Agent, which curl/wget don't send by default.
       - name: Install devkitPro toolchain (3DS dev packages)
         if: steps.cache-devkitpro.outputs.cache-hit != 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          SUDO=""
-          if [ "$(id -u)" != "0" ]; then SUDO="sudo -E"; fi
-
-          # This runner is persistent (not a fresh disk per job), so a cache
-          # *miss* on its own doesn't mean a clean slate - whatever's left
-          # under /opt/devkitpro from a previous cache generation is still
-          # sitting there, and dkp-pacman won't reinstall packages that are
-          # already present. Without this wipe, the glibc-patch step below
-          # would keep patchelf-ing binaries that were already patched by a
-          # previous run (possibly for a different glibc), compounding
-          # rpath entries across generations instead of starting fresh -
-          # exactly what produced an inconsistent loader/libc pairing here:
-          #   Inconsistency detected by ld.so: dl-call-libc-early-init.c...
-          # Only the package *content* dirs are wiped, not all of
-          # /opt/devkitpro: dkp-pacman itself is bootstrapped into
-          # /opt/devkitpro/pacman by the devkitpro-pacman apt package's
-          # postinst, which apt only runs once (it no-ops on an
-          # already-installed package, cache miss or not) - deleting that
-          # directory too breaks dkp-pacman itself with no way to recover it
-          # short of purging and reinstalling the apt package.
-          $SUDO rm -rf "$DEVKITARM" "$DEVKITPRO/libctru" "$DEVKITPRO/portlibs" "$DEVKITPRO/tools"
-
-          $SUDO apt-get update
-          $SUDO apt-get install -y apt-transport-https ca-certificates wget gnupg unzip
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates wget gnupg unzip
 
           mkdir -p /tmp/devkitpro-keyring
           wget -q -U "dkp-apt" -O /tmp/devkitpro-keyring/devkitpro-pub.gpg https://apt.devkitpro.org/devkitpro-pub.gpg
-          $SUDO mkdir -p /usr/share/keyring
-          $SUDO cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
-          echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
+          sudo mkdir -p /usr/share/keyring
+          sudo cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
+          echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | sudo tee /etc/apt/sources.list.d/devkitpro.list
 
-          $SUDO apt-get update
-          $SUDO apt-get install -y devkitpro-pacman
+          sudo apt-get update
+          sudo apt-get install -y devkitpro-pacman
 
-          # A previous run on this runner deleted /opt/devkitpro/pacman
-          # directly (see the git history of the wipe above) without going
-          # through apt, so dpkg still considers devkitpro-pacman installed
-          # and the plain install above no-ops instead of re-bootstrapping
-          # it. A plain --reinstall isn't enough either: devkitpro-pacman's
-          # postinst assumes /opt/devkitpro/pacman/etc/pacman.conf already
-          # exists (from whatever originally bootstrapped it) and doesn't
-          # recreate it from scratch on a reinstall, so it just fails
-          # instead:
-          #   ==> ERROR: pacman configuration file
-          #   '/opt/devkitpro/pacman/etc/pacman.conf' not found.
-          # Purging first clears every trace dpkg has of this package -
-          # including whatever "already configured" state made it skip
-          # re-bootstrapping - so the following install runs postinst as a
-          # genuine first-time install. This is also what recovers
-          # dkp-pacman if this ever happens again for any other reason.
-          if [ ! -x "$DEVKITPRO/pacman/bin/pacman" ]; then
-            $SUDO apt-get purge -y devkitpro-pacman
-            $SUDO apt-get install -y devkitpro-pacman
-          fi
-
-          $SUDO dkp-pacman -Sy --noconfirm 3ds-dev 3ds-curl 3ds-mpg123 3ds-mbedtls
+          sudo dkp-pacman -Sy --noconfirm 3ds-dev 3ds-curl 3ds-mpg123 3ds-mbedtls
 
           # makerom (used for the .cia build) isn't a devkitPro package at
           # all - it's a separate tool from Project_CTR that devkitPro's own
@@ -139,81 +80,9 @@ jobs:
           # cache above too, alongside everything dkp-pacman just installed.
           MAKEROM_VERSION="v0.19.0"
           wget -q "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-${MAKEROM_VERSION}/makerom-${MAKEROM_VERSION}-ubuntu_x86_64.zip" -O /tmp/makerom.zip
-          $SUDO mkdir -p /opt/devkitpro/tools/bin
-          $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
-          $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
-
-      # devkitARM's arm-none-eabi-gcc, devkitPro's other bundled tools
-      # (picasso, tex3ds, bin2s, etc.), and makerom (Project_CTR's separate
-      # .cia tool, downloaded above) are all built on newer bases than this
-      # runner container ships, which fails as e.g.:
-      #   arm-none-eabi-gcc: .../libc.so.6: version `GLIBC_2.35' not found
-      #   makerom: .../libc.so.6: version `GLIBC_2.38' not found
-      # makerom's prebuilt Ubuntu binary needs the newest glibc of the three
-      # (2.38 as of this writing) - Debian 12 (bookworm, glibc 2.36) covers
-      # devkitPro's own tools but not makerom, so this uses Debian 13
-      # (trixie) instead. Rather than upgrading the runner's own system
-      # libc6 - shared with the runner agent and everything else in this
-      # container - download trixie's libc6 into a private prefix under
-      # /opt/devkitpro (so it's covered by the cache above too) and use
-      # patchelf to repoint only these binaries at it. Nothing else on the
-      # runner is touched, and it's fully reversible by deleting
-      # GLIBC_PREFIX. If a future devkitPro/makerom update needs newer
-      # symbols than trixie's glibc provides, point DEBIAN_SUITE below at a
-      # newer Debian/Ubuntu suite's Packages index instead.
-      - name: Provide a newer glibc for devkitARM/devkitPro's prebuilt tools
-        if: steps.cache-devkitpro.outputs.cache-hit != 'true'
-        run: |
-          SUDO=""
-          if [ "$(id -u)" != "0" ]; then SUDO="sudo -E"; fi
-
-          $SUDO apt-get install -y --no-install-recommends patchelf file
-
-          DEBIAN_SUITE="http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz"
-          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-newer"
-          mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
-
-          wget -q "$DEBIAN_SUITE" -O /tmp/glibc-deb/Packages.gz
-          gunzip -f /tmp/glibc-deb/Packages.gz
-          LIBC6_PATH=$(awk '/^Package: libc6$/{f=1} f&&/^Filename:/{print $2; exit} /^$/{f=0}' /tmp/glibc-deb/Packages)
-          wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
-          dpkg -x /tmp/glibc-deb/libc6.deb "$GLIBC_PREFIX"
-
-          # Debian's libc6 .deb ships the dynamic linker as the real file
-          # under lib/x86_64-linux-gnu/, with lib64/ld-linux-x86-64.so.2 as
-          # an *absolute* symlink to it. dpkg -x preserves that absolute
-          # target as-is, so following it inside our private prefix lands
-          # back on the runner's own old system loader instead of this
-          # extracted one - resolving to the real (non-symlink) file avoids
-          # that regardless of exactly how a given release lays it out.
-          NEWLD=$(find "$GLIBC_PREFIX" -name 'ld-linux-x86-64.so.2' -type f | head -1)
-          NEWLIBDIR="$GLIBC_PREFIX/lib/x86_64-linux-gnu"
-
-          if [ -z "$NEWLD" ]; then
-            echo "::error::Couldn't find the real ld-linux-x86-64.so.2 inside $GLIBC_PREFIX - libc6 layout may have changed upstream" >&2
-            exit 1
-          fi
-
-          # Repoint every dynamically-linked ELF under devkitARM and
-          # devkitPro's tools at the trixie loader + libc - leaves every
-          # other binary on the runner (including the runner agent itself)
-          # untouched. Appends NEWLIBDIR to each binary's existing rpath
-          # (rather than replacing it) since several of these - cc1/cc1plus
-          # in particular - already carry a rpath pointing at devkitARM's
-          # own bundled libgmp/libmpfr/libmpc/libisl, which would otherwise
-          # stop resolving. --set-interpreter is applied separately so it
-          # failing on a plain shared library (no PT_INTERP segment, e.g. one
-          # of those bundled libs) doesn't also skip that library's rpath fix.
-          find "$DEVKITARM" "$DEVKITPRO/tools/bin" -type f | while read -r f; do
-            file "$f" | grep -q 'ELF.*dynamically linked' || continue
-            OLDRPATH=$(patchelf --print-rpath "$f" 2>/dev/null || true)
-            if [ -n "$OLDRPATH" ]; then
-              patchelf --set-rpath "$OLDRPATH:$NEWLIBDIR" "$f" 2>/dev/null || true
-            else
-              patchelf --set-rpath "$NEWLIBDIR" "$f" 2>/dev/null || true
-            fi
-            patchelf --set-interpreter "$NEWLD" "$f" 2>/dev/null || true
-          done
+          sudo mkdir -p /opt/devkitpro/tools/bin
+          sudo unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
+          sudo chmod +x /opt/devkitpro/tools/bin/makerom
 
       - name: Build (.elf, .3dsx, .cia)
         run: |
@@ -227,11 +96,10 @@ jobs:
       # constructing it doesn't require the upload to have happened yet,
       # only for the QR to actually resolve once it has). Uses a public
       # QR-generation API (goqr.me) via plain curl rather than installing a
-      # QR tool locally (e.g. qrencode), since that'd need apt/sudo access
-      # this workflow can't assume your self-hosted runner grants it -
-      # swap this step for `qrencode` directly if you'd rather not depend
-      # on a third party (the URL itself is already public once released,
-      # so there's nothing sensitive being sent).
+      # QR tool locally (e.g. qrencode) - swap this step for `qrencode`
+      # directly if you'd rather not depend on a third party (the URL
+      # itself is already public once released, so there's nothing
+      # sensitive being sent).
       - name: Generate QR code (CIA remote-install link)
         run: |
           DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/nightly/DualPlex.cia"
