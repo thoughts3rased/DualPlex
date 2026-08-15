@@ -59,7 +59,7 @@ jobs:
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
             /opt/devkitpro/tools/glibc-makerom
-          key: devkitpro-3ds-extras-v2
+          key: devkitpro-3ds-extras-v3
 
       - name: Install missing 3DS portlibs + makerom
         if: steps.cache-extras.outputs.cache-hit != 'true'
@@ -72,13 +72,17 @@ jobs:
 
           # pkg.devkitpro.org 403s plain wget/curl-style User-Agents (same
           # WAF rule apt.devkitpro.org has), which is what broke a bare
-          # dkp-pacman install on the runner directly. This image's own
-          # pacman.conf presumably already accounts for that since it built
-          # successfully, but set it explicitly anyway so this doesn't
-          # depend on that staying true upstream.
+          # dkp-pacman install on the runner directly - this image's own
+          # pacman.conf turns out not to already handle it either. Needs to
+          # go specifically under the [options] section - appending to
+          # end-of-file landed it inside pacman.conf's last repo section
+          # instead (whichever one happens to be last), where pacman just
+          # warns and ignores it:
+          #   warning: config file .../pacman.conf, line 84: directive
+          #   'XferCommand' in section 'dkp-linux' not recognized.
           PACMAN_CONF="$DEVKITPRO/pacman/etc/pacman.conf"
           if ! grep -q '^XferCommand' "$PACMAN_CONF"; then
-            echo 'XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -c -O %o %u' | $SUDO tee -a "$PACMAN_CONF" > /dev/null
+            $SUDO sed -i '/^\[options\]/a XferCommand = /usr/bin/wget --user-agent="dkp-pacman" -c -O %o %u' "$PACMAN_CONF"
           fi
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
