@@ -58,14 +58,12 @@ jobs:
           path: |
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
-            /opt/devkitpro/tools/makerom-real
-            /opt/devkitpro/tools/glibc-makerom
-          # v6: makerom moved from a patchelf'd binary directly at
-          # tools/bin/makerom to a wrapper script there plus the real
-          # binary under tools/makerom-real - bump the key so a cache
-          # entry saved under the old layout (if one exists) can't get
-          # restored and silently reintroduce it.
-          key: devkitpro-3ds-extras-v6
+          # v7: dropped the private-glibc/wrapper-script machinery
+          # entirely (downgraded to makerom-v0.18.4, old enough to not
+          # need it) - back to a plain binary directly at tools/bin/makerom
+          # again, so bump the key once more rather than risk restoring a
+          # stale v0.19.0-based layout from an earlier attempt.
+          key: devkitpro-3ds-extras-v7
 
       - name: Install missing 3DS portlibs + makerom
         if: steps.cache-extras.outputs.cache-hit != 'true'
@@ -151,60 +149,25 @@ jobs:
           # makerom (used for the .cia build) isn't a devkitPro package at
           # all - it's a separate tool from Project_CTR that devkitPro's own
           # docs point you at downloading manually and adding to PATH.
-          # Unzipped to its own subdirectory (not directly into
-          # tools/bin/makerom) since the actual PATH-visible "makerom" ends
-          # up being a wrapper script below, not this binary itself.
-          MAKEROM_VERSION="v0.19.0"
+          # Two different approaches to running makerom-v0.19.0's prebuilt
+          # Ubuntu binary against this container's older glibc were tried
+          # and abandoned here: patchelf --set-interpreter/--set-rpath on
+          # the binary itself ran clean but didn't fix the runtime error,
+          # and invoking a separately-downloaded newer ld.so directly with
+          # --library-path *also* didn't - glibc's dynamic loader appears
+          # to bind to its own sibling libc.so.6 too tightly for either to
+          # reliably override once components merged into libc.so.6 in
+          # recent glibc versions. Simpler fix: v0.19.0 (Jan 2026) needs
+          # GLIBC_2.38; v0.18.4 (Sep 2023, likely built on an
+          # ubuntu-22.04/glibc-2.35 CI runner) is old enough to already be
+          # covered by this Debian-bookworm-based image's own glibc, with
+          # no version-specific flags in play (see the plain -f/-o/-elf/
+          # -rsf/-icon invocation in the Makefile) - so there's nothing to
+          # patch around at all.
+          MAKEROM_VERSION="v0.18.4"
           wget -q "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-${MAKEROM_VERSION}/makerom-${MAKEROM_VERSION}-ubuntu_x86_64.zip" -O /tmp/makerom.zip
-          $SUDO mkdir -p /opt/devkitpro/tools/bin /opt/devkitpro/tools/makerom-real
-          $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/makerom-real/
-          $SUDO chmod +x /opt/devkitpro/tools/makerom-real/makerom
-
-          # makerom's prebuilt Ubuntu binary needs GLIBC_2.38, newer than
-          # what devkitpro/devkitarm's own base image ships (unlike
-          # devkitARM/devkitPro's own tools, which are baked into this image
-          # already and match its glibc fine - makerom is the one binary
-          # here that comes from somewhere else entirely):
-          #   makerom: /lib/x86_64-linux-gnu/libc.so.6: version
-          #   `GLIBC_2.38' not found (required by makerom)
-          # Download Debian 13 (trixie)'s libc6 into a private prefix rather
-          # than touching the container's own system libc6. Every run gets
-          # a fresh container instance, so there's no persistent state to
-          # worry about compounding across runs here.
-          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-makerom"
-          mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
-          wget -q "http://deb.debian.org/debian/dists/trixie/main/binary-amd64/Packages.gz" -O /tmp/glibc-deb/Packages.gz
-          gunzip -f /tmp/glibc-deb/Packages.gz
-          LIBC6_PATH=$(awk '/^Package: libc6$/{f=1} f&&/^Filename:/{print $2; exit} /^$/{f=0}' /tmp/glibc-deb/Packages)
-          wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
-          dpkg -x /tmp/glibc-deb/libc6.deb "$GLIBC_PREFIX"
-
-          # Debian's libc6 .deb ships the dynamic linker as the real file
-          # under lib/x86_64-linux-gnu/, with lib64/ld-linux-x86-64.so.2 as
-          # an *absolute* symlink to it - following that inside our private
-          # prefix would land back on the container's own old system loader,
-          # so resolve to the real (non-symlink) file instead.
-          NEWLD=$(find "$GLIBC_PREFIX" -name 'ld-linux-x86-64.so.2' -type f | head -1)
-          if [ -z "$NEWLD" ]; then
-            echo "::error::Couldn't find the real ld-linux-x86-64.so.2 inside $GLIBC_PREFIX - libc6 layout may have changed upstream" >&2
-            exit 1
-          fi
-
-          # patchelf --set-interpreter/--set-rpath on the makerom binary
-          # itself was tried here first and looked right (ran without
-          # error), but still failed at runtime with the exact same GLIBC
-          # error patching was meant to fix. That's a known rough edge with
-          # this technique: once invoked via the kernel's normal PT_INTERP
-          # dispatch, the loader resolves its *own* glibc dependencies
-          # through its own compiled-in search behavior, not necessarily
-          # through the RPATH baked into the binary it's loading - so
-          # patching the target binary's RPATH alone doesn't reliably
-          # override that. Invoking the foreign loader directly as its own
-          # process, with an explicit --library-path, sidesteps that
-          # ambiguity entirely and is the standard reliable way to run one
-          # binary against a different glibc.
-          echo '#!/bin/sh' | $SUDO tee /opt/devkitpro/tools/bin/makerom >/dev/null
-          echo "exec \"$NEWLD\" --library-path \"$GLIBC_PREFIX/lib/x86_64-linux-gnu\" /opt/devkitpro/tools/makerom-real/makerom \"\$@\"" | $SUDO tee -a /opt/devkitpro/tools/bin/makerom >/dev/null
+          $SUDO mkdir -p /opt/devkitpro/tools/bin
+          $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
           $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
 
       - name: Build (.elf, .3dsx, .cia)
