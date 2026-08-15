@@ -205,8 +205,10 @@ jobs:
           body: |
             Automated build from commit ${{ github.sha }}, replaces the previous nightly build.
 
-            - **DualPlex.cia**: install with [FBI](https://github.com/Steveice10/FBI) - either sideload the file directly, or open FBI's "Remote Install" QR scanner on your 3DS and scan `DualPlex-qr.png` below to fetch and install it directly, no PC transfer needed.
+            - **DualPlex.cia**: install with [FBI](https://github.com/Steveice10/FBI) - either sideload the file directly, or open FBI's "Remote Install" QR scanner on your 3DS and scan the code below to fetch and install it directly, no PC transfer needed.
             - **DualPlex.3dsx**: copy to `/3ds/` on your SD card to run via the Homebrew Launcher.
+
+            ![DualPlex.cia remote-install QR code](https://github.com/${{ github.repository }}/releases/download/nightly/DualPlex-qr.png)
           files: |
             DualPlex.cia
             DualPlex.3dsx
