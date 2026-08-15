@@ -73,16 +73,11 @@ jobs:
           # Belt-and-suspenders alongside the XferCommand fix below: that
           # fix only takes effect for wget invocations that go through
           # *this* pacman.conf's XferCommand line, at the moment this
-          # script sets it. devkitpro-pacman's postinst runs its own
-          # database sync automatically as part of `apt-get install
-          # --reinstall` further down, before this script gets control
-          # back - if that sync's wget call ends up resolving without our
-          # custom UA (stale pacman.conf, a differently-templated one from
-          # the freshly-unpacked package, or anything else not accounted
-          # for above), it hits the same WAF 403 with no chance for this
-          # script to intervene in time. A wget-wide default User-Agent
-          # covers that gap too, since it applies to any wget call that
-          # doesn't set its own.
+          # script sets it. A wget-wide default User-Agent covers any other
+          # unconfigured wget call that hits the same WAF too (there isn't
+          # currently one after this script stopped touching dpkg/apt for
+          # devkitpro-pacman - see below - but this is cheap insurance
+          # against a future one).
           echo 'user_agent = dkp-pacman' | $SUDO tee -a /etc/wgetrc >/dev/null
 
           # pkg.devkitpro.org 403s plain wget/curl-style User-Agents (same
@@ -106,67 +101,34 @@ jobs:
           #   error: dkp-libs: signature from "... WinterMute ..." is
           #   invalid
           # This image's pacman keyring was bootstrapped once, whenever the
-          # image was last built, and baked into that layer. Reinstalling
-          # devkitpro-pacman re-runs its postinst, which re-imports the
-          # keyring bundled in the .deb - the same bootstrap that worked
-          # when this was a bare (non-container) install earlier. apt
-          # doesn't know the image's on-disk keyring predates its own
-          # install record, so --reinstall is needed to force it rather
-          # than a plain install (which just no-ops, same as the devkitPro
-          # pacman-bootstrap issue hit earlier on the since-abandoned
-          # self-hosted runner). The postinst script itself may also skip
-          # re-importing if it sees an existing gnupg dir and assumes it's
-          # already set up, so clear that out first to force a genuinely
-          # fresh import regardless. (Spoiler: even a genuinely fresh
-          # import of the .deb's own bundled keyring isn't sufficient by
-          # itself - see below.)
-          $SUDO rm -rf "$DEVKITPRO/pacman/etc/pacman.d/gnupg"
+          # image was last built, and baked into that layer, with
+          # insufficient trust for one of devkitPro's real signing keys.
+          # `apt-get install --reinstall devkitpro-pacman` looked like the
+          # fix (force postinst to redo the bootstrap) and was tried at
+          # length here, but it's a dead end two ways over: apt reported
+          # the *same* package version installed before and after, so the
+          # postinst reran against byte-identical bundled key data each
+          # time - reinstalling never changes what gets trusted, only a
+          # rebuilt .deb would. And reinstalling also runs postinst's own
+          # automatic `-Sy` sync as a side effect of `dpkg --configure`,
+          # which - still under-trusted - fails and takes the whole apt
+          # transaction down with it (dpkg then leaves the package
+          # half-configured, and a bare retry of the reinstall hits a
+          # separate apt bug on top: "No file name for
+          # devkitpro-pacman:amd64").
+          #
+          # None of that dance is actually necessary. The real fix below
+          # sources keys fresh from GitHub directly, independent of
+          # whatever's bundled in the .deb - so it doesn't need the package
+          # reinstalled, dpkg/apt touched, or the existing gnupg dir wiped
+          # at all. Just make sure a master key exists (idempotent, and the
+          # image already has one from its own bootstrap at build time),
+          # then layer devkitPro's canonical keyring on top and fully
+          # trust every key in it.
+          GNUPGHOME="$DEVKITPRO/pacman/etc/pacman.d/gnupg"
+          $SUDO dkp-pacman-key --init
 
           mkdir -p /tmp/devkitpro-keyring
-          wget -q -U "dkp-apt" -O /tmp/devkitpro-keyring/devkitpro-pub.gpg https://apt.devkitpro.org/devkitpro-pub.gpg
-          $SUDO mkdir -p /usr/share/keyring
-          $SUDO cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
-          echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
-          $SUDO apt-get update
-
-          # devkitpro-pacman's postinst runs its own db sync against
-          # pkg.devkitpro.org as part of configuring the package, and
-          # that's hit the same WAF 403 intermittently even with the UA
-          # workarounds above in place - worked clean on one run, 403'd on
-          # a later one with no script change in between, pointing at
-          # rate-limiting/flakiness on shared GitHub-runner IPs rather than
-          # a deterministic gap in the fix. dpkg leaves the package
-          # half-configured on failure; a plain retry re-runs postinst
-          # (and its sync) rather than needing a purge/reinstall cycle.
-          RETRIES=3
-          n=0
-          until $SUDO apt-get install --reinstall -y devkitpro-pacman; do
-            n=$((n + 1))
-            if [ "$n" -ge "$RETRIES" ]; then
-              echo "::error::apt-get install --reinstall devkitpro-pacman failed after $RETRIES attempts" >&2
-              exit 1
-            fi
-            echo "devkitpro-pacman reinstall failed (attempt $n/$RETRIES) - retrying in 10s..." >&2
-            sleep 10
-          done
-
-          # --reinstall above still isn't enough on its own:
-          #   error: dkp-libs: signature from "... WinterMute ..." is
-          #   invalid
-          # dkp-pacman-key --populate (what devkitpro-pacman's postinst
-          # runs) only ever imports/trusts whatever keyring file happens to
-          # be bundled inside that *specific .deb version's* files on disk.
-          # apt reported this reinstall as the same version already
-          # installed (6.0.1-2 before and after) - so the postinst script
-          # reran, but against byte-identical key data each time. Whichever
-          # of devkitPro's real signing keys fell short of full trust in
-          # that bundle stays short no matter how many times it's
-          # reinstalled; only a rebuilt .deb would actually change it.
-          # Fetch devkitPro's own canonical keyring straight from GitHub
-          # instead - updated independently of the .deb's release cadence -
-          # and fully trust every key in it, rather than whatever the
-          # frozen .deb's own --populate step decided.
-          GNUPGHOME="$DEVKITPRO/pacman/etc/pacman.d/gnupg"
           wget -q -O /tmp/devkitpro-keyring/devkitpro.gpg https://raw.githubusercontent.com/devkitPro/devkitpro-keyring/master/devkitpro.gpg
           $SUDO gpg --homedir "$GNUPGHOME" --import /tmp/devkitpro-keyring/devkitpro.gpg
           for KEYID in $($SUDO gpg --homedir "$GNUPGHOME" --list-keys --with-colons | awk -F: '/^pub/{print $5}'); do
