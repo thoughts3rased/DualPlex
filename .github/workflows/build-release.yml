@@ -34,41 +34,38 @@ env:
 jobs:
   build:
     runs-on: [self-hosted, linux]
-    # Runs inside devkitPro's own image instead of directly on the runner's
-    # host filesystem. devkitARM's prebuilt arm-none-eabi-gcc is built on
-    # Arch Linux and dynamically linked against a very recent glibc; running
-    # it against an older host libc (as on typical Ubuntu/Debian-based
-    # runner images) fails with "GLIBC_2.3x not found (required by
-    # arm-none-eabi-gcc)". Building inside the same image devkitPro links
-    # its toolchain against sidesteps the mismatch entirely - the compiler
-    # and the libc it needs always come from the same filesystem. Requires
-    # the self-hosted runner to have Docker available so it can launch job
-    # containers, same as any `uses:`-style Docker action already does.
-    container:
-      image: devkitpro/devkitarm:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # devkitARM itself, plus libctru/citro2d/citro3d (the 3ds-dev group),
-      # already ship in the devkitpro/devkitarm image. Only the extra
-      # portlibs this project links against, and makerom (not a devkitPro
-      # package at all), are missing - and cached here across runs. On a
-      # cache hit this and the next step are both skipped entirely.
-      - name: Cache 3DS portlibs + makerom
+      # Cached across runs, keyed on a fixed version string below - bump it
+      # (v2 -> v3) to force a clean reinstall if the toolchain ever needs
+      # refreshing. On a cache hit every step below down to (not including)
+      # the Build step is skipped entirely: everything the build needs
+      # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
+      # under /opt/devkitpro, so a restored cache is immediately usable
+      # without dkp-pacman, apt, or the internet being reachable at all.
+      - name: Cache devkitPro toolchain
         id: cache-devkitpro
         uses: actions/cache@v4
         with:
-          path: |
-            /opt/devkitpro/portlibs
-            /opt/devkitpro/tools/bin/makerom
-          key: devkitpro-3ds-extras-v1
+          path: /opt/devkitpro
+          key: devkitpro-3ds-v2
 
-      # Needs root: runs bare if already root (the devkitpro/devkitarm image
-      # runs as root by default), otherwise via sudo (assumed passwordless,
-      # as is standard for CI runners) - adjust if your runner needs
-      # something else here.
-      - name: Install missing 3DS portlibs + makerom
+      # The runner's container has no devkitPro (or anything it needs) baked
+      # in, so it's installed here on a cache miss. This is a from-scratch
+      # reimplementation of devkitPro's own install-devkitpro-pacman script
+      # rather than curl | bash-ing it directly - that script (a) has no -y
+      # on any of its apt-get calls, so it hangs/fails waiting for input
+      # with no TTY attached (exactly what CI is), and (b) apt.devkitpro.org
+      # 403s any request without a "dkp-apt"-ish User-Agent, which curl/wget
+      # don't send by default. Sets DEBIAN_FRONTEND=noninteractive too, for
+      # any transitive package that pops a debconf prompt.
+      # Needs root: runs bare if already root (common for a minimal CI
+      # container image), otherwise via sudo (assumed passwordless, as is
+      # standard for CI runners) - adjust if your runner needs something
+      # else here.
+      - name: Install devkitPro toolchain (3DS dev packages)
         if: steps.cache-devkitpro.outputs.cache-hit != 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -77,21 +74,85 @@ jobs:
           if [ "$(id -u)" != "0" ]; then SUDO="sudo -E"; fi
 
           $SUDO apt-get update
-          $SUDO apt-get install -y --no-install-recommends wget unzip
+          $SUDO apt-get install -y apt-transport-https ca-certificates wget gnupg unzip
 
-          $SUDO dkp-pacman -Sy --noconfirm 3ds-curl 3ds-mpg123 3ds-mbedtls
+          mkdir -p /tmp/devkitpro-keyring
+          wget -q -U "dkp-apt" -O /tmp/devkitpro-keyring/devkitpro-pub.gpg https://apt.devkitpro.org/devkitpro-pub.gpg
+          $SUDO mkdir -p /usr/share/keyring
+          $SUDO cp /tmp/devkitpro-keyring/devkitpro-pub.gpg /usr/share/keyring/devkitpro-pub.gpg
+          echo "deb [signed-by=/usr/share/keyring/devkitpro-pub.gpg] https://apt.devkitpro.org stable main" | $SUDO tee /etc/apt/sources.list.d/devkitpro.list
+
+          $SUDO apt-get update
+          $SUDO apt-get install -y devkitpro-pacman
+
+          $SUDO dkp-pacman -Sy --noconfirm 3ds-dev 3ds-curl 3ds-mpg123 3ds-mbedtls
 
           # makerom (used for the .cia build) isn't a devkitPro package at
           # all - it's a separate tool from Project_CTR that devkitPro's own
           # docs point you at downloading manually and adding to PATH.
           # Placed under /opt/devkitpro/tools/bin so it's covered by the
-          # cache above too, alongside the portlibs dkp-pacman just
-          # installed.
+          # cache above too, alongside everything dkp-pacman just installed.
           MAKEROM_VERSION="v0.19.0"
           wget -q "https://github.com/3DSGuy/Project_CTR/releases/download/makerom-${MAKEROM_VERSION}/makerom-${MAKEROM_VERSION}-ubuntu_x86_64.zip" -O /tmp/makerom.zip
           $SUDO mkdir -p /opt/devkitpro/tools/bin
           $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
           $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
+
+      # devkitARM's arm-none-eabi-gcc (and devkitPro's other bundled tools -
+      # picasso, tex3ds, bin2s, etc.) are built on Arch Linux and need glibc
+      # symbols (up to GLIBC_2.36 as of this writing) newer than what this
+      # runner container ships, which fails as:
+      #   arm-none-eabi-gcc: .../libc.so.6: version `GLIBC_2.35' not found
+      # Rather than upgrading the runner's own system libc6 - shared with
+      # the runner agent and everything else in this container - download
+      # Debian 12 (bookworm)'s libc6 into a private prefix under
+      # /opt/devkitpro (so it's covered by the cache above too) and use
+      # patchelf to repoint only devkitARM/devkitPro's own binaries at it.
+      # Nothing else on the runner is touched, and it's fully reversible by
+      # deleting GLIBC_PREFIX. If a future devkitPro update needs newer
+      # symbols than bookworm's glibc provides, point BOOKWORM below at a
+      # newer Debian/Ubuntu suite's Packages index instead.
+      - name: Provide a newer glibc for devkitARM/devkitPro's prebuilt tools
+        if: steps.cache-devkitpro.outputs.cache-hit != 'true'
+        run: |
+          SUDO=""
+          if [ "$(id -u)" != "0" ]; then SUDO="sudo -E"; fi
+
+          $SUDO apt-get install -y --no-install-recommends patchelf file
+
+          BOOKWORM="http://deb.debian.org/debian/dists/bookworm/main/binary-amd64/Packages.gz"
+          GLIBC_PREFIX="$DEVKITPRO/tools/glibc-bookworm"
+          rm -rf "$GLIBC_PREFIX" && mkdir -p "$GLIBC_PREFIX" /tmp/glibc-deb
+
+          wget -q "$BOOKWORM" -O /tmp/glibc-deb/Packages.gz
+          gunzip -f /tmp/glibc-deb/Packages.gz
+          LIBC6_PATH=$(awk '/^Package: libc6$/{f=1} f&&/^Filename:/{print $2; exit} /^$/{f=0}' /tmp/glibc-deb/Packages)
+          wget -q "http://deb.debian.org/debian/$LIBC6_PATH" -O /tmp/glibc-deb/libc6.deb
+          dpkg -x /tmp/glibc-deb/libc6.deb "$GLIBC_PREFIX"
+
+          NEWLD="$GLIBC_PREFIX/lib64/ld-linux-x86-64.so.2"
+          NEWLIBDIR="$GLIBC_PREFIX/lib/x86_64-linux-gnu"
+
+          # Repoint every dynamically-linked ELF under devkitARM and
+          # devkitPro's tools at the bookworm loader + libc - leaves every
+          # other binary on the runner (including the runner agent itself)
+          # untouched. Appends NEWLIBDIR to each binary's existing rpath
+          # (rather than replacing it) since several of these - cc1/cc1plus
+          # in particular - already carry a rpath pointing at devkitARM's
+          # own bundled libgmp/libmpfr/libmpc/libisl, which would otherwise
+          # stop resolving. --set-interpreter is applied separately so it
+          # failing on a plain shared library (no PT_INTERP segment, e.g. one
+          # of those bundled libs) doesn't also skip that library's rpath fix.
+          find "$DEVKITARM" "$DEVKITPRO/tools/bin" -type f | while read -r f; do
+            file "$f" | grep -q 'ELF.*dynamically linked' || continue
+            OLDRPATH=$(patchelf --print-rpath "$f" 2>/dev/null || true)
+            if [ -n "$OLDRPATH" ]; then
+              patchelf --set-rpath "$OLDRPATH:$NEWLIBDIR" "$f" 2>/dev/null || true
+            else
+              patchelf --set-rpath "$NEWLIBDIR" "$f" 2>/dev/null || true
+            fi
+            patchelf --set-interpreter "$NEWLD" "$f" 2>/dev/null || true
+          done
 
       - name: Build (.elf, .3dsx, .cia)
         run: |
