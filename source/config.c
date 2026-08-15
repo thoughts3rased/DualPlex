@@ -75,6 +75,8 @@ static void parse_config_file(FILE* f, AppConfig* config) {
                     strncpy(config->server_name, val, sizeof(config->server_name) - 1);
                 } else if (strcmp(key, "clock_24h") == 0) {
                     config->clock_24h = (strcmp(val, "1") == 0);
+                } else if (strcmp(key, "client_id") == 0) {
+                    strncpy(config->client_id, val, sizeof(config->client_id) - 1);
                 }
                 // "volume" is intentionally no longer read: the app has no volume
                 // setting of its own anymore (see config_save() below) - kept
@@ -123,7 +125,31 @@ bool config_save(const AppConfig* config) {
     fprintf(f, "auth_token=%s\n", config->auth_token);
     fprintf(f, "server_name=%s\n", config->server_name);
     fprintf(f, "clock_24h=%d\n", config->clock_24h ? 1 : 0);
-    
+    fprintf(f, "client_id=%s\n", config->client_id);
+
     fclose(f);
     return true;
+}
+
+void config_ensure_client_id(AppConfig* config) {
+    if (!config || config->client_id[0]) return;
+
+    // rand() is fine here - this only needs to be unique across a handful of
+    // consoles on the same home network/account, not cryptographically
+    // unpredictable - and main.c seeds it from the hardware tick counter
+    // before config_load()/this call, so two consoles started at the same
+    // moment still land on different sequences.
+    unsigned char bytes[16];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        bytes[i] = (unsigned char)(rand() & 0xFF);
+    }
+
+    char hex[sizeof(bytes) * 2 + 1];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        snprintf(hex + i * 2, 3, "%02x", bytes[i]);
+    }
+
+    snprintf(config->client_id, sizeof(config->client_id), "dualplex-3ds-%s", hex);
+    LOG_INFO("Generated new per-console client id: %s", config->client_id);
+    config_save(config);
 }

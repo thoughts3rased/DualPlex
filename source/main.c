@@ -56,7 +56,13 @@ int main(int argc, char* argv[]) {
     // Load config
     config_set_defaults(&app_config);
     config_load(&app_config);
-    
+    config_ensure_client_id(&app_config); // per-console id - see config_ensure_client_id()
+
+    // Must happen before any plex_api_* call, including the login-flow ones
+    // (plex_api_create_pin()/plex_api_login_direct()) triggered later from
+    // the UI - see plex_api_set_client_id().
+    plex_api_set_client_id(app_config.client_id);
+
     // Initialize subsystems
     logger_init();
     LOG_INFO("DualPlex starting up...");

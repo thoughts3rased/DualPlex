@@ -14,6 +14,33 @@
 static char s_server_url[PLEX_MAX_URL] = {0};
 static char s_auth_token[128] = {0};
 static bool s_initialized = false;
+
+// Per-console X-Plex-Client-Identifier. Defaults to the shared hardcoded
+// PLEX_CLIENT_ID until plex_api_set_client_id() is called (see there and
+// main.c) with a value generated once per console and persisted to
+// config.txt - without that, every DualPlex install sends the exact same
+// identifier, and PMS keys its Now Playing dashboard "players" by this
+// value alone. Two 3DS's signed into the same account and playing at once
+// then look like a single player to the server, with each console's
+// timeline ping stomping the other's, which is what makes the dashboard
+// appear to flicker/swap between them.
+static char s_client_id[64] = PLEX_CLIENT_ID;
+
+void plex_api_set_client_id(const char* client_id) {
+    if (!client_id || !client_id[0]) return;
+    strncpy(s_client_id, client_id, sizeof(s_client_id) - 1);
+    s_client_id[sizeof(s_client_id) - 1] = '\0';
+}
+
+// Formats "X-Plex-Client-Identifier: <id>" for curl_slist_append(). Returns
+// a pointer to a reused static buffer - curl_slist_append() copies the
+// string immediately, so it's fine that the buffer gets overwritten by the
+// next call.
+static const char* client_id_header(void) {
+    static char buf[96];
+    snprintf(buf, sizeof(buf), "X-Plex-Client-Identifier: %s", s_client_id);
+    return buf;
+}
 static PlexQualityTier s_quality_tier = QUALITY_MP3_320;  // Default: highest MP3
 
 // Whether the most recent plex_api_test_connection() call actually
@@ -170,7 +197,7 @@ static bool plex_http_get(const char* endpoint, char** response_out) {
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
     headers = curl_slist_append(headers, token_header);
     
-    headers = curl_slist_append(headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    headers = curl_slist_append(headers, client_id_header());
     headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
     headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
     headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
@@ -219,7 +246,7 @@ static bool plex_http_get_full_url(const char* url, const char* token, char** re
         snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
         headers = curl_slist_append(headers, token_hdr);
     }
-    headers = curl_slist_append(headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    headers = curl_slist_append(headers, client_id_header());
     headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
     headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
     headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
@@ -270,7 +297,7 @@ static bool plex_http_post_full_url(const char* url, const char* post_fields, co
         snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
         headers = curl_slist_append(headers, token_hdr);
     }
-    headers = curl_slist_append(headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    headers = curl_slist_append(headers, client_id_header());
     headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
     headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
     headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
@@ -1292,7 +1319,7 @@ static bool plex_http_get_binary(const char* url, const char* token, u8** respon
     char token_header[256];
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", token ? token : s_auth_token);
     headers = curl_slist_append(headers, token_header);
-    headers = curl_slist_append(headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    headers = curl_slist_append(headers, client_id_header());
     
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -1372,11 +1399,14 @@ static bool build_transcode_url(const PlexTrack* track, int offset_sec, char* ur
     // this id, and the app runs two transcodes concurrently by design (the
     // current track playing while the next track is prefetched) - sharing one
     // session id between them makes PMS treat the prefetch as re-targeting the
-    // playing track's session, which 400s both requests.
+    // playing track's session, which 400s both requests. Built from the
+    // per-console client id (not the shared PLEX_CLIENT_ID literal) so two
+    // different 3DS's transcoding the same track at the same time still get
+    // distinct session ids too.
     const char* rkey_tail = strrchr(track->rating_key, '/');
     rkey_tail = (rkey_tail && rkey_tail[1]) ? rkey_tail + 1 : track->rating_key;
     char session_id[PLEX_MAX_STR + 32];
-    snprintf(session_id, sizeof(session_id), PLEX_CLIENT_ID "-%s", rkey_tail[0] ? rkey_tail : "0");
+    snprintf(session_id, sizeof(session_id), "%s-%s", s_client_id, rkey_tail[0] ? rkey_tail : "0");
 
     // Auth and client identity go on the request as X-Plex-* headers (set by
     // audio_player.c when it fetches this URL), not as query params here -
@@ -1537,7 +1567,7 @@ static bool lyr_async_start_request(const char* endpoint) {
     char token_header[256];
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
     s_lyr_headers = curl_slist_append(s_lyr_headers, token_header);
-    s_lyr_headers = curl_slist_append(s_lyr_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_lyr_headers = curl_slist_append(s_lyr_headers, client_id_header());
     s_lyr_headers = curl_slist_append(s_lyr_headers, "X-Plex-Product: " PLEX_PRODUCT);
 
     curl_easy_setopt(s_lyr_easy, CURLOPT_URL, url);
@@ -1725,7 +1755,7 @@ void plex_api_report_timeline_async(const char* rating_key, const char* state, i
     char token_header[256];
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
     s_tl_headers = curl_slist_append(s_tl_headers, token_header);
-    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_tl_headers = curl_slist_append(s_tl_headers, client_id_header());
     s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Product: " PLEX_PRODUCT);
 
     curl_easy_setopt(s_tl_easy, CURLOPT_URL, url);
@@ -1785,7 +1815,7 @@ void plex_api_rate_track_async(const char* rating_key, float rating_10) {
     char token_header[256];
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
     s_tl_headers = curl_slist_append(s_tl_headers, token_header);
-    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_tl_headers = curl_slist_append(s_tl_headers, client_id_header());
     s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Product: " PLEX_PRODUCT);
 
     curl_easy_setopt(s_tl_easy, CURLOPT_URL, url);
@@ -1892,7 +1922,7 @@ static bool an_async_start_request(const char* endpoint) {
     char token_header[256];
     snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
     s_an_headers = curl_slist_append(s_an_headers, token_header);
-    s_an_headers = curl_slist_append(s_an_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_an_headers = curl_slist_append(s_an_headers, client_id_header());
     s_an_headers = curl_slist_append(s_an_headers, "X-Plex-Product: " PLEX_PRODUCT);
 
     curl_easy_setopt(s_an_easy, CURLOPT_URL, url);

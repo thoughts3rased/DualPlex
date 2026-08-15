@@ -99,6 +99,19 @@ const char* plex_api_get_quality_label(PlexQualityTier tier);
 // Suggest the best quality tier for a given measured download speed (bytes/sec).
 PlexQualityTier plex_api_suggest_quality(int download_speed_bps, bool is_n3ds);
 
+// Sets the per-console X-Plex-Client-Identifier sent with every request
+// (overriding the default shared PLEX_CLIENT_ID literal). Call once at
+// startup with a value generated once per console and persisted to
+// config.txt (see config_ensure_client_id() and main.c), before any other
+// plex_api_* call - including the login-flow ones like plex_api_create_pin()
+// and plex_api_login_direct(), which happen before plex_api_init() since
+// there's no server yet at that point. Without a stable per-console id, PMS
+// can't tell two 3DS's signed into the same account apart on its Now
+// Playing dashboard - it keys "players" by this value alone, so both
+// consoles look like a single player, each one's timeline update stomping
+// the other's. A NULL or empty client_id is ignored.
+void plex_api_set_client_id(const char* client_id);
+
 // Initialize the Plex API client with server URL and auth token.
 bool plex_api_init(const char* server_url, const char* auth_token);
 

@@ -25,6 +25,14 @@ typedef struct {
     // setting - that isn't exposed through any documented API - so this is
     // DualPlex's own remembered preference instead (see Settings screen).
     bool clock_24h;
+    // Randomly-generated identifier unique to this physical console, sent
+    // as Plex's X-Plex-Client-Identifier header on every request (see
+    // plex_api_set_client_id()). Generated once by config_ensure_client_id()
+    // below and persisted here so it stays stable across relaunches - PMS
+    // keys its Now Playing dashboard "players" by this value, so without a
+    // stable per-console id, two 3DS's signed into the same account would
+    // look like a single player to it.
+    char client_id[48];
 } AppConfig;
 
 // Load config from SD card. Returns true on success.
@@ -35,5 +43,11 @@ bool config_save(const AppConfig* config);
 
 // Set default values.
 void config_set_defaults(AppConfig* config);
+
+// Fills in config->client_id with a freshly generated value and persists it
+// via config_save() if it's not already set (a fresh install, or a
+// config.txt saved before this field existed). A no-op otherwise. Call
+// after srand() has been seeded (see main.c) and before any plex_api_* call.
+void config_ensure_client_id(AppConfig* config);
 
 #endif // CONFIG_H
