@@ -11,6 +11,11 @@
 typedef struct {
     char server_url[PLEX_MAX_URL];  // e.g. "http://192.168.1.100:32400"
     char auth_token[128];            // X-Plex-Token
+    // Whether the top-screen clock displays 24-hour time instead of 12-hour
+    // with AM/PM. Not read from the 3DS's own "Display 24-Hour Time" system
+    // setting - that isn't exposed through any documented API - so this is
+    // DualPlex's own remembered preference instead (see Settings screen).
+    bool clock_24h;
 } AppConfig;
 
 // Load config from SD card. Returns true on success.

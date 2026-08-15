@@ -25,6 +25,7 @@ extern bool g_stub_is_new3ds;
  * linkage in plex_api.c only so it can be exercised directly here. See its
  * definition for why. */
 extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
 
 /* ---------------------------------------------------------------- test framework */
 
@@ -52,6 +53,16 @@ static const char* g_current_test = "";
             g_tests_failed++; \
             printf("  FAIL [%s] %s:%d: expected \"%s\", got \"%s\"\n", \
                    g_current_test, __FILE__, __LINE__, _e ? _e : "(null)", _a ? _a : "(null)"); \
+        } \
+    } while (0)
+
+#define CHECK_FLOAT_NEAR(actual, expected, tol) do { \
+        float _a = (actual); float _e = (expected); float _d = _a - _e; \
+        if (_d < 0) _d = -_d; \
+        if (_d > (tol)) { \
+            g_tests_failed++; \
+            printf("  FAIL [%s] %s:%d: expected %g, got %g\n", \
+                   g_current_test, __FILE__, __LINE__, (double)_e, (double)_a); \
         } \
     } while (0)
 
@@ -563,6 +574,76 @@ TEST(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers) {
 }
 
 /* ================================================================== */
+/* parse_loudness_curve_response() - real captured /library/streams/{id}/
+ * loudness response (plain text, one dB value per line) for $ilkMoney -
+ * "Detour", 1484 lines/samples (148.4s @ 100ms/sample, matches the track's
+ * actual duration). */
+
+TEST(parse_loudness_curve_response_head_mode_returns_first_samples) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out[10];
+    int count = parse_loudness_curve_response(fixture, out, 10, /*want_tail=*/false);
+
+    CHECK(count == 10);
+    /* First 10 lines of the fixture, verbatim. */
+    float expected[10] = { -37.2f, -32.9f, -31.5f, -30.7f, -31.1f, -31.8f, -31.9f, -31.7f, -30.9f, -30.3f };
+    for (int i = 0; i < 10; i++) {
+        CHECK_FLOAT_NEAR(out[i], expected[i], 0.01f);
+    }
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_tail_mode_returns_last_samples) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out[5];
+    int count = parse_loudness_curve_response(fixture, out, 5, /*want_tail=*/true);
+
+    CHECK(count == 5);
+    /* Last 5 lines of the fixture (the file has a trailing newline after the
+     * final value, so these are genuinely the last 5 numbers in the file). */
+    float expected[5] = { -9.1f, -9.2f, -9.2f, -9.4f, -10.4f };
+    for (int i = 0; i < 5; i++) {
+        CHECK_FLOAT_NEAR(out[i], expected[i], 0.01f);
+    }
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_respects_max_cap) {
+    char* fixture = read_fixture("tests/fixtures/detour_loudness_curve.txt");
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+
+    float out_head[3];
+    CHECK(parse_loudness_curve_response(fixture, out_head, 3, false) == 3);
+
+    float out_tail[3];
+    CHECK(parse_loudness_curve_response(fixture, out_tail, 3, true) == 3);
+
+    free(fixture);
+}
+
+TEST(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them) {
+    const char* text = "-10.0\n-11.5\n-12.25\n";
+    float out[16];
+    CHECK(parse_loudness_curve_response(text, out, 16, false) == 3);
+    CHECK(parse_loudness_curve_response(text, out, 16, true) == 3);
+}
+
+TEST(parse_loudness_curve_response_empty_input_returns_zero) {
+    float out[8];
+    CHECK(parse_loudness_curve_response("", out, 8, false) == 0);
+    CHECK(parse_loudness_curve_response(NULL, out, 8, true) == 0);
+}
+
+/* ================================================================== */
 
 int main(void) {
     RUN(transcode_url_flac_direct_tier_falls_back_to_320_bitrate);
@@ -588,6 +669,11 @@ int main(void) {
     RUN(parse_lyrics_stream_response_raw_lrc_text_fallback_shape);
     RUN(parse_lyrics_stream_response_no_lyrics_present_returns_zero);
     RUN(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers);
+    RUN(parse_loudness_curve_response_head_mode_returns_first_samples);
+    RUN(parse_loudness_curve_response_tail_mode_returns_last_samples);
+    RUN(parse_loudness_curve_response_respects_max_cap);
+    RUN(parse_loudness_curve_response_fewer_samples_than_max_returns_all_of_them);
+    RUN(parse_loudness_curve_response_empty_input_returns_zero);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {

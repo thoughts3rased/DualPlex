@@ -6,7 +6,7 @@
 extern const uint8_t iconfont_bin[];
 extern const uint8_t iconfont_bin_end[];
 #if __cplusplus >= 201103L
-static constexpr size_t iconfont_bin_size=524508;
+static constexpr size_t iconfont_bin_size=524548;
 #else
-static const size_t iconfont_bin_size=524508;
+static const size_t iconfont_bin_size=524548;
 #endif

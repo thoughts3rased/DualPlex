@@ -773,6 +773,7 @@ static int parse_tracks_from_json(const char* response, PlexTrack* out, int star
                     cJSON* thumb = cJSON_GetObjectItem(item, "thumb");
                     cJSON* duration = cJSON_GetObjectItem(item, "duration");
                     cJSON* index = cJSON_GetObjectItem(item, "index");
+                    cJSON* userRating = cJSON_GetObjectItem(item, "userRating"); // 0.0-10.0, omitted entirely if the track has never been rated
                     
                     if (ratingKey) {
                         if (cJSON_IsString(ratingKey) && ratingKey->valuestring) {
@@ -793,7 +794,8 @@ static int parse_tracks_from_json(const char* response, PlexTrack* out, int star
                     if (thumb && cJSON_IsString(thumb)) strncpy(out[idx].thumb, thumb->valuestring, sizeof(out[idx].thumb) - 1);
                     if (duration && cJSON_IsNumber(duration)) out[idx].duration = duration->valueint;
                     if (index && cJSON_IsNumber(index)) out[idx].index = index->valueint;
-                    
+                    if (userRating && cJSON_IsNumber(userRating)) out[idx].user_rating = (float)userRating->valuedouble;
+
                     cJSON* media = cJSON_GetObjectItem(item, "Media");
                     if (media && cJSON_IsArray(media)) {
                         cJSON* media_item = cJSON_GetArrayItem(media, 0);
@@ -1410,6 +1412,271 @@ void plex_api_timeline_async_update(void) {
     CURLMcode mres = curl_multi_perform(s_tl_multi, &running);
     if (mres == CURLM_OK && running > 0) return;
     tl_async_cleanup(); // done (success or failure - fire-and-forget either way)
+}
+
+void plex_api_rate_track_async(const char* rating_key, float rating_10) {
+    if (!s_initialized || !rating_key || !rating_key[0]) return;
+
+    // Shares the timeline-report request slot above - see this function's
+    // doc comment in plex_api.h for why that's fine.
+    tl_async_cleanup();
+
+    const char* clean_rkey = rating_key;
+    const char* p = strrchr(rating_key, '/');
+    if (p && strlen(p + 1) > 0) clean_rkey = p + 1;
+
+    int rating_int = (int)(rating_10 >= 0.0f ? rating_10 + 0.5f : rating_10 - 0.5f); // round to nearest whole point
+    if (rating_int > 10) rating_int = 10;
+    if (rating_int < -1) rating_int = -1;
+
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/:/rate?identifier=com.plexapp.plugins.library&key=%s&rating=%d",
+             clean_rkey, rating_int);
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s%s", s_server_url, endpoint);
+
+    if (!s_tl_multi) s_tl_multi = curl_multi_init();
+    s_tl_easy = curl_easy_init();
+    if (!s_tl_easy) return;
+
+    s_tl_buf.data = malloc(1);
+    s_tl_buf.size = 0;
+    s_tl_buf.capacity = 1;
+    if (s_tl_buf.data) s_tl_buf.data[0] = 0;
+
+    s_tl_headers = curl_slist_append(NULL, "Accept: application/json");
+    char token_header[256];
+    snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
+    s_tl_headers = curl_slist_append(s_tl_headers, token_header);
+    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_tl_headers = curl_slist_append(s_tl_headers, "X-Plex-Product: " PLEX_PRODUCT);
+
+    curl_easy_setopt(s_tl_easy, CURLOPT_URL, url);
+    curl_easy_setopt(s_tl_easy, CURLOPT_HTTPHEADER, s_tl_headers);
+    curl_easy_setopt(s_tl_easy, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(s_tl_easy, CURLOPT_WRITEDATA, (void*)&s_tl_buf);
+    curl_easy_setopt(s_tl_easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(s_tl_easy, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    curl_multi_add_handle(s_tl_multi, s_tl_easy);
+    s_tl_active = true;
+
+    LOG_INFO("Rating track %s: %d/10 (async)", clean_rkey, rating_int);
+}
+
+// --- Sonic Analysis (loudness) async fetch --------------------------------
+// Two-stage, same shape as the lyrics async fetch above: first resolve the
+// track's audio Stream (for its gain/loudness/lra scalars and its stream id,
+// via /library/metadata/{ratingKey}), then fetch that stream's short-term
+// loudness curve (/library/streams/{id}/loudness - plain text, one dB value
+// per line, one entry per 100ms per developer.plex.tv's
+// libraryGetStreamsStreamLoudness) and keep only the requested end of it.
+
+// Parses a /library/streams/{id}/loudness response (plain text, one float
+// per line) into out, keeping at most `max` samples. If want_tail, keeps the
+// LAST max samples seen (a sliding window, so the result ends up being
+// whatever was closest to the end of the track regardless of how long the
+// full response was); otherwise keeps the FIRST max samples and stops
+// parsing as soon as it has enough. Returns the number of samples written.
+// External linkage (not declared in the header) so the host test suite can
+// exercise it directly against a captured fixture, same as
+// parse_lyrics_stream_response().
+int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail) {
+    if (!text || !out || max <= 0) return 0;
+    int n = 0; // valid samples currently in out[0..n-1], oldest -> newest
+    const char* p = text;
+    while (*p) {
+        char* endptr = NULL;
+        float v = strtof(p, &endptr);
+        if (endptr == p) { p++; continue; } // not a number (e.g. stray whitespace/newline) - skip a char and keep scanning
+        p = endptr;
+        if (n < max) {
+            out[n++] = v;
+        } else if (want_tail) {
+            memmove(out, out + 1, (size_t)(max - 1) * sizeof(float));
+            out[max - 1] = v;
+        } else {
+            break; // head mode: already have enough, no need to keep parsing
+        }
+    }
+    return n;
+}
+
+typedef enum {
+    ANALYSIS_ASYNC_IDLE,
+    ANALYSIS_ASYNC_FETCHING_METADATA,
+    ANALYSIS_ASYNC_FETCHING_CURVE,
+    ANALYSIS_ASYNC_DONE
+} AnalysisAsyncState;
+
+static AnalysisAsyncState s_an_state = ANALYSIS_ASYNC_IDLE;
+static CURLM* s_an_multi = NULL;
+static CURL* s_an_easy = NULL;
+static struct curl_slist* s_an_headers = NULL;
+static HttpBuffer s_an_buf = {0};
+static bool s_an_want_tail = true;
+static PlexTrackAnalysis s_an_result = {0};
+
+static void an_async_cleanup_request(void) {
+    if (s_an_multi && s_an_easy) {
+        curl_multi_remove_handle(s_an_multi, s_an_easy);
+        curl_easy_cleanup(s_an_easy);
+        s_an_easy = NULL;
+    }
+    if (s_an_headers) {
+        curl_slist_free_all(s_an_headers);
+        s_an_headers = NULL;
+    }
+    if (s_an_buf.data) {
+        free(s_an_buf.data);
+        s_an_buf.data = NULL;
+    }
+    s_an_buf.size = 0;
+    s_an_buf.capacity = 0;
+}
+
+static bool an_async_start_request(const char* endpoint) {
+    if (!s_an_multi) s_an_multi = curl_multi_init();
+    s_an_easy = curl_easy_init();
+    if (!s_an_easy) return false;
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s%s", s_server_url, endpoint);
+
+    s_an_buf.data = malloc(1);
+    s_an_buf.size = 0;
+    s_an_buf.capacity = 1;
+    if (s_an_buf.data) s_an_buf.data[0] = 0;
+
+    s_an_headers = curl_slist_append(NULL, "Accept: application/json");
+    char token_header[256];
+    snprintf(token_header, sizeof(token_header), "X-Plex-Token: %s", s_auth_token);
+    s_an_headers = curl_slist_append(s_an_headers, token_header);
+    s_an_headers = curl_slist_append(s_an_headers, "X-Plex-Client-Identifier: " PLEX_CLIENT_ID);
+    s_an_headers = curl_slist_append(s_an_headers, "X-Plex-Product: " PLEX_PRODUCT);
+
+    curl_easy_setopt(s_an_easy, CURLOPT_URL, url);
+    curl_easy_setopt(s_an_easy, CURLOPT_HTTPHEADER, s_an_headers);
+    curl_easy_setopt(s_an_easy, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(s_an_easy, CURLOPT_WRITEDATA, (void*)&s_an_buf);
+    curl_easy_setopt(s_an_easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(s_an_easy, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(s_an_easy, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(s_an_easy, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(s_an_easy, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    curl_multi_add_handle(s_an_multi, s_an_easy);
+    return true;
+}
+
+void plex_api_analysis_async_start(const char* rating_key, bool want_tail) {
+    an_async_cleanup_request();
+    s_an_state = ANALYSIS_ASYNC_IDLE;
+    memset(&s_an_result, 0, sizeof(s_an_result));
+    s_an_want_tail = want_tail;
+
+    if (!s_initialized || !rating_key || !rating_key[0]) return;
+
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/library/metadata/%s", rating_key);
+    if (an_async_start_request(endpoint)) {
+        s_an_state = ANALYSIS_ASYNC_FETCHING_METADATA;
+    }
+}
+
+void plex_api_analysis_async_update(void) {
+    if (s_an_state == ANALYSIS_ASYNC_IDLE || s_an_state == ANALYSIS_ASYNC_DONE) return;
+    if (!s_an_multi || !s_an_easy) return;
+
+    int running = 0;
+    CURLMcode mres = curl_multi_perform(s_an_multi, &running);
+    if (mres == CURLM_OK && running > 0) return; // still in flight, check again next frame
+
+    long http_code = 0;
+    curl_easy_getinfo(s_an_easy, CURLINFO_RESPONSE_CODE, &http_code);
+    bool ok = (mres == CURLM_OK && http_code == 200 && s_an_buf.data && s_an_buf.size > 0);
+
+    if (s_an_state == ANALYSIS_ASYNC_FETCHING_METADATA) {
+        int stream_id = 0;
+        if (ok) {
+            cJSON* json = cJSON_Parse(s_an_buf.data);
+            if (json) {
+                cJSON* container = cJSON_GetObjectItem(json, "MediaContainer");
+                cJSON* metadata = container ? cJSON_GetObjectItem(container, "Metadata") : NULL;
+                cJSON* item = (metadata && cJSON_IsArray(metadata)) ? cJSON_GetArrayItem(metadata, 0) : NULL;
+                cJSON* media = item ? cJSON_GetObjectItem(item, "Media") : NULL;
+                cJSON* media_item = (media && cJSON_IsArray(media)) ? cJSON_GetArrayItem(media, 0) : NULL;
+                cJSON* part = media_item ? cJSON_GetObjectItem(media_item, "Part") : NULL;
+                cJSON* part_item = (part && cJSON_IsArray(part)) ? cJSON_GetArrayItem(part, 0) : NULL;
+                cJSON* stream = part_item ? cJSON_GetObjectItem(part_item, "Stream") : NULL;
+                cJSON* s_item = NULL;
+                cJSON_ArrayForEach(s_item, stream) {
+                    cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
+                    if (!streamType || !cJSON_IsNumber(streamType) || streamType->valueint != 2) continue; // 2 = audio
+                    cJSON* id = cJSON_GetObjectItem(s_item, "id");
+                    cJSON* gain = cJSON_GetObjectItem(s_item, "gain");
+                    cJSON* loudness = cJSON_GetObjectItem(s_item, "loudness");
+                    cJSON* lra = cJSON_GetObjectItem(s_item, "lra");
+                    if (id && cJSON_IsNumber(id)) stream_id = id->valueint;
+                    if (gain && cJSON_IsString(gain)) s_an_result.gain_db = strtof(gain->valuestring, NULL);
+                    if (loudness && cJSON_IsString(loudness)) s_an_result.loudness_lufs = strtof(loudness->valuestring, NULL);
+                    if (lra && cJSON_IsString(lra)) s_an_result.lra = strtof(lra->valuestring, NULL);
+                    break;
+                }
+                cJSON_Delete(json);
+            }
+        }
+        an_async_cleanup_request();
+
+        if (stream_id <= 0) {
+            // No audio Stream / no gain data - track was never analyzed (or
+            // this server doesn't have Plex Pass). Report "no data" rather
+            // than fetching a curve that can't exist either.
+            s_an_state = ANALYSIS_ASYNC_DONE;
+            return;
+        }
+
+        char curve_endpoint[128];
+        snprintf(curve_endpoint, sizeof(curve_endpoint), "/library/streams/%d/loudness", stream_id);
+        if (an_async_start_request(curve_endpoint)) {
+            s_an_state = ANALYSIS_ASYNC_FETCHING_CURVE;
+        } else {
+            s_an_result.valid = true; // still have the scalar gain/loudness/lra even without a curve
+            s_an_state = ANALYSIS_ASYNC_DONE;
+        }
+        return;
+    }
+
+    if (s_an_state == ANALYSIS_ASYNC_FETCHING_CURVE) {
+        if (ok) {
+            s_an_result.curve_count = parse_loudness_curve_response(
+                s_an_buf.data, s_an_result.curve_db, PLEX_ANALYSIS_CURVE_SAMPLES, s_an_want_tail);
+        }
+        an_async_cleanup_request();
+        s_an_result.valid = true; // gain/loudness/lra came from the metadata stage regardless of curve success
+        s_an_state = ANALYSIS_ASYNC_DONE;
+        LOG_INFO("Sonic analysis loaded: gain=%.2fdB loudness=%.2f lra=%.2f curve=%d samples (%s)",
+                 s_an_result.gain_db, s_an_result.loudness_lufs, s_an_result.lra, s_an_result.curve_count,
+                 s_an_want_tail ? "tail" : "head");
+    }
+}
+
+bool plex_api_analysis_async_is_done(void) {
+    return s_an_state == ANALYSIS_ASYNC_DONE;
+}
+
+void plex_api_analysis_async_take_result(PlexTrackAnalysis* out) {
+    if (!out) return;
+    if (s_an_state != ANALYSIS_ASYNC_DONE) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = s_an_result;
+    s_an_state = ANALYSIS_ASYNC_IDLE; // consumed
 }
 
 bool plex_api_get_album_art(const char* thumb_path, u8** out_data, size_t* out_size) {
