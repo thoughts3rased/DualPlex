@@ -677,14 +677,36 @@ TEST(is_local_connection_false_for_public_ip_or_hostname) {
     CHECK(!plex_api_is_local_connection());
 }
 
-TEST(is_https_reflects_the_stored_url_scheme) {
-    /* sanitize_server_url() downgrades any https:// input to http://, so a
-     * fresh init() should always read back as plain HTTP regardless of what
-     * scheme was passed in. */
+TEST(is_https_preserved_for_hostnames) {
+    /* Plex Media Server's HTTPS listener validates the request's Host/SNI
+     * against a *.plex.direct name and will reject a bare IP outright, but
+     * has no such problem with an actual hostname - so HTTPS to one is left
+     * alone rather than downgraded on principle. */
+    plex_api_init("https://192-168-0-200.abc123.plex.direct:32400", "TOK");
+    CHECK(plex_api_is_https());
+    CHECK_STR_EQ(plex_api_get_server_url(), "https://192-168-0-200.abc123.plex.direct:32400");
+
+    plex_api_init("https://myserver.example.com:32400", "TOK");
+    CHECK(plex_api_is_https());
+}
+
+TEST(is_https_downgraded_for_bare_ip_addresses) {
+    /* The one case PMS's HTTPS listener can't actually serve - downgrading
+     * this up front (rather than waiting for plex_api_test_connection()'s
+     * fallback) skips a request that would always fail. */
     plex_api_init("https://192.168.0.200:32400", "TOK");
     CHECK(!plex_api_is_https());
+    CHECK_STR_EQ(plex_api_get_server_url(), "http://192.168.0.200:32400");
 
+    plex_api_init("https://203.0.113.5:32400", "TOK");
+    CHECK(!plex_api_is_https());
+}
+
+TEST(is_https_false_for_plain_http_input) {
     plex_api_init("http://192.168.0.200:32400", "TOK");
+    CHECK(!plex_api_is_https());
+
+    plex_api_init("http://myserver.example.com:32400", "TOK");
     CHECK(!plex_api_is_https());
 }
 
@@ -721,7 +743,9 @@ int main(void) {
     RUN(parse_loudness_curve_response_empty_input_returns_zero);
     RUN(is_local_connection_true_for_rfc1918_ranges);
     RUN(is_local_connection_false_for_public_ip_or_hostname);
-    RUN(is_https_reflects_the_stored_url_scheme);
+    RUN(is_https_preserved_for_hostnames);
+    RUN(is_https_downgraded_for_bare_ip_addresses);
+    RUN(is_https_false_for_plain_http_input);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {

@@ -287,42 +287,46 @@ static bool plex_http_post_full_url(const char* url, const char* post_fields, co
     return false;
 }
 
+// Whether `host` (the part of a URL after "scheme://", so possibly still
+// followed by ":port" or "/path") is a literal dotted-quad IPv4 address
+// rather than a DNS hostname.
+static bool host_is_literal_ipv4(const char* host) {
+    int a, b, c, d, consumed = 0;
+    if (sscanf(host, "%d.%d.%d.%d%n", &a, &b, &c, &d, &consumed) != 4) return false;
+    char next = host[consumed];
+    return next == '\0' || next == ':' || next == '/';
+}
+
 static void sanitize_server_url(const char* in_url, char* out_url, size_t max_len) {
     if (!in_url || !in_url[0]) {
         out_url[0] = '\0';
         return;
     }
-    
+
     char temp[PLEX_MAX_URL];
     strncpy(temp, in_url, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
-    
-    // Check if domain is a .plex.direct address with dashed IP (e.g. 192-168-0-200.xyz.plex.direct:32400)
-    char* direct = strstr(temp, ".plex.direct");
-    if (direct) {
-        char* ip_start = strstr(temp, "http://");
-        if (ip_start) ip_start += 7;
-        else {
-            ip_start = strstr(temp, "https://");
-            if (ip_start) ip_start += 8;
-            else ip_start = temp;
-        }
-        
-        int a, b, c, d, port = 32400;
-        if (sscanf(ip_start, "%d-%d-%d-%d", &a, &b, &c, &d) == 4) {
-            char* port_str = strchr(direct, ':');
-            if (port_str) port = atoi(port_str + 1);
-            snprintf(out_url, max_len, "http://%d.%d.%d.%d:%d", a, b, c, d, port > 0 ? port : 32400);
+
+    // Plex Media Server's built-in HTTPS listener validates the request's
+    // Host/SNI against a *.plex.direct hostname and rejects a bare IP
+    // address outright (a documented PMS restriction, not a certificate-
+    // trust problem - see the CURLOPT_SSL_VERIFYPEER/VERIFYHOST(0) calls
+    // below, so this isn't about client-side cert verification either).
+    // A *.plex.direct hostname - dashed-IP direct connections included,
+    // e.g. 192-168-0-200.xyz.plex.direct:32400 - or any other DNS name
+    // (a user's own reverse proxy, say) doesn't have that problem and is
+    // left as HTTPS untouched. If a given server genuinely can't be
+    // reached over HTTPS for some other reason, plex_api_test_connection()
+    // falls back to HTTP on its own rather than that being decided here.
+    bool is_https = strncmp(temp, "https://", 8) == 0;
+    if (is_https) {
+        const char* host = temp + 8;
+        if (host_is_literal_ipv4(host)) {
+            snprintf(out_url, max_len, "http://%s", host);
             return;
         }
     }
-    
-    // Convert https:// to http:// for local IP connections
-    if (strncmp(temp, "https://", 8) == 0) {
-        snprintf(out_url, max_len, "http://%s", temp + 8);
-        return;
-    }
-    
+
     strncpy(out_url, temp, max_len - 1);
     out_url[max_len - 1] = '\0';
 }
@@ -391,6 +395,37 @@ bool plex_api_test_connection(void) {
         free(response);
         return true;
     }
+
+    // If we were trying HTTPS and that didn't work, silently retry once
+    // over HTTP before giving up, and keep s_server_url on whichever one
+    // actually succeeds. Covers servers this platform genuinely can't
+    // reach over HTTPS for some reason (e.g. a TLS version/cipher PMS's
+    // listener wants that this port's mbedtls doesn't support) without
+    // that possibility deciding the scheme up front for every server -
+    // most do work fine over HTTPS and should get the real padlock icon.
+    if (strncmp(s_server_url, "https://", 8) == 0) {
+        char http_url[PLEX_MAX_URL];
+        snprintf(http_url, sizeof(http_url), "http://%s", s_server_url + 8);
+
+        char saved_https_url[PLEX_MAX_URL];
+        strncpy(saved_https_url, s_server_url, sizeof(saved_https_url) - 1);
+        saved_https_url[sizeof(saved_https_url) - 1] = '\0';
+
+        strncpy(s_server_url, http_url, sizeof(s_server_url) - 1);
+        s_server_url[sizeof(s_server_url) - 1] = '\0';
+
+        if (plex_http_get("/", &response)) {
+            free(response);
+            LOG_WARN("HTTPS connection to %s failed - falling back to HTTP", saved_https_url);
+            return true;
+        }
+
+        // Neither worked - restore the HTTPS URL so error messages/retries
+        // reflect what the user actually configured.
+        strncpy(s_server_url, saved_https_url, sizeof(s_server_url) - 1);
+        s_server_url[sizeof(s_server_url) - 1] = '\0';
+    }
+
     return false;
 }
 
