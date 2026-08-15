@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Cached across runs, keyed on a fixed version string below - bump it
-      # (v5 -> v6) to force a clean reinstall if the toolchain ever needs
+      # (v6 -> v7) to force a clean reinstall if the toolchain ever needs
       # refreshing. On a cache hit every step below down to (not including)
       # the Build step is skipped entirely: everything the build needs
       # (devkitARM, libctru, portlibs, and the patched-in glibc below) lives
@@ -55,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/devkitpro
-          key: devkitpro-3ds-v5
+          key: devkitpro-3ds-v6
 
       # The runner's container has no devkitPro (or anything it needs) baked
       # in, so it's installed here on a cache miss. This is a from-scratch
@@ -88,7 +88,14 @@ jobs:
           # rpath entries across generations instead of starting fresh -
           # exactly what produced an inconsistent loader/libc pairing here:
           #   Inconsistency detected by ld.so: dl-call-libc-early-init.c...
-          $SUDO rm -rf "$DEVKITPRO"
+          # Only the package *content* dirs are wiped, not all of
+          # /opt/devkitpro: dkp-pacman itself is bootstrapped into
+          # /opt/devkitpro/pacman by the devkitpro-pacman apt package's
+          # postinst, which apt only runs once (it no-ops on an
+          # already-installed package, cache miss or not) - deleting that
+          # directory too breaks dkp-pacman itself with no way to recover it
+          # short of purging and reinstalling the apt package.
+          $SUDO rm -rf "$DEVKITARM" "$DEVKITPRO/libctru" "$DEVKITPRO/portlibs" "$DEVKITPRO/tools"
 
           $SUDO apt-get update
           $SUDO apt-get install -y apt-transport-https ca-certificates wget gnupg unzip
@@ -101,6 +108,18 @@ jobs:
 
           $SUDO apt-get update
           $SUDO apt-get install -y devkitpro-pacman
+
+          # A previous run on this runner deleted /opt/devkitpro/pacman
+          # directly (see the git history of the wipe above) without going
+          # through apt, so dpkg still considers devkitpro-pacman installed
+          # and the plain install above no-ops instead of re-bootstrapping
+          # it. --reinstall forces dpkg to re-run its postinst regardless of
+          # what it thinks is already installed, which is also what
+          # recovers dkp-pacman if this ever happens again for any other
+          # reason.
+          if [ ! -x "$DEVKITPRO/pacman/bin/pacman" ]; then
+            $SUDO apt-get install --reinstall -y devkitpro-pacman
+          fi
 
           $SUDO dkp-pacman -Sy --noconfirm 3ds-dev 3ds-curl 3ds-mpg123 3ds-mbedtls
 
