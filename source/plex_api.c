@@ -390,9 +390,12 @@ bool plex_api_is_local_connection(void) {
 }
 
 bool plex_api_test_connection(void) {
+    bool tried_https = strncmp(s_server_url, "https://", 8) == 0;
+
     char* response = NULL;
     if (plex_http_get("/", &response)) {
         free(response);
+        if (tried_https) LOG_INFO("Connected to %s over HTTPS", s_server_url);
         return true;
     }
 
@@ -403,7 +406,7 @@ bool plex_api_test_connection(void) {
     // listener wants that this port's mbedtls doesn't support) without
     // that possibility deciding the scheme up front for every server -
     // most do work fine over HTTPS and should get the real padlock icon.
-    if (strncmp(s_server_url, "https://", 8) == 0) {
+    if (tried_https) {
         char http_url[PLEX_MAX_URL];
         snprintf(http_url, sizeof(http_url), "http://%s", s_server_url + 8);
 
@@ -424,6 +427,9 @@ bool plex_api_test_connection(void) {
         // reflect what the user actually configured.
         strncpy(s_server_url, saved_https_url, sizeof(s_server_url) - 1);
         s_server_url[sizeof(s_server_url) - 1] = '\0';
+        LOG_ERROR("Connection failed over both HTTPS and HTTP fallback to %s", saved_https_url);
+    } else {
+        LOG_ERROR("Connection failed to %s", s_server_url);
     }
 
     return false;
