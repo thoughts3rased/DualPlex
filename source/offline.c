@@ -3,6 +3,29 @@
 // one-at-a-time background download engine that fills it in. See offline.h
 // for the public shape; this file also owns the download queue and the
 // manifest's on-disk JSON format.
+//
+// Threading: the actual transfer (curl_multi_wait/perform + the SD card
+// write) runs on a dedicated background thread (see offline_init()/
+// dl_thread_func()) rather than being pumped inline on the main thread's own
+// frame budget - a download competing with rendering/audio decode for main-
+// thread time was the other half of the stutter problem the bandwidth
+// throttle below addresses (see OFFLINE_DL_THROTTLED_BYTES_PER_SEC). Pinned
+// to core 2 on New3DS when available, so it runs genuinely in parallel with
+// zero main-thread cost; falls back to sharing a core via the OS scheduler
+// otherwise (Old3DS, or a New3DS build without the exheader capability for
+// core 2 - see thread.h's threadCreate() doc comment).
+//
+// Every bit of mutable state in this file (the manifest, the queue, the
+// active transfer) is reachable from both the main thread (ui.c, via the
+// public offline_* calls) and the download thread, so it's all guarded by a
+// single lock (s_lock). curl objects specifically (s_dl_multi, s_active.easy/
+// fp/headers) are additionally only ever *touched* by the download thread
+// itself, even under the lock - the main thread never calls a curl function
+// directly. When something the main thread does (deleting an in-progress
+// download, or shutting down) needs the active transfer torn down, it just
+// requests that (s_cancel_active_requested) and lets the download thread
+// carry it out on its own next loop iteration, rather than reaching into
+// curl objects from a foreign thread.
 #include "offline.h"
 #include "plex_api.h"
 #include "audio_player.h"
@@ -30,7 +53,7 @@
 #define OFFLINE_MAX_QUEUE 150
 
 // Caps the active download's transfer rate while audio_player.c is actively
-// streaming a track over the network (see offline_update()) - otherwise the
+// streaming a track over the network (see dl_thread_func()) - otherwise the
 // download happily saturates however much of the WiFi link it's given,
 // competing with the stream for the same bandwidth and starving its ring
 // buffer, audible as stutter. 128 KB/s (~1 Mbps) comfortably covers even a
@@ -38,8 +61,21 @@
 // to spare on any WiFi link that can sustain both at all, while still
 // making real download progress in the background rather than stalling it
 // outright. No cap at all (0) once nothing's streaming over the network -
-// see audio_player_is_streaming_over_network().
+// see s_network_streaming_hint/offline_set_network_streaming_hint().
 #define OFFLINE_DL_THROTTLED_BYTES_PER_SEC (128 * 1024)
+
+// Only a direct (untranscoded) download can be resumed across a restart or a
+// network drop - see start_next_download()'s comment on why a transcode
+// can't. Capped rather than unlimited so a persistently unreachable server
+// doesn't retry forever; backoff between attempts (retry_backoff_ticks())
+// keeps a real but temporary drop from hammering it either.
+#define OFFLINE_MAX_RETRIES 5
+
+#define OFFLINE_RESUME_PATH "/3ds/dualplex/offline/resume.json"
+
+// 64KB - generous headroom for curl + cJSON manifest (de)serialization on
+// the background download thread (see offline_init()).
+#define OFFLINE_DL_THREAD_STACK_SIZE 0x10000
 
 // A track that has finished downloading and is recorded in library.json.
 // ref_count is how many still-active download requests (standalone track,
@@ -71,9 +107,10 @@ typedef struct {
     char track_keys[OFFLINE_PLAYLIST_MAX_TRACKS][PLEX_MAX_STR];
 } OfflinePlaylistEntry;
 
-// A download not yet started - metadata copied out of the PlexTrack that was
-// queued (which the caller's own array may go on to overwrite/reuse before
-// this actually gets downloaded, e.g. navigating to a different album).
+// A download not yet started (or waiting to be retried) - metadata copied
+// out of the PlexTrack that was queued (which the caller's own array may go
+// on to overwrite/reuse before this actually gets downloaded, e.g.
+// navigating to a different album).
 typedef struct {
     char rating_key[PLEX_MAX_STR];
     char title[PLEX_MAX_STR];
@@ -89,6 +126,11 @@ typedef struct {
     int bit_depth;
     int index;
     int duration;
+    // Retry bookkeeping - reset each session (not persisted to
+    // OFFLINE_RESUME_PATH; an app restart is itself a fresh set of
+    // attempts). See finish_active_download()'s failure path.
+    int retry_count;
+    u64 retry_not_before; // svcGetSystemTick() value; don't attempt before this
 } OfflineQueueItem;
 
 typedef struct {
@@ -104,6 +146,9 @@ typedef struct {
     curl_off_t bytes_total;
 } ActiveDownload;
 
+// --- Shared state - see the module comment at the top for the locking rules ---
+static LightLock s_lock;
+
 static OfflineTrackEntry s_tracks[OFFLINE_MAX_TRACKS];
 static int s_num_tracks = 0;
 static OfflinePlaylistEntry s_playlists[OFFLINE_MAX_PLAYLISTS];
@@ -114,6 +159,30 @@ static int s_queue_count = 0;
 
 static CURLM* s_dl_multi = NULL;
 static ActiveDownload s_active = {0};
+
+// Main thread -> download thread: "cancel whatever's active and delete its
+// partial file" (an explicit user delete, or offline_delete_all()) - see the
+// module comment on why this is a request/flag rather than the main thread
+// calling cancel_active_download() itself.
+static volatile bool s_cancel_active_requested = false;
+
+// Main thread -> download thread: is audio_player.c currently streaming
+// over the network right now? See offline_set_network_streaming_hint(). A
+// plain flag, not lock-protected - a torn read of a single bool costs at
+// worst one loop iteration's throttle decision being stale, never a real
+// correctness problem, and audio_player.c's own state is main-thread-only
+// regardless, so the download thread has no other way to ask it directly.
+static volatile bool s_network_streaming_hint = false;
+
+// Download thread -> main thread: "please fetch this album's cover art" -
+// see request_album_thumb_if_needed()/offline_update()'s comment on why the
+// actual fetch can't happen on the download thread itself.
+static bool s_pending_thumb_request = false;
+static char s_pending_thumb_url[PLEX_MAX_URL] = "";
+static char s_pending_thumb_path[512] = "";
+
+static Thread s_dl_thread = NULL;
+static volatile bool s_dl_thread_should_run = false;
 
 // --- Small filesystem helpers ------------------------------------------------
 
@@ -185,6 +254,9 @@ static void remove_all_files_in_dir(const char* dir) {
 }
 
 // --- Manifest lookups & grouping identity ------------------------------------
+// Everything below this point assumes the caller already holds s_lock,
+// unless otherwise noted - these are all internal helpers, never called
+// directly from outside this file.
 
 static int find_track_index(const char* rating_key) {
     if (!rating_key || !rating_key[0]) return -1;
@@ -372,15 +444,99 @@ static void load_manifest(void) {
     cJSON_Delete(root);
 }
 
-void offline_init(void) {
-    ensure_dirs();
-    s_num_tracks = 0;
-    s_num_playlists = 0;
-    s_queue_count = 0;
-    memset(&s_active, 0, sizeof(s_active));
-    load_manifest();
-    LOG_INFO("offline: loaded %d downloaded track(s), %d playlist(s) (%u bytes on disk)",
-             s_num_tracks, s_num_playlists, (unsigned)offline_get_storage_used_bytes());
+// --- Resume record persistence (OFFLINE_RESUME_PATH) -------------------------
+// Records just enough about whichever download is currently in progress to
+// re-launch the exact same request later - see start_next_download()'s
+// resume-detection (which figures out how much of it is already on disk by
+// checking the .part file's actual size, not anything persisted here) and
+// offline_init()'s pickup of this at startup. Only ever written for a
+// resumable (direct, non-transcoded) download - see is_ext_playable().
+
+static void save_resume_record(const OfflineQueueItem* item) {
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "rating_key", item->rating_key);
+    cJSON_AddStringToObject(o, "title", item->title);
+    cJSON_AddStringToObject(o, "artist_title", item->artist_title);
+    cJSON_AddStringToObject(o, "album_title", item->album_title);
+    cJSON_AddStringToObject(o, "artist_rating_key", item->artist_rating_key);
+    cJSON_AddStringToObject(o, "album_rating_key", item->album_rating_key);
+    cJSON_AddStringToObject(o, "part_key", item->part_key);
+    cJSON_AddStringToObject(o, "thumb", item->thumb);
+    cJSON_AddStringToObject(o, "audio_codec", item->audio_codec);
+    cJSON_AddNumberToObject(o, "bitrate", item->bitrate);
+    cJSON_AddNumberToObject(o, "sampling_rate", item->sampling_rate);
+    cJSON_AddNumberToObject(o, "bit_depth", item->bit_depth);
+    cJSON_AddNumberToObject(o, "index", item->index);
+    cJSON_AddNumberToObject(o, "duration", item->duration);
+
+    char* text = cJSON_PrintUnformatted(o);
+    if (text) {
+        FILE* f = fopen(OFFLINE_RESUME_PATH, "w");
+        if (f) {
+            fputs(text, f);
+            fclose(f);
+        }
+        cJSON_free(text);
+    }
+    cJSON_Delete(o);
+}
+
+static void clear_resume_record(void) {
+    remove(OFFLINE_RESUME_PATH);
+}
+
+// Returns true (with *out_item filled in) if a valid resume record exists.
+static bool load_resume_record(OfflineQueueItem* out_item) {
+    FILE* f = fopen(OFFLINE_RESUME_PATH, "r");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return false;
+    }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON* root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return false;
+
+    memset(out_item, 0, sizeof(*out_item));
+#define GETSTR(dst, jkey) do { \
+        cJSON* _j = cJSON_GetObjectItem(root, jkey); \
+        if (_j && cJSON_IsString(_j)) strncpy(dst, _j->valuestring, sizeof(dst) - 1); \
+    } while (0)
+#define GETINT(dst, jkey) do { \
+        cJSON* _j = cJSON_GetObjectItem(root, jkey); \
+        if (_j && cJSON_IsNumber(_j)) dst = _j->valueint; \
+    } while (0)
+    GETSTR(out_item->rating_key, "rating_key");
+    GETSTR(out_item->title, "title");
+    GETSTR(out_item->artist_title, "artist_title");
+    GETSTR(out_item->album_title, "album_title");
+    GETSTR(out_item->artist_rating_key, "artist_rating_key");
+    GETSTR(out_item->album_rating_key, "album_rating_key");
+    GETSTR(out_item->part_key, "part_key");
+    GETSTR(out_item->thumb, "thumb");
+    GETSTR(out_item->audio_codec, "audio_codec");
+    GETINT(out_item->bitrate, "bitrate");
+    GETINT(out_item->sampling_rate, "sampling_rate");
+    GETINT(out_item->bit_depth, "bit_depth");
+    GETINT(out_item->index, "index");
+    GETINT(out_item->duration, "duration");
+#undef GETSTR
+#undef GETINT
+
+    cJSON_Delete(root);
+    return out_item->rating_key[0] != '\0' && out_item->part_key[0] != '\0';
 }
 
 // --- Queueing ----------------------------------------------------------------
@@ -404,7 +560,26 @@ static void queue_push(const PlexTrack* t) {
     q->duration = t->duration;
 }
 
-int offline_queue_tracks(const PlexTrack* tracks, int count) {
+// Pushes `item` to the FRONT of the queue - used for a retry (keep making
+// progress on the thing that's already partway done before starting
+// something new) and for the resume record picked up at startup (same
+// reasoning). Silently drops it if the queue's already full; vanishingly
+// unlikely (OFFLINE_MAX_QUEUE is generous) and not worth failing louder for.
+static void queue_push_front(const OfflineQueueItem* item) {
+    if (s_queue_count >= OFFLINE_MAX_QUEUE) {
+        LOG_WARN("offline: download queue full (%d) - dropping retry of '%s'", OFFLINE_MAX_QUEUE, item->title);
+        return;
+    }
+    memmove(&s_queue[1], &s_queue[0], (size_t)s_queue_count * sizeof(OfflineQueueItem));
+    s_queue[0] = *item;
+    s_queue_count++;
+}
+
+// Actual implementation of offline_queue_tracks() - assumes the lock is
+// already held, so offline_queue_playlist() below can call this directly
+// instead of going through the public, lock-acquiring offline_queue_tracks()
+// (LightLock isn't recursive - see the module comment).
+static int queue_tracks_locked(const PlexTrack* tracks, int count) {
     if (!tracks || count <= 0) return 0;
     int newly_queued = 0;
     bool dirty = false;
@@ -436,16 +611,26 @@ int offline_queue_tracks(const PlexTrack* tracks, int count) {
     return newly_queued;
 }
 
+int offline_queue_tracks(const PlexTrack* tracks, int count) {
+    LightLock_Lock(&s_lock);
+    int result = queue_tracks_locked(tracks, count);
+    LightLock_Unlock(&s_lock);
+    return result;
+}
+
 int offline_queue_playlist(const char* playlist_rating_key, const char* playlist_title,
                             const PlexTrack* tracks, int count) {
     if (!playlist_rating_key || !playlist_rating_key[0]) return 0;
-    int newly = offline_queue_tracks(tracks, count);
+
+    LightLock_Lock(&s_lock);
+    int newly = queue_tracks_locked(tracks, count);
 
     int pi = find_playlist_index(playlist_rating_key);
     if (pi < 0) {
         if (s_num_playlists >= OFFLINE_MAX_PLAYLISTS) {
             LOG_WARN("offline: playlist manifest full (%d) - can't add '%s'",
                      OFFLINE_MAX_PLAYLISTS, playlist_title ? playlist_title : "?");
+            LightLock_Unlock(&s_lock);
             return newly;
         }
         pi = s_num_playlists++;
@@ -463,10 +648,14 @@ int offline_queue_playlist(const char* playlist_rating_key, const char* playlist
     }
 
     save_manifest();
+    LightLock_Unlock(&s_lock);
     return newly;
 }
 
 // --- Download engine -----------------------------------------------------
+// Everything from here down to dl_thread_func() runs exclusively on the
+// background download thread (see offline_init()), with the lock already
+// held by the caller unless noted otherwise.
 
 static void derive_ext(const char* part_key, char* out, size_t max) {
     const char* base = strrchr(part_key, '/');
@@ -490,7 +679,12 @@ static void derive_ext(const char* part_key, char* out, size_t max) {
 // extension (mpg123 for MP3, dr_flac for FLAC - nothing else). A source file
 // in any other format (AAC/M4A/OGG/WMA, not uncommon in some libraries) gets
 // transcoded to MP3 at download time instead of saved as-is - see
-// start_next_download() - so it's guaranteed playable offline.
+// start_next_download() - so it's guaranteed playable offline. Also exactly
+// the set of downloads that can be resumed (see the module's resume-record
+// comment): a transcode is a live server-side re-encode, not a stable byte
+// stream - re-issuing the same transcode request and skipping N bytes via
+// Range doesn't reliably land back on the same content, so an interrupted
+// transcode just starts over instead of resuming.
 static bool is_ext_playable(const char* ext) {
     return strcasecmp(ext, "mp3") == 0 || strcasecmp(ext, "flac") == 0;
 }
@@ -549,15 +743,17 @@ static void add_track_manifest_entry(const OfflineQueueItem* q, const char* ext,
     e->ref_count += 1;
 }
 
-// Caches one thumbnail per album (not per track - every track on the same
-// album shares the same cover art) under OFFLINE_THUMBS_DIR, for
-// offline_get_thumb_path()/album_art_load_local() to show art on the Now
-// Playing screen with no server connection. Blocking (reuses
-// plex_api_get_album_art(), which pumps audio_player_update() internally
-// while it waits - same as every other blocking plex_api_* call), but only
-// runs once per album's first downloaded track, not once per track.
-static void maybe_fetch_album_thumb(const OfflineQueueItem* item) {
-    if (!item->thumb[0]) return;
+// Flags this track's album for a cover-art fetch next time offline_update()
+// runs on the main thread, if it isn't already cached - see the module
+// comment on why the download thread can't just do this fetch itself
+// (plex_api_get_album_art() blocks via a helper that pumps
+// audio_player_update(), which must stay on the main thread). Only one
+// request is kept in flight at a time; a second album finishing before the
+// main thread services the first just skips its own thumbnail this round
+// (cheap, cosmetic-only, and picked up next time that album's tracks are
+// touched by a fresh download anyway).
+static void request_album_thumb_if_needed(const OfflineQueueItem* item) {
+    if (!item->thumb[0] || s_pending_thumb_request) return;
     const char* album_id = item->album_rating_key[0] ? item->album_rating_key
                           : (item->album_title[0] ? item->album_title : item->rating_key);
 
@@ -570,19 +766,17 @@ static void maybe_fetch_album_thumb(const OfflineQueueItem* item) {
         return;
     }
 
-    u8* data = NULL;
-    size_t size = 0;
-    if (plex_api_get_album_art(item->thumb, &data, &size) && data && size > 0) {
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            fwrite(data, 1, size, f);
-            fclose(f);
-        }
-    }
-    if (data) free(data);
+    strncpy(s_pending_thumb_url, item->thumb, sizeof(s_pending_thumb_url) - 1);
+    strncpy(s_pending_thumb_path, path, sizeof(s_pending_thumb_path) - 1);
+    s_pending_thumb_request = true;
 }
 
-static void cancel_active_download(void) {
+// Tears down whatever the active transfer's curl/file handles are.
+// `delete_partial` distinguishes an explicit cancel (user deleted this item,
+// or offline_delete_all() wiped everything - remove the .part file and its
+// resume record too) from a graceful pause (app shutting down - leave both
+// in place so offline_init() picks this same download back up next launch).
+static void cancel_active_download(bool delete_partial) {
     if (!s_active.valid) return;
     if (s_active.fp) {
         fclose(s_active.fp);
@@ -597,15 +791,32 @@ static void cancel_active_download(void) {
         curl_slist_free_all(s_active.headers);
         s_active.headers = NULL;
     }
-    remove(s_active.tmp_path);
+    if (delete_partial) {
+        remove(s_active.tmp_path);
+        clear_resume_record();
+    }
     memset(&s_active, 0, sizeof(s_active));
 }
 
 static void start_next_download(void) {
     if (s_queue_count <= 0) return;
 
-    OfflineQueueItem item = s_queue[0];
-    memmove(&s_queue[0], &s_queue[1], (size_t)(s_queue_count - 1) * sizeof(OfflineQueueItem));
+    // Front-most item that isn't still backing off after a failed attempt
+    // (see finish_active_download()) - usually just index 0, but a retry
+    // waiting out its backoff shouldn't block everything queued behind it
+    // that's perfectly able to start right now.
+    u64 now = svcGetSystemTick();
+    int idx = -1;
+    for (int i = 0; i < s_queue_count; i++) {
+        if (s_queue[i].retry_not_before <= now) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) return; // everything currently queued is backing off
+
+    OfflineQueueItem item = s_queue[idx];
+    memmove(&s_queue[idx], &s_queue[idx + 1], (size_t)(s_queue_count - 1 - idx) * sizeof(OfflineQueueItem));
     s_queue_count--;
 
     // May have become redundant while it was waiting its turn (queued twice
@@ -639,7 +850,24 @@ static void start_next_download(void) {
     track_file_path(item.rating_key, ext, s_active.final_path, sizeof(s_active.final_path));
     snprintf(s_active.tmp_path, sizeof(s_active.tmp_path), "%s.part", s_active.final_path);
 
-    s_active.fp = fopen(s_active.tmp_path, "wb");
+    // Resume detection: a direct download's .part file from an earlier
+    // attempt (this session's retry, or picked up fresh from
+    // OFFLINE_RESUME_PATH at startup) is trustworthy exactly as far as its
+    // own size on disk says it is - ask the server to continue from there
+    // instead of re-downloading it. A transcode never resumes (see
+    // is_ext_playable()'s comment) - if a stray .part happens to exist for
+    // one anyway (shouldn't, but be defensive), start clean over it.
+    long existing_size = 0;
+    if (direct) {
+        FILE* probe = fopen(s_active.tmp_path, "rb");
+        if (probe) {
+            fseek(probe, 0, SEEK_END);
+            existing_size = ftell(probe);
+            fclose(probe);
+        }
+    }
+
+    s_active.fp = fopen(s_active.tmp_path, existing_size > 0 ? "ab" : "wb");
     if (!s_active.fp) {
         LOG_ERROR("offline: couldn't open '%s' for writing", s_active.tmp_path);
         return;
@@ -672,17 +900,36 @@ static void start_next_download(void) {
     curl_easy_setopt(s_active.easy, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(s_active.easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(s_active.easy, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
+    if (existing_size > 0) {
+        curl_easy_setopt(s_active.easy, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)existing_size);
+    }
 
     if (!s_dl_multi) s_dl_multi = curl_multi_init();
     curl_multi_add_handle(s_dl_multi, s_active.easy);
 
     s_active.item = item;
     strncpy(s_active.item_ext, ext, sizeof(s_active.item_ext) - 1);
-    s_active.bytes_done = 0;
+    s_active.bytes_done = (size_t)existing_size;
     s_active.bytes_total = 0;
     s_active.valid = true;
 
-    LOG_INFO("offline: downloading '%s' -> %s", item.title, s_active.final_path);
+    if (direct) save_resume_record(&item);
+
+    if (existing_size > 0) {
+        LOG_INFO("offline: resuming '%s' from %ld bytes -> %s", item.title, existing_size, s_active.final_path);
+    } else {
+        LOG_INFO("offline: downloading '%s' -> %s", item.title, s_active.final_path);
+    }
+}
+
+// 5s, 10s, 20s, 40s, 80s, capped at 120s - short enough that a real blip
+// recovers quickly, long enough that a genuinely unreachable server isn't
+// hammered every frame's worth of retries.
+static u64 retry_backoff_ticks(int retry_count) {
+    int shift = retry_count < 5 ? retry_count : 5;
+    double secs = 5.0 * (double)(1 << shift);
+    if (secs > 120.0) secs = 120.0;
+    return (u64)(secs * 268123480.0); // 3DS tick rate - matches the constant already used elsewhere (e.g. audio_player.c)
 }
 
 static void finish_active_download(void) {
@@ -696,7 +943,8 @@ static void finish_active_download(void) {
     }
     long http_code = 0;
     if (s_active.easy) curl_easy_getinfo(s_active.easy, CURLINFO_RESPONSE_CODE, &http_code);
-    ok = ok && http_code == 200 && s_active.bytes_done > 0;
+    // A resumed request answers 206 Partial Content, not 200 - both mean success here.
+    ok = ok && (http_code == 200 || http_code == 206) && s_active.bytes_done > 0;
 
     if (s_active.fp) {
         fclose(s_active.fp);
@@ -720,8 +968,25 @@ static void finish_active_download(void) {
             ok = false;
         }
     } else {
-        LOG_ERROR("offline: download failed for '%s' (http=%ld)", s_active.item.title, http_code);
-        remove(s_active.tmp_path);
+        // Resumable and still under the retry cap: keep the partial file
+        // (and its resume record) and put it back at the front of the
+        // queue instead of losing the progress already made - a dropped
+        // WiFi connection or a momentary server hiccup shouldn't mean
+        // starting a multi-minute FLAC download over from scratch.
+        bool resumable = is_ext_playable(s_active.item_ext) && s_active.bytes_done > 0;
+        if (resumable && s_active.item.retry_count < OFFLINE_MAX_RETRIES) {
+            OfflineQueueItem retry_item = s_active.item;
+            retry_item.retry_count++;
+            retry_item.retry_not_before = svcGetSystemTick() + retry_backoff_ticks(retry_item.retry_count);
+            queue_push_front(&retry_item);
+            LOG_WARN("offline: '%s' failed (http=%ld) - will retry (%d/%d), kept %d bytes",
+                     s_active.item.title, http_code, retry_item.retry_count, OFFLINE_MAX_RETRIES, (int)s_active.bytes_done);
+        } else {
+            remove(s_active.tmp_path);
+            clear_resume_record();
+            LOG_ERROR("offline: giving up on '%s' after %d attempt(s) (http=%ld)",
+                       s_active.item.title, s_active.item.retry_count + 1, http_code);
+        }
     }
 
     if (ok) {
@@ -730,7 +995,8 @@ static void finish_active_download(void) {
         int stored_bitrate = was_direct ? s_active.item.bitrate : 320;
         add_track_manifest_entry(&s_active.item, s_active.item_ext, stored_codec, stored_bitrate,
                                   (long)s_active.bytes_done);
-        maybe_fetch_album_thumb(&s_active.item);
+        request_album_thumb_if_needed(&s_active.item);
+        clear_resume_record();
         save_manifest();
         LOG_INFO("offline: finished '%s' (%d bytes)", s_active.item.title, (int)s_active.bytes_done);
     }
@@ -738,115 +1004,297 @@ static void finish_active_download(void) {
     memset(&s_active, 0, sizeof(s_active));
 }
 
-void offline_cleanup(void) {
-    if (s_active.valid) cancel_active_download();
+// --- Background download thread ----------------------------------------------
+
+// One iteration's worth of work, called with the lock held. Kept separate
+// from dl_thread_func() just so the "what to do this iteration" logic reads
+// linearly without the lock-acquire boilerplate repeated at each step.
+static void dl_thread_tick_locked(void) {
+    if (s_cancel_active_requested) {
+        if (s_active.valid) cancel_active_download(true);
+        s_cancel_active_requested = false;
+    }
+    if (!s_active.valid && s_queue_count > 0) {
+        start_next_download();
+    }
+}
+
+static void dl_thread_func(void* arg) {
+    (void)arg;
+    for (;;) {
+        LightLock_Lock(&s_lock);
+        bool run = s_dl_thread_should_run;
+        dl_thread_tick_locked();
+        CURLM* multi = s_dl_multi;
+        bool active = s_active.valid;
+        LightLock_Unlock(&s_lock);
+
+        if (!run) break;
+
+        if (active && multi) {
+            // The actual (bounded) blocking wait for socket activity - kept
+            // outside the lock so a query from the main thread (e.g. the
+            // Downloads screen reading progress) never waits on network I/O.
+            int numfds = 0;
+            curl_multi_wait(multi, NULL, 0, 200, &numfds);
+
+            LightLock_Lock(&s_lock);
+            if (s_active.valid) { // could have been cancelled while the wait above was unlocked
+                curl_off_t cap = s_network_streaming_hint ? OFFLINE_DL_THROTTLED_BYTES_PER_SEC : 0;
+                curl_easy_setopt(s_active.easy, CURLOPT_MAX_RECV_SPEED_LARGE, cap);
+
+                int running = 0;
+                curl_multi_perform(s_dl_multi, &running);
+
+                if (s_active.bytes_total <= 0 && s_active.easy) {
+                    curl_off_t cl = 0;
+                    if (curl_easy_getinfo(s_active.easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0) {
+                        s_active.bytes_total = cl;
+                    }
+                }
+                if (running == 0) finish_active_download();
+            }
+            LightLock_Unlock(&s_lock);
+        } else {
+            // Nothing to do this round (empty queue, or the front item's
+            // still backing off after a failure) - a short idle poll rather
+            // than spinning.
+            svcSleepThread(200 * 1000 * 1000LL);
+        }
+    }
+
+    // Shutting down (offline_cleanup() asked us to stop and is waiting via
+    // threadJoin()) - pause rather than cancel, so a resumable in-progress
+    // download survives to the next launch instead of restarting.
+    LightLock_Lock(&s_lock);
+    if (s_active.valid) {
+        bool keep_partial = is_ext_playable(s_active.item_ext);
+        cancel_active_download(!keep_partial);
+    }
     if (s_dl_multi) {
         curl_multi_cleanup(s_dl_multi);
         s_dl_multi = NULL;
     }
+    LightLock_Unlock(&s_lock);
+}
+
+void offline_init(void) {
+    LightLock_Init(&s_lock);
+    ensure_dirs();
+    s_num_tracks = 0;
+    s_num_playlists = 0;
+    s_queue_count = 0;
+    memset(&s_active, 0, sizeof(s_active));
+    s_cancel_active_requested = false;
+    s_network_streaming_hint = false;
+    s_pending_thumb_request = false;
+
+    load_manifest();
+
+    // Pick up an interrupted download from a previous run, if there's a
+    // valid resume record and it's not already something we'd otherwise
+    // re-queue (already finished, or somehow already pending).
+    OfflineQueueItem resume_item;
+    if (load_resume_record(&resume_item)) {
+        if (find_track_index(resume_item.rating_key) < 0 && queue_find(resume_item.rating_key) < 0) {
+            queue_push_front(&resume_item);
+            LOG_INFO("offline: will resume interrupted download of '%s'", resume_item.title);
+        } else {
+            clear_resume_record();
+        }
+    }
+
+    LOG_INFO("offline: loaded %d downloaded track(s), %d playlist(s) (%u bytes on disk)",
+             s_num_tracks, s_num_playlists, (unsigned)offline_get_storage_used_bytes());
+
+    s_dl_thread_should_run = true;
+
+    // Give the download thread a lower priority than the main thread so it
+    // never preempts rendering/audio work when the two do end up sharing a
+    // core (always true on Old3DS; true on New3DS too if core 2 isn't
+    // available - see below). Higher numeric value = lower priority.
+    s32 main_prio = 0x30; // libctru's typical main-thread default - used as a fallback if the query itself fails
+    svcGetThreadPriority(&main_prio, CUR_THREAD_HANDLE);
+    int dl_prio = main_prio + 1;
+    if (dl_prio > 0x3F) dl_prio = 0x3F;
+
+    bool is_n3ds = false;
+    APT_CheckNew3DS(&is_n3ds);
+    if (is_n3ds) {
+        // Core 2 is New3DS-exclusive and needs an exheader capability bit
+        // this app may or may not have (see thread.h's threadCreate() doc
+        // comment) - if it's not granted, this just returns NULL and the
+        // fallback below still gets a real background thread, just sharing
+        // a core with everything else instead of running on a free one.
+        s_dl_thread = threadCreate(dl_thread_func, NULL, OFFLINE_DL_THREAD_STACK_SIZE, dl_prio, 2, false);
+    }
+    if (!s_dl_thread) {
+        s_dl_thread = threadCreate(dl_thread_func, NULL, OFFLINE_DL_THREAD_STACK_SIZE, dl_prio, -2, false);
+    }
+    if (!s_dl_thread) {
+        LOG_ERROR("offline: failed to create the background download thread - downloads are disabled this session");
+        s_dl_thread_should_run = false;
+    } else {
+        LOG_INFO("offline: download thread started (%s)", is_n3ds ? "New3DS" : "Old3DS");
+    }
+}
+
+void offline_set_network_streaming_hint(bool is_streaming) {
+    s_network_streaming_hint = is_streaming;
 }
 
 void offline_update(void) {
-    if (s_active.valid) {
-        // Re-checked every pump (cheap - just a curl_easy_setopt()) rather
-        // than only once at download start, so throttling engages/lifts
-        // within a frame of playback actually starting/stopping, not just
-        // whenever the next download happens to begin.
-        curl_off_t cap = audio_player_is_streaming_over_network() ? OFFLINE_DL_THROTTLED_BYTES_PER_SEC : 0;
-        curl_easy_setopt(s_active.easy, CURLOPT_MAX_RECV_SPEED_LARGE, cap);
+    // The only main-thread-side follow-up work left after moving the actual
+    // transfer to the background thread - see request_album_thumb_if_needed().
+    bool have_request = false;
+    char url[PLEX_MAX_URL] = "";
+    char path[512] = "";
 
-        int running = 0;
-        curl_multi_perform(s_dl_multi, &running);
+    LightLock_Lock(&s_lock);
+    if (s_pending_thumb_request) {
+        strncpy(url, s_pending_thumb_url, sizeof(url) - 1);
+        strncpy(path, s_pending_thumb_path, sizeof(path) - 1);
+        s_pending_thumb_request = false;
+        have_request = true;
+    }
+    LightLock_Unlock(&s_lock);
 
-        if (s_active.bytes_total <= 0 && s_active.easy) {
-            curl_off_t cl = 0;
-            if (curl_easy_getinfo(s_active.easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0) {
-                s_active.bytes_total = cl;
+    if (have_request) {
+        u8* data = NULL;
+        size_t size = 0;
+        if (plex_api_get_album_art(url, &data, &size) && data && size > 0) {
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                fwrite(data, 1, size, f);
+                fclose(f);
             }
         }
-
-        if (running == 0) finish_active_download();
-        return;
+        if (data) free(data);
     }
+}
 
-    if (s_queue_count > 0) start_next_download();
+void offline_cleanup(void) {
+    LightLock_Lock(&s_lock);
+    s_dl_thread_should_run = false;
+    LightLock_Unlock(&s_lock);
+
+    if (s_dl_thread) {
+        threadJoin(s_dl_thread, U64_MAX);
+        threadFree(s_dl_thread);
+        s_dl_thread = NULL;
+    }
 }
 
 void offline_get_download_status(OfflineDownloadStatus* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
-    out->queue_remaining = s_queue_count;
-    if (!s_active.valid) return;
 
-    out->active = true;
-    strncpy(out->title, s_active.item.title, sizeof(out->title) - 1);
-    strncpy(out->artist_title, s_active.item.artist_title, sizeof(out->artist_title) - 1);
-    out->bytes_done = s_active.bytes_done;
-    out->bytes_total = s_active.bytes_total > 0 ? (size_t)s_active.bytes_total : 0;
+    LightLock_Lock(&s_lock);
+    out->queue_remaining = s_queue_count;
+    if (s_active.valid) {
+        out->active = true;
+        strncpy(out->title, s_active.item.title, sizeof(out->title) - 1);
+        strncpy(out->artist_title, s_active.item.artist_title, sizeof(out->artist_title) - 1);
+        out->bytes_done = s_active.bytes_done;
+        out->bytes_total = s_active.bytes_total > 0 ? (size_t)s_active.bytes_total : 0;
+    }
+    LightLock_Unlock(&s_lock);
 }
 
 // --- Querying what's on disk -------------------------------------------------
 
 bool offline_track_is_downloaded(const char* rating_key) {
-    return find_track_index(rating_key) >= 0;
+    LightLock_Lock(&s_lock);
+    bool result = find_track_index(rating_key) >= 0;
+    LightLock_Unlock(&s_lock);
+    return result;
 }
 
 bool offline_artist_has_any_downloaded(const char* artist_rating_key) {
     if (!artist_rating_key || !artist_rating_key[0]) return false;
+    LightLock_Lock(&s_lock);
+    bool found = false;
     for (int i = 0; i < s_num_tracks; i++) {
-        if (strcmp(artist_identity(&s_tracks[i]), artist_rating_key) == 0) return true;
+        if (strcmp(artist_identity(&s_tracks[i]), artist_rating_key) == 0) { found = true; break; }
     }
-    return false;
+    LightLock_Unlock(&s_lock);
+    return found;
 }
 
 bool offline_playlist_has_any_downloaded(const char* playlist_rating_key) {
+    LightLock_Lock(&s_lock);
+    bool found = false;
     int pi = find_playlist_index(playlist_rating_key);
-    if (pi < 0) return false;
-    OfflinePlaylistEntry* p = &s_playlists[pi];
-    for (int i = 0; i < p->track_count; i++) {
-        if (find_track_index(p->track_keys[i]) >= 0) return true;
+    if (pi >= 0) {
+        OfflinePlaylistEntry* p = &s_playlists[pi];
+        for (int i = 0; i < p->track_count; i++) {
+            if (find_track_index(p->track_keys[i]) >= 0) { found = true; break; }
+        }
     }
-    return false;
+    LightLock_Unlock(&s_lock);
+    return found;
 }
 
 bool offline_get_track_playback_url(const char* rating_key, char* url_out, size_t url_max) {
+    LightLock_Lock(&s_lock);
     int ti = find_track_index(rating_key);
-    if (ti < 0) return false;
-    char path[512];
-    track_file_path(s_tracks[ti].rating_key, s_tracks[ti].ext, path, sizeof(path));
-    snprintf(url_out, url_max, "file://%s", path);
-    return true;
+    bool ok = ti >= 0;
+    if (ok) {
+        char path[512];
+        track_file_path(s_tracks[ti].rating_key, s_tracks[ti].ext, path, sizeof(path));
+        snprintf(url_out, url_max, "file://%s", path);
+    }
+    LightLock_Unlock(&s_lock);
+    return ok;
 }
 
 bool offline_get_thumb_path(const char* rating_key, char* path_out, size_t path_max) {
+    LightLock_Lock(&s_lock);
     int ti = find_track_index(rating_key);
-    if (ti < 0) return false;
-    const char* aid = album_identity(&s_tracks[ti]);
-    if (!aid[0]) return false;
-
-    char path[512];
-    album_thumb_path(aid, path, sizeof(path));
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fclose(f);
-
-    strncpy(path_out, path, path_max - 1);
-    path_out[path_max - 1] = '\0';
-    return true;
+    bool ok = false;
+    if (ti >= 0) {
+        const char* aid = album_identity(&s_tracks[ti]);
+        if (aid[0]) {
+            char path[512];
+            album_thumb_path(aid, path, sizeof(path));
+            FILE* f = fopen(path, "rb");
+            if (f) {
+                fclose(f);
+                strncpy(path_out, path, path_max - 1);
+                path_out[path_max - 1] = '\0';
+                ok = true;
+            }
+        }
+    }
+    LightLock_Unlock(&s_lock);
+    return ok;
 }
 
 size_t offline_get_storage_used_bytes(void) {
+    LightLock_Lock(&s_lock);
     size_t total = 0;
     for (int i = 0; i < s_num_tracks; i++) {
         if (s_tracks[i].file_size > 0) total += (size_t)s_tracks[i].file_size;
     }
+    LightLock_Unlock(&s_lock);
     return total;
 }
 
-int offline_get_track_count(void) { return s_num_tracks; }
-int offline_get_playlist_count(void) { return s_num_playlists; }
+int offline_get_track_count(void) {
+    LightLock_Lock(&s_lock);
+    int n = s_num_tracks;
+    LightLock_Unlock(&s_lock);
+    return n;
+}
+int offline_get_playlist_count(void) {
+    LightLock_Lock(&s_lock);
+    int n = s_num_playlists;
+    LightLock_Unlock(&s_lock);
+    return n;
+}
 
 int offline_get_artist_count(void) {
+    LightLock_Lock(&s_lock);
     const char* seen[OFFLINE_MAX_TRACKS];
     int n = 0;
     for (int i = 0; i < s_num_tracks; i++) {
@@ -858,10 +1306,12 @@ int offline_get_artist_count(void) {
         }
         if (!dup) seen[n++] = id;
     }
+    LightLock_Unlock(&s_lock);
     return n;
 }
 
 int offline_get_album_count(void) {
+    LightLock_Lock(&s_lock);
     const char* seen[OFFLINE_MAX_TRACKS];
     int n = 0;
     for (int i = 0; i < s_num_tracks; i++) {
@@ -873,6 +1323,7 @@ int offline_get_album_count(void) {
         }
         if (!dup) seen[n++] = id;
     }
+    LightLock_Unlock(&s_lock);
     return n;
 }
 
@@ -893,6 +1344,7 @@ static int cmp_track_index(const void* a, const void* b) {
 
 int offline_get_artists(PlexArtist* out, int max) {
     if (!out || max <= 0) return 0;
+    LightLock_Lock(&s_lock);
     int n = 0;
     for (int i = 0; i < s_num_tracks && n < max; i++) {
         const char* id = artist_identity(&s_tracks[i]);
@@ -910,12 +1362,14 @@ int offline_get_artists(PlexArtist* out, int max) {
         strncpy(out[n].title, title, sizeof(out[n].title) - 1);
         n++;
     }
+    LightLock_Unlock(&s_lock);
     qsort(out, n, sizeof(PlexArtist), cmp_artist_title);
     return n;
 }
 
 int offline_get_albums(const char* artist_rating_key, PlexAlbum* out, int max) {
     if (!out || max <= 0 || !artist_rating_key) return 0;
+    LightLock_Lock(&s_lock);
     int n = 0;
     for (int i = 0; i < s_num_tracks && n < max; i++) {
         OfflineTrackEntry* e = &s_tracks[i];
@@ -944,12 +1398,14 @@ int offline_get_albums(const char* artist_rating_key, PlexAlbum* out, int max) {
         }
         out[i].leaf_count = count;
     }
+    LightLock_Unlock(&s_lock);
     qsort(out, n, sizeof(PlexAlbum), cmp_album_title);
     return n;
 }
 
 int offline_get_tracks_for_album(const char* album_rating_key, PlexTrack* out, int max) {
     if (!out || max <= 0 || !album_rating_key) return 0;
+    LightLock_Lock(&s_lock);
     int n = 0;
     for (int i = 0; i < s_num_tracks && n < max; i++) {
         OfflineTrackEntry* e = &s_tracks[i];
@@ -957,12 +1413,14 @@ int offline_get_tracks_for_album(const char* album_rating_key, PlexTrack* out, i
         fill_plex_track_from_entry(e, &out[n]);
         n++;
     }
+    LightLock_Unlock(&s_lock);
     qsort(out, n, sizeof(PlexTrack), cmp_track_index);
     return n;
 }
 
 int offline_get_playlists(PlexPlaylist* out, int max) {
     if (!out || max <= 0) return 0;
+    LightLock_Lock(&s_lock);
     int n = s_num_playlists < max ? s_num_playlists : max;
     for (int i = 0; i < n; i++) {
         OfflinePlaylistEntry* p = &s_playlists[i];
@@ -979,23 +1437,26 @@ int offline_get_playlists(PlexPlaylist* out, int max) {
         }
         out[i].duration = duration;
     }
+    LightLock_Unlock(&s_lock);
     qsort(out, n, sizeof(PlexPlaylist), cmp_playlist_title);
     return n;
 }
 
 int offline_get_tracks_for_playlist(const char* playlist_rating_key, PlexTrack* out, int max) {
     if (!out || max <= 0) return 0;
-    int pi = find_playlist_index(playlist_rating_key);
-    if (pi < 0) return 0;
-
-    OfflinePlaylistEntry* p = &s_playlists[pi];
+    LightLock_Lock(&s_lock);
     int n = 0;
-    for (int i = 0; i < p->track_count && n < max; i++) {
-        int ti = find_track_index(p->track_keys[i]);
-        if (ti < 0) continue; // deleted independently since this playlist was downloaded - just skip it
-        fill_plex_track_from_entry(&s_tracks[ti], &out[n]);
-        n++;
+    int pi = find_playlist_index(playlist_rating_key);
+    if (pi >= 0) {
+        OfflinePlaylistEntry* p = &s_playlists[pi];
+        for (int i = 0; i < p->track_count && n < max; i++) {
+            int ti = find_track_index(p->track_keys[i]);
+            if (ti < 0) continue; // deleted independently since this playlist was downloaded - just skip it
+            fill_plex_track_from_entry(&s_tracks[ti], &out[n]);
+            n++;
+        }
     }
+    LightLock_Unlock(&s_lock);
     return n;
 }
 
@@ -1055,10 +1516,13 @@ static bool queue_item_matches_artist(const OfflineQueueItem* q, const char* id)
     return qid[0] && strcmp(qid, id) == 0;
 }
 
-// Drops any not-yet-downloaded queue entries (and cancels the in-flight
-// transfer, if it's one of them) matching `id` per `match` - so deleting an
-// album/artist/track also stops it from reappearing a moment later once its
-// still-pending download completes.
+// Drops any not-yet-downloaded queue entries matching `id` per `match`, and
+// requests cancellation of the in-flight transfer if it's one of them (see
+// the module comment on why this is a request the download thread itself
+// carries out, rather than this function - running on the main thread -
+// touching curl objects directly) - so deleting an album/artist/track also
+// stops it from reappearing a moment later once its still-pending download
+// completes.
 static void purge_queue_and_active(bool (*match)(const OfflineQueueItem*, const char*), const char* id) {
     int i = 0;
     while (i < s_queue_count) {
@@ -1070,19 +1534,22 @@ static void purge_queue_and_active(bool (*match)(const OfflineQueueItem*, const 
         }
     }
     if (s_active.valid && match(&s_active.item, id)) {
-        cancel_active_download();
+        s_cancel_active_requested = true;
     }
 }
 
 void offline_delete_track(const char* rating_key) {
     if (!rating_key || !rating_key[0]) return;
+    LightLock_Lock(&s_lock);
     purge_queue_and_active(queue_item_matches_rating_key, rating_key);
     release_track_ref(rating_key);
     save_manifest();
+    LightLock_Unlock(&s_lock);
 }
 
 void offline_delete_album(const char* album_rating_key) {
     if (!album_rating_key || !album_rating_key[0]) return;
+    LightLock_Lock(&s_lock);
     purge_queue_and_active(queue_item_matches_album, album_rating_key);
 
     // release_track_ref() only removes the matched entry (via swap-with-last,
@@ -1104,10 +1571,12 @@ void offline_delete_album(const char* album_rating_key) {
         }
     }
     save_manifest();
+    LightLock_Unlock(&s_lock);
 }
 
 void offline_delete_artist(const char* artist_rating_key) {
     if (!artist_rating_key || !artist_rating_key[0]) return;
+    LightLock_Lock(&s_lock);
     purge_queue_and_active(queue_item_matches_artist, artist_rating_key);
 
     // See offline_delete_album()'s comment on why `i` only advances when
@@ -1124,32 +1593,57 @@ void offline_delete_artist(const char* artist_rating_key) {
         }
     }
     save_manifest();
+    LightLock_Unlock(&s_lock);
 }
 
 void offline_delete_playlist(const char* playlist_rating_key) {
+    LightLock_Lock(&s_lock);
     int pi = find_playlist_index(playlist_rating_key);
-    if (pi < 0) return;
+    if (pi >= 0) {
+        OfflinePlaylistEntry p = s_playlists[pi]; // copy - the array below gets reshuffled
+        int last = s_num_playlists - 1;
+        if (pi != last) s_playlists[pi] = s_playlists[last];
+        s_num_playlists--;
 
-    OfflinePlaylistEntry p = s_playlists[pi]; // copy - the array below gets reshuffled
-    int last = s_num_playlists - 1;
-    if (pi != last) s_playlists[pi] = s_playlists[last];
-    s_num_playlists--;
-
-    for (int i = 0; i < p.track_count; i++) {
-        release_track_ref(p.track_keys[i]);
+        for (int i = 0; i < p.track_count; i++) {
+            release_track_ref(p.track_keys[i]);
+        }
+        save_manifest();
     }
-    save_manifest();
+    LightLock_Unlock(&s_lock);
 }
 
 void offline_delete_all(void) {
+    LightLock_Lock(&s_lock);
     s_queue_count = 0;
-    if (s_active.valid) cancel_active_download();
+    bool need_cancel = s_active.valid;
+    if (need_cancel) s_cancel_active_requested = true;
+    LightLock_Unlock(&s_lock);
 
+    if (need_cancel) {
+        // Bounded wait for the download thread to actually release the
+        // active transfer's file/curl handles before wiping the tracks/
+        // directory below out from under it - see purge_queue_and_active()'s
+        // comment on why a single-item delete doesn't need this (no such
+        // race there - a track that's still downloading was never added to
+        // the manifest, so there's no completed file for it to collide
+        // with), but a full directory wipe does.
+        for (int waited_ms = 0; waited_ms < 1000; waited_ms += 20) {
+            LightLock_Lock(&s_lock);
+            bool still_active = s_active.valid;
+            LightLock_Unlock(&s_lock);
+            if (!still_active) break;
+            svcSleepThread(20 * 1000 * 1000LL);
+        }
+    }
+
+    LightLock_Lock(&s_lock);
     remove_all_files_in_dir(OFFLINE_TRACKS_DIR);
     remove_all_files_in_dir(OFFLINE_THUMBS_DIR);
-
+    clear_resume_record();
     s_num_tracks = 0;
     s_num_playlists = 0;
     save_manifest();
     LOG_INFO("offline: deleted all downloads");
+    LightLock_Unlock(&s_lock);
 }

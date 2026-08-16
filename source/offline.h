@@ -6,26 +6,50 @@
 #include "plex_api.h"
 
 // Everything offline.c stores on the SD card lives under here: downloaded
-// audio in tracks/, one cached thumbnail per album in thumbs/, and a JSON
+// audio in tracks/, one cached thumbnail per album in thumbs/, a JSON
 // manifest recording what's been downloaded (and each track's reference
-// count - see offline_queue_tracks()) so it survives a relaunch.
+// count - see offline_queue_tracks()) so it survives a relaunch, and (not
+// exposed here - purely an implementation detail) a small resume record for
+// whichever download was in progress, so an app close or network drop
+// mid-download picks back up instead of starting over.
 #define OFFLINE_DIR          "/3ds/dualplex/offline"
 #define OFFLINE_TRACKS_DIR   "/3ds/dualplex/offline/tracks"
 #define OFFLINE_THUMBS_DIR   "/3ds/dualplex/offline/thumbs"
 #define OFFLINE_MANIFEST_PATH "/3ds/dualplex/offline/library.json"
 
 // Must be called once at startup (after logger_init(), before any other
-// offline_* call) - loads the on-disk manifest into memory.
+// offline_* call, on the main thread) - loads the on-disk manifest, picks up
+// an interrupted download left over from a previous run if there is one
+// (see the module comment at the top of offline.c), and spawns the
+// background thread that actually pumps downloads - pinned to core 2 on
+// New3DS (falls back to sharing a core with everything else if that's not
+// available, same as Old3DS), so a download in progress no longer costs the
+// main thread/render loop anything.
 void offline_init(void);
 
-// Pump the background download engine. Call every frame regardless of
-// screen, same pattern as audio_player_update()/plex_api_*_async_update() -
-// downloads happen in the background one track at a time.
+// Call every frame on the main thread regardless of screen, same pattern as
+// audio_player_update()/plex_api_*_async_update(). The actual download
+// transfer runs entirely on the background thread now (see offline_init()) -
+// this just services the rare bits of download-completion follow-up that
+// still have to happen on the main thread (currently: fetching a newly-
+// downloaded album's cover art, since that goes through plex_api.c's
+// blocking-call helper, which pumps audio_player_update() internally and so
+// must run on the same thread as everything else that touches NDSP).
 void offline_update(void);
 
-// Aborts any in-flight download (closing/discarding its partial file) so a
-// quit mid-download doesn't leak the curl handle - call once at shutdown,
-// before curl_global_cleanup().
+// Publishes whether audio_player.c is currently streaming a track over the
+// network, for the background download thread to read (see
+// audio_player_is_streaming_over_network()) - call every frame on the main
+// thread, right after audio_player_update(). Kept as a plain published flag
+// rather than having the download thread call into audio_player.c directly,
+// since audio_player.c's own state is main-thread-only otherwise.
+void offline_set_network_streaming_hint(bool is_streaming);
+
+// Stops the background download thread and waits for it to actually exit -
+// call once at shutdown, on the main thread, before curl_global_cleanup().
+// A download that was still in progress is left exactly where it was (not
+// cancelled) if it's resumable, so it picks back up on the next launch
+// instead of starting over - see offline_init().
 void offline_cleanup(void);
 
 // --- Queueing downloads -----------------------------------------------------
