@@ -157,7 +157,9 @@ int main(int argc, char* argv[]) {
         // Update
         audio_player_update();
         offline_set_network_streaming_hint(audio_player_is_streaming_over_network()); // for the download thread's bandwidth throttle - see offline.h
-        offline_update(); // main-thread-side download follow-up (cover art) - see offline.h; the transfer itself runs on its own background thread
+        // No offline_*_update() call needed here - downloads run entirely on
+        // their own background thread now (see offline_init()), with
+        // nothing left that has to be pumped from the main loop.
         ui_update(kDown, kHeld, touch);
         
         // Render

@@ -27,16 +27,6 @@
 // main thread/render loop anything.
 void offline_init(void);
 
-// Call every frame on the main thread regardless of screen, same pattern as
-// audio_player_update()/plex_api_*_async_update(). The actual download
-// transfer runs entirely on the background thread now (see offline_init()) -
-// this just services the rare bits of download-completion follow-up that
-// still have to happen on the main thread (currently: fetching a newly-
-// downloaded album's cover art, since that goes through plex_api.c's
-// blocking-call helper, which pumps audio_player_update() internally and so
-// must run on the same thread as everything else that touches NDSP).
-void offline_update(void);
-
 // Publishes whether audio_player.c is currently streaming a track over the
 // network, for the background download thread to read (see
 // audio_player_is_streaming_over_network()) - call every frame on the main

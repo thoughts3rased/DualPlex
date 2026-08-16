@@ -182,13 +182,6 @@ static volatile bool s_cancel_active_requested = false;
 // regardless, so the download thread has no other way to ask it directly.
 static volatile bool s_network_streaming_hint = false;
 
-// Download thread -> main thread: "please fetch this album's cover art" -
-// see request_album_thumb_if_needed()/offline_update()'s comment on why the
-// actual fetch can't happen on the download thread itself.
-static bool s_pending_thumb_request = false;
-static char s_pending_thumb_url[PLEX_MAX_URL] = "";
-static char s_pending_thumb_path[512] = "";
-
 static Thread s_dl_thread = NULL;
 static volatile bool s_dl_thread_should_run = false;
 
@@ -344,7 +337,23 @@ static void save_manifest(void) {
     cJSON_AddItemToObject(root, "playlists", playlists);
 
     char* text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
     if (text) {
+        // The actual SD card write is the slow part - drop the lock around
+        // it (reacquiring before returning, since every caller of this
+        // function - always from within an already-locked section - keeps
+        // going afterward assuming it still holds it) so the main thread's
+        // frequent, otherwise-quick queries (offline_get_download_status()
+        // et al, called every frame for the top-bar/Downloads-screen
+        // progress display) aren't blocked behind a full manifest rewrite
+        // on every single track completion. Safe: `text` is already a
+        // complete, self-contained snapshot built from s_tracks/s_playlists
+        // above - nothing below touches them again, so a concurrent change
+        // on the other thread during the unlock window just means this
+        // particular write reflects a moment-old snapshot, corrected by
+        // whichever save_manifest() call that same change already triggers.
+        LightLock_Unlock(&s_lock);
         FILE* f = fopen(OFFLINE_MANIFEST_PATH, "w");
         if (f) {
             fputs(text, f);
@@ -352,9 +361,9 @@ static void save_manifest(void) {
         } else {
             LOG_ERROR("offline: failed to write manifest at %s", OFFLINE_MANIFEST_PATH);
         }
+        LightLock_Lock(&s_lock);
         cJSON_free(text);
     }
-    cJSON_Delete(root);
 }
 
 static void load_manifest(void) {
@@ -478,15 +487,22 @@ static void save_resume_record(const OfflineQueueItem* item) {
     cJSON_AddNumberToObject(o, "duration", item->duration);
 
     char* text = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+
     if (text) {
+        // Same reasoning as save_manifest()'s unlock/relock around the
+        // actual write - doubly safe here even, since `item` is always a
+        // by-value local copy at every call site, not a pointer into
+        // s_queue/s_active that a concurrent change could invalidate.
+        LightLock_Unlock(&s_lock);
         FILE* f = fopen(OFFLINE_RESUME_PATH, "w");
         if (f) {
             fputs(text, f);
             fclose(f);
         }
+        LightLock_Lock(&s_lock);
         cJSON_free(text);
     }
-    cJSON_Delete(o);
 }
 
 static void clear_resume_record(void) {
@@ -610,7 +626,15 @@ static void save_queue(void) {
     cJSON* arr = cJSON_CreateArray();
     for (int i = 0; i < s_queue_count; i++) queue_item_to_json(arr, &s_queue[i]);
     char* text = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+
     if (text) {
+        // Same reasoning as save_manifest()'s identical unlock/relock around
+        // the actual write - this one matters even more in practice, since
+        // it fires on every single track that starts *or* finishes
+        // downloading (see start_next_download()/finish_active_download()),
+        // not just on completion.
+        LightLock_Unlock(&s_lock);
         FILE* f = fopen(OFFLINE_QUEUE_PATH, "w");
         if (f) {
             fputs(text, f);
@@ -618,9 +642,9 @@ static void save_queue(void) {
         } else {
             LOG_ERROR("offline: failed to write queue at %s", OFFLINE_QUEUE_PATH);
         }
+        LightLock_Lock(&s_lock);
         cJSON_free(text);
     }
-    cJSON_Delete(arr);
 }
 
 // Forward-declared - defined further down with the rest of the queue
@@ -898,17 +922,99 @@ static void add_track_manifest_entry(const OfflineQueueItem* q, const char* ext,
     e->ref_count += 1;
 }
 
-// Flags this track's album for a cover-art fetch next time offline_update()
-// runs on the main thread, if it isn't already cached - see the module
-// comment on why the download thread can't just do this fetch itself
-// (plex_api_get_album_art() blocks via a helper that pumps
-// audio_player_update(), which must stay on the main thread). Only one
-// request is kept in flight at a time; a second album finishing before the
-// main thread services the first just skips its own thumbnail this round
-// (cheap, cosmetic-only, and picked up next time that album's tracks are
-// touched by a fresh download anyway).
-static void request_album_thumb_if_needed(const OfflineQueueItem* item) {
-    if (!item->thumb[0] || s_pending_thumb_request) return;
+// Growable-buffer write callback for fetch_album_art_bytes() below - same
+// shape as the equivalent callbacks in plex_api.c/album_art.c, just a local
+// copy so this file doesn't need to reach into either of theirs.
+typedef struct {
+    char* data;
+    size_t size;
+    size_t capacity;
+} ThumbBuf;
+
+static size_t thumb_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    ThumbBuf* buf = (ThumbBuf*)userdata;
+    size_t total = size * nmemb;
+    if (buf->size + total + 1 > buf->capacity) {
+        size_t new_cap = buf->capacity ? buf->capacity * 2 : 16384;
+        while (new_cap < buf->size + total + 1) new_cap *= 2;
+        char* p = (char*)realloc(buf->data, new_cap);
+        if (!p) return 0;
+        buf->data = p;
+        buf->capacity = new_cap;
+    }
+    memcpy(buf->data + buf->size, ptr, total);
+    buf->size += total;
+    buf->data[buf->size] = '\0';
+    return total;
+}
+
+// Fetches an album thumbnail's raw image bytes - the same URL-building
+// plex_api_get_album_art() does, deliberately not reusing it directly: that
+// function (like every other blocking call in plex_api.c) goes through a
+// helper that pumps audio_player_update() while it waits, since it's meant
+// to be called from the main thread without starving NDSP. This runs on the
+// download thread instead (see maybe_cache_album_thumb() below), where a
+// plain blocking curl_easy_perform() is exactly right - the main thread
+// keeps pumping its own audio_player_update() independently regardless of
+// how long this takes, since the two no longer share a thread at all.
+static bool fetch_album_art_bytes(const char* thumb_path, u8** out_data, size_t* out_size) {
+    *out_data = NULL;
+    *out_size = 0;
+    const char* server_url = plex_api_get_server_url();
+    if (!thumb_path || !thumb_path[0] || !server_url || !server_url[0]) return false;
+
+    char url[1024];
+    if (thumb_path[0] == '/') {
+        snprintf(url, sizeof(url), "%s%s", server_url, thumb_path);
+    } else {
+        snprintf(url, sizeof(url), "%s/photo/:/transcode?width=128&height=128&minSize=1&url=/library/metadata/%s",
+                 server_url, thumb_path);
+    }
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    ThumbBuf buf = {0};
+    struct curl_slist* headers = NULL;
+    const char* token = plex_api_get_token();
+    if (token && token[0]) {
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr), "X-Plex-Token: %s", token);
+        headers = curl_slist_append(headers, hdr);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, thumb_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res == CURLE_OK && http_code == 200 && buf.data && buf.size > 0) {
+        *out_data = (u8*)buf.data;
+        *out_size = buf.size;
+        return true;
+    }
+    if (buf.data) free(buf.data);
+    return false;
+}
+
+// Caches this track's album's cover art if it isn't already cached - called
+// from the download thread (with the lock held, like everything else on
+// it), same idea as save_manifest()/save_queue(): the actual network fetch
+// is the slow part, so the lock is dropped around just that (item is always
+// a by-value copy at every call site, so nothing about it can be
+// invalidated by a concurrent change during the unlock window).
+static void maybe_cache_album_thumb(const OfflineQueueItem* item) {
+    if (!item->thumb[0]) return;
     const char* album_id = item->album_rating_key[0] ? item->album_rating_key
                           : (item->album_title[0] ? item->album_title : item->rating_key);
 
@@ -921,9 +1027,24 @@ static void request_album_thumb_if_needed(const OfflineQueueItem* item) {
         return;
     }
 
-    strncpy(s_pending_thumb_url, item->thumb, sizeof(s_pending_thumb_url) - 1);
-    strncpy(s_pending_thumb_path, path, sizeof(s_pending_thumb_path) - 1);
-    s_pending_thumb_request = true;
+    char thumb_url[PLEX_MAX_URL];
+    strncpy(thumb_url, item->thumb, sizeof(thumb_url) - 1);
+    thumb_url[sizeof(thumb_url) - 1] = '\0';
+
+    LightLock_Unlock(&s_lock);
+    u8* data = NULL;
+    size_t size = 0;
+    bool ok = fetch_album_art_bytes(thumb_url, &data, &size);
+    LightLock_Lock(&s_lock);
+
+    if (ok && data && size > 0) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fwrite(data, 1, size, f);
+            fclose(f);
+        }
+    }
+    if (data) free(data);
 }
 
 // Tears down whatever the active transfer's curl/file handles are.
@@ -1152,7 +1273,7 @@ static void finish_active_download(void) {
         int stored_bitrate = was_direct ? s_active.item.bitrate : 320;
         add_track_manifest_entry(&s_active.item, s_active.item_ext, stored_codec, stored_bitrate,
                                   (long)s_active.bytes_done);
-        request_album_thumb_if_needed(&s_active.item);
+        maybe_cache_album_thumb(&s_active.item);
         clear_resume_record();
         save_manifest();
         LOG_INFO("offline: finished '%s' (%d bytes)", s_active.item.title, (int)s_active.bytes_done);
@@ -1244,7 +1365,6 @@ void offline_init(void) {
     memset(&s_active, 0, sizeof(s_active));
     s_cancel_active_requested = false;
     s_network_streaming_hint = false;
-    s_pending_thumb_request = false;
 
     load_manifest();
 
@@ -1304,36 +1424,6 @@ void offline_init(void) {
 
 void offline_set_network_streaming_hint(bool is_streaming) {
     s_network_streaming_hint = is_streaming;
-}
-
-void offline_update(void) {
-    // The only main-thread-side follow-up work left after moving the actual
-    // transfer to the background thread - see request_album_thumb_if_needed().
-    bool have_request = false;
-    char url[PLEX_MAX_URL] = "";
-    char path[512] = "";
-
-    LightLock_Lock(&s_lock);
-    if (s_pending_thumb_request) {
-        strncpy(url, s_pending_thumb_url, sizeof(url) - 1);
-        strncpy(path, s_pending_thumb_path, sizeof(path) - 1);
-        s_pending_thumb_request = false;
-        have_request = true;
-    }
-    LightLock_Unlock(&s_lock);
-
-    if (have_request) {
-        u8* data = NULL;
-        size_t size = 0;
-        if (plex_api_get_album_art(url, &data, &size) && data && size > 0) {
-            FILE* f = fopen(path, "wb");
-            if (f) {
-                fwrite(data, 1, size, f);
-                fclose(f);
-            }
-        }
-        if (data) free(data);
-    }
 }
 
 void offline_cleanup(void) {
