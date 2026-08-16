@@ -218,21 +218,21 @@ endef
 	@echo $(notdir $<)
 	$(eval CURBIN := $*.shbin)
 	$(eval DESSION := $(CURBIN:.shbin=.shbin.o))
-	$(DEVKITARM)/bin/picasso -o $(CURBIN) $^
+	picasso -o $(CURBIN) $^
 	bin2s -H $*_shbin.h $(CURBIN) | $(AS) -o $(DESSION)
 
 %.shbin.o %_shbin.h : %.v.pica
 	@echo $(notdir $<)
 	$(eval CURBIN := $*.shbin)
 	$(eval DESSION := $(CURBIN:.shbin=.shbin.o))
-	$(DEVKITARM)/bin/picasso -o $(CURBIN) $<
+	picasso -o $(CURBIN) $<
 	bin2s -H $*_shbin.h $(CURBIN) | $(AS) -o $(DESSION)
 
 %.shbin.o %_shbin.h : %.shlist
 	@echo $(notdir $<)
 	$(eval CURBIN := $*.shbin)
 	$(eval DESSION := $(CURBIN:.shbin=.shbin.o))
-	$(DEVKITARM)/bin/picasso -o $(CURBIN) $<
+	picasso -o $(CURBIN) $<
 	bin2s -H $*_shbin.h $(CURBIN) | $(AS) -o $(DESSION)
 
 $(GFXBUILD)/%.t3x : %.t3s
