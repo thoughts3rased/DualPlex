@@ -40,7 +40,9 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
   bandwidth while a track is actively streaming so it doesn't compete with (and stutter)
   playback. An interrupted download (closing the app, or a dropped connection) picks back up
   from where it left off rather than starting over, as long as the source file didn't need
-  transcoding. `Settings > Downloads` browses what's saved
+  transcoding; the rest of the queue survives too - closing the app mid-way through downloading
+  a big playlist picks up right where it left off next launch instead of losing whatever hadn't
+  started yet. `Settings > Downloads` browses what's saved
   (the same Artists/Albums/Tracks/Playlists screens as online, just backed by the SD card),
   shows the current download's progress, and deletes a single track/album/artist/playlist
   (same context menu, now offering "Delete from Downloads") or everything at once. The Auth

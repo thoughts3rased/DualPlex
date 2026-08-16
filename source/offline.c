@@ -46,11 +46,13 @@
 // Capacities. Kept in the same ballpark as PLEX_MAX_ITEMS (the cap used
 // throughout the rest of the app for library lists) rather than trying to
 // support an unbounded local library - this is a "save some favorites for a
-// trip" cache, not a full mirror of a Plex server.
-#define OFFLINE_MAX_TRACKS 500
+// trip" cache, not a full mirror of a Plex server. The download queue
+// (s_queue) is the one exception - it grows dynamically (see queue_ensure_
+// capacity()) rather than being capped at all, after a 200+ track playlist
+// download turned out to silently lose everything past a fixed 150-item cap.
+#define OFFLINE_MAX_TRACKS 1000
 #define OFFLINE_MAX_PLAYLISTS 30
-#define OFFLINE_PLAYLIST_MAX_TRACKS 100
-#define OFFLINE_MAX_QUEUE 150
+#define OFFLINE_PLAYLIST_MAX_TRACKS 500
 
 // Caps the active download's transfer rate while audio_player.c is actively
 // streaming a track over the network (see dl_thread_func()) - otherwise the
@@ -72,6 +74,7 @@
 #define OFFLINE_MAX_RETRIES 5
 
 #define OFFLINE_RESUME_PATH "/3ds/dualplex/offline/resume.json"
+#define OFFLINE_QUEUE_PATH "/3ds/dualplex/offline/queue.json"
 
 // 64KB - generous headroom for curl + cJSON manifest (de)serialization on
 // the background download thread (see offline_init()).
@@ -154,8 +157,13 @@ static int s_num_tracks = 0;
 static OfflinePlaylistEntry s_playlists[OFFLINE_MAX_PLAYLISTS];
 static int s_num_playlists = 0;
 
-static OfflineQueueItem s_queue[OFFLINE_MAX_QUEUE];
+// Grows as needed (see queue_ensure_capacity()) rather than being a fixed-
+// size array - persisted to OFFLINE_QUEUE_PATH (see save_queue()/load_queue())
+// so anything still waiting to download survives an app restart too, not
+// just the one item actively in progress (see OFFLINE_RESUME_PATH).
+static OfflineQueueItem* s_queue = NULL;
 static int s_queue_count = 0;
+static int s_queue_capacity = 0;
 
 static CURLM* s_dl_multi = NULL;
 static ActiveDownload s_active = {0};
@@ -539,9 +547,152 @@ static bool load_resume_record(OfflineQueueItem* out_item) {
     return out_item->rating_key[0] != '\0' && out_item->part_key[0] != '\0';
 }
 
+// --- Queue persistence (OFFLINE_QUEUE_PATH) -----------------------------
+// The full pending queue (everything not yet started - see
+// OFFLINE_RESUME_PATH for the one item actively in progress), so closing
+// the app - or it crashing - doesn't lose a big batch of still-queued
+// downloads, only whichever one hadn't started yet loses its head start.
+// Same field set as the resume record and the same reasoning for not
+// persisting retry_count/retry_not_before (a restart is a fresh set of
+// attempts) - kept as separate near-duplicate code rather than factored
+// together since a queue is an *array* of these and a resume record is a
+// single one; sharing a helper would cost more in indirection than it saves.
+
+static void queue_item_to_json(cJSON* arr, const OfflineQueueItem* item) {
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "rating_key", item->rating_key);
+    cJSON_AddStringToObject(o, "title", item->title);
+    cJSON_AddStringToObject(o, "artist_title", item->artist_title);
+    cJSON_AddStringToObject(o, "album_title", item->album_title);
+    cJSON_AddStringToObject(o, "artist_rating_key", item->artist_rating_key);
+    cJSON_AddStringToObject(o, "album_rating_key", item->album_rating_key);
+    cJSON_AddStringToObject(o, "part_key", item->part_key);
+    cJSON_AddStringToObject(o, "thumb", item->thumb);
+    cJSON_AddStringToObject(o, "audio_codec", item->audio_codec);
+    cJSON_AddNumberToObject(o, "bitrate", item->bitrate);
+    cJSON_AddNumberToObject(o, "sampling_rate", item->sampling_rate);
+    cJSON_AddNumberToObject(o, "bit_depth", item->bit_depth);
+    cJSON_AddNumberToObject(o, "index", item->index);
+    cJSON_AddNumberToObject(o, "duration", item->duration);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void queue_item_from_json(cJSON* item, OfflineQueueItem* out) {
+    memset(out, 0, sizeof(*out));
+#define GETSTR(dst, jkey) do { \
+        cJSON* _j = cJSON_GetObjectItem(item, jkey); \
+        if (_j && cJSON_IsString(_j)) strncpy(dst, _j->valuestring, sizeof(dst) - 1); \
+    } while (0)
+#define GETINT(dst, jkey) do { \
+        cJSON* _j = cJSON_GetObjectItem(item, jkey); \
+        if (_j && cJSON_IsNumber(_j)) dst = _j->valueint; \
+    } while (0)
+    GETSTR(out->rating_key, "rating_key");
+    GETSTR(out->title, "title");
+    GETSTR(out->artist_title, "artist_title");
+    GETSTR(out->album_title, "album_title");
+    GETSTR(out->artist_rating_key, "artist_rating_key");
+    GETSTR(out->album_rating_key, "album_rating_key");
+    GETSTR(out->part_key, "part_key");
+    GETSTR(out->thumb, "thumb");
+    GETSTR(out->audio_codec, "audio_codec");
+    GETINT(out->bitrate, "bitrate");
+    GETINT(out->sampling_rate, "sampling_rate");
+    GETINT(out->bit_depth, "bit_depth");
+    GETINT(out->index, "index");
+    GETINT(out->duration, "duration");
+#undef GETSTR
+#undef GETINT
+}
+
+static void save_queue(void) {
+    ensure_dirs();
+    cJSON* arr = cJSON_CreateArray();
+    for (int i = 0; i < s_queue_count; i++) queue_item_to_json(arr, &s_queue[i]);
+    char* text = cJSON_PrintUnformatted(arr);
+    if (text) {
+        FILE* f = fopen(OFFLINE_QUEUE_PATH, "w");
+        if (f) {
+            fputs(text, f);
+            fclose(f);
+        } else {
+            LOG_ERROR("offline: failed to write queue at %s", OFFLINE_QUEUE_PATH);
+        }
+        cJSON_free(text);
+    }
+    cJSON_Delete(arr);
+}
+
+// Forward-declared - defined further down with the rest of the queue
+// mutators, but load_queue() (called from offline_init(), before any of
+// those exist yet in file order) needs to push what it reads through the
+// same capacity-growing path they use.
+static void queue_push_front(const OfflineQueueItem* item);
+
+static void load_queue(void) {
+    FILE* f = fopen(OFFLINE_QUEUE_PATH, "r");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return;
+    }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON* root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        LOG_WARN("offline: queue at %s failed to parse - starting empty", OFFLINE_QUEUE_PATH);
+        return;
+    }
+    if (cJSON_IsArray(root)) {
+        // Appended in order via repeated queue_push_front() calls would
+        // reverse it, so build it back to front instead - the net result
+        // is the same relative order it was saved in.
+        int n = cJSON_GetArraySize(root);
+        for (int i = n - 1; i >= 0; i--) {
+            OfflineQueueItem qi;
+            queue_item_from_json(cJSON_GetArrayItem(root, i), &qi);
+            if (qi.rating_key[0] && qi.part_key[0]) queue_push_front(&qi);
+        }
+        LOG_INFO("offline: restored %d queued download(s) from a previous session", s_queue_count);
+    }
+    cJSON_Delete(root);
+}
+
 // --- Queueing ----------------------------------------------------------------
 
+// Grows s_queue (realloc) so it can hold at least `min_capacity` items - the
+// download queue has no fixed cap (unlike the rest of this file's arrays;
+// see the capacities comment up top) since a large playlist download is
+// exactly the kind of thing that needs more room than any fixed guess would
+// give it. Failure (out of memory) just leaves the array as it was; callers
+// re-check s_queue_count < s_queue_capacity before writing into it.
+static void queue_ensure_capacity(int min_capacity) {
+    if (s_queue_capacity >= min_capacity) return;
+    int new_cap = s_queue_capacity > 0 ? s_queue_capacity * 2 : 64;
+    while (new_cap < min_capacity) new_cap *= 2;
+    OfflineQueueItem* new_arr = (OfflineQueueItem*)realloc(s_queue, (size_t)new_cap * sizeof(OfflineQueueItem));
+    if (!new_arr) {
+        LOG_ERROR("offline: out of memory growing the download queue to %d entries", new_cap);
+        return;
+    }
+    s_queue = new_arr;
+    s_queue_capacity = new_cap;
+}
+
 static void queue_push(const PlexTrack* t) {
+    queue_ensure_capacity(s_queue_count + 1);
+    if (s_queue_count >= s_queue_capacity) return; // out of memory - see queue_ensure_capacity()
     OfflineQueueItem* q = &s_queue[s_queue_count++];
     memset(q, 0, sizeof(*q));
     strncpy(q->rating_key, t->rating_key, sizeof(q->rating_key) - 1);
@@ -562,12 +713,12 @@ static void queue_push(const PlexTrack* t) {
 
 // Pushes `item` to the FRONT of the queue - used for a retry (keep making
 // progress on the thing that's already partway done before starting
-// something new) and for the resume record picked up at startup (same
-// reasoning). Silently drops it if the queue's already full; vanishingly
-// unlikely (OFFLINE_MAX_QUEUE is generous) and not worth failing louder for.
+// something new), for the resume record picked up at startup, and by
+// load_queue() (same reasoning as the resume record for all three).
 static void queue_push_front(const OfflineQueueItem* item) {
-    if (s_queue_count >= OFFLINE_MAX_QUEUE) {
-        LOG_WARN("offline: download queue full (%d) - dropping retry of '%s'", OFFLINE_MAX_QUEUE, item->title);
+    queue_ensure_capacity(s_queue_count + 1);
+    if (s_queue_count >= s_queue_capacity) {
+        LOG_ERROR("offline: out of memory - dropping '%s'", item->title);
         return;
     }
     memmove(&s_queue[1], &s_queue[0], (size_t)s_queue_count * sizeof(OfflineQueueItem));
@@ -578,7 +729,9 @@ static void queue_push_front(const OfflineQueueItem* item) {
 // Actual implementation of offline_queue_tracks() - assumes the lock is
 // already held, so offline_queue_playlist() below can call this directly
 // instead of going through the public, lock-acquiring offline_queue_tracks()
-// (LightLock isn't recursive - see the module comment).
+// (LightLock isn't recursive - see the module comment). Persists the queue
+// itself (not just the manifest) when anything was actually added - see
+// OFFLINE_QUEUE_PATH.
 static int queue_tracks_locked(const PlexTrack* tracks, int count) {
     if (!tracks || count <= 0) return 0;
     int newly_queued = 0;
@@ -599,15 +752,12 @@ static int queue_tracks_locked(const PlexTrack* tracks, int count) {
         // still pending doesn't bump anything further.
         if (queue_find(t->rating_key) >= 0) continue;
 
-        if (s_queue_count >= OFFLINE_MAX_QUEUE) {
-            LOG_WARN("offline: download queue full (%d) - dropping '%s'", OFFLINE_MAX_QUEUE, t->title);
-            continue;
-        }
         queue_push(t);
         newly_queued++;
     }
 
     if (dirty) save_manifest();
+    if (newly_queued > 0) save_queue();
     return newly_queued;
 }
 
@@ -641,6 +791,11 @@ int offline_queue_playlist(const char* playlist_rating_key, const char* playlist
     strncpy(p->rating_key, playlist_rating_key, sizeof(p->rating_key) - 1);
     strncpy(p->title, playlist_title ? playlist_title : "", sizeof(p->title) - 1);
     int n = count < OFFLINE_PLAYLIST_MAX_TRACKS ? count : OFFLINE_PLAYLIST_MAX_TRACKS;
+    if (count > OFFLINE_PLAYLIST_MAX_TRACKS) {
+        LOG_WARN("offline: playlist '%s' has %d tracks, only remembering the first %d as part of it "
+                 "(all %d still get downloaded/counted individually)",
+                 playlist_title ? playlist_title : "?", count, OFFLINE_PLAYLIST_MAX_TRACKS, count);
+    }
     for (int i = 0; i < n; i++) {
         if (!tracks[i].rating_key[0]) continue;
         strncpy(p->track_keys[p->track_count], tracks[i].rating_key, sizeof(p->track_keys[0]) - 1);
@@ -818,6 +973,7 @@ static void start_next_download(void) {
     OfflineQueueItem item = s_queue[idx];
     memmove(&s_queue[idx], &s_queue[idx + 1], (size_t)(s_queue_count - 1 - idx) * sizeof(OfflineQueueItem));
     s_queue_count--;
+    save_queue(); // reflect the pop on disk regardless of what happens to `item` next - see OFFLINE_QUEUE_PATH
 
     // May have become redundant while it was waiting its turn (queued twice
     // via two different calls before either one started downloading).
@@ -979,6 +1135,7 @@ static void finish_active_download(void) {
             retry_item.retry_count++;
             retry_item.retry_not_before = svcGetSystemTick() + retry_backoff_ticks(retry_item.retry_count);
             queue_push_front(&retry_item);
+            save_queue();
             LOG_WARN("offline: '%s' failed (http=%ld) - will retry (%d/%d), kept %d bytes",
                      s_active.item.title, http_code, retry_item.retry_count, OFFLINE_MAX_RETRIES, (int)s_active.bytes_done);
         } else {
@@ -1091,9 +1248,15 @@ void offline_init(void) {
 
     load_manifest();
 
+    // Restore whatever was still queued (not yet started) from a previous
+    // session - see OFFLINE_QUEUE_PATH.
+    load_queue();
+
     // Pick up an interrupted download from a previous run, if there's a
     // valid resume record and it's not already something we'd otherwise
-    // re-queue (already finished, or somehow already pending).
+    // re-queue (already finished, or somehow already pending - e.g.
+    // load_queue() just restored it too, since it was both still queued
+    // *and* the one actively in progress when the app last closed).
     OfflineQueueItem resume_item;
     if (load_resume_record(&resume_item)) {
         if (find_track_index(resume_item.rating_key) < 0 && queue_find(resume_item.rating_key) < 0) {
@@ -1104,8 +1267,8 @@ void offline_init(void) {
         }
     }
 
-    LOG_INFO("offline: loaded %d downloaded track(s), %d playlist(s) (%u bytes on disk)",
-             s_num_tracks, s_num_playlists, (unsigned)offline_get_storage_used_bytes());
+    LOG_INFO("offline: loaded %d downloaded track(s), %d playlist(s) (%u bytes on disk), %d queued",
+             s_num_tracks, s_num_playlists, (unsigned)offline_get_storage_used_bytes(), s_queue_count);
 
     s_dl_thread_should_run = true;
 
@@ -1183,6 +1346,11 @@ void offline_cleanup(void) {
         threadFree(s_dl_thread);
         s_dl_thread = NULL;
     }
+
+    // The thread's fully stopped now - safe to free without the lock.
+    free(s_queue);
+    s_queue = NULL;
+    s_queue_capacity = 0;
 }
 
 void offline_get_download_status(OfflineDownloadStatus* out) {
@@ -1524,15 +1692,19 @@ static bool queue_item_matches_artist(const OfflineQueueItem* q, const char* id)
 // stops it from reappearing a moment later once its still-pending download
 // completes.
 static void purge_queue_and_active(bool (*match)(const OfflineQueueItem*, const char*), const char* id) {
+    int removed = 0;
     int i = 0;
     while (i < s_queue_count) {
         if (match(&s_queue[i], id)) {
             memmove(&s_queue[i], &s_queue[i + 1], (size_t)(s_queue_count - 1 - i) * sizeof(OfflineQueueItem));
             s_queue_count--;
+            removed++;
         } else {
             i++;
         }
     }
+    if (removed > 0) save_queue(); // keep OFFLINE_QUEUE_PATH from resurrecting deleted items on next launch
+
     if (s_active.valid && match(&s_active.item, id)) {
         s_cancel_active_requested = true;
     }
@@ -1641,6 +1813,7 @@ void offline_delete_all(void) {
     remove_all_files_in_dir(OFFLINE_TRACKS_DIR);
     remove_all_files_in_dir(OFFLINE_THUMBS_DIR);
     clear_resume_record();
+    save_queue(); // s_queue_count was already zeroed above - persist the now-empty queue
     s_num_tracks = 0;
     s_num_playlists = 0;
     save_manifest();
