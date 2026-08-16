@@ -195,28 +195,6 @@ int plex_api_get_albums(const char* artist_key, PlexAlbum* out, int max);
 int plex_api_get_tracks_page(const char* album_key, PlexTrack* out, int start, int count, int* out_total);
 int plex_api_get_tracks(const char* album_key, PlexTrack* out, int max);
 
-// Non-blocking fetch of the remaining tracks in an album/playlist, for
-// completing a playback queue that was only partially loaded (e.g. the user
-// pressed play before scrolling far enough to lazy-load the rest of a long
-// playlist). Starts a background request for `count` tracks starting at
-// `start` from `key` (same key/start/count semantics as
-// plex_api_get_tracks_page() above, just non-blocking) - a new call replaces
-// any fetch still in flight, so callers should also call
-// plex_api_queue_fill_async_cancel() when navigating away from the list the
-// in-flight fetch belongs to (e.g. before overwriting `out` with a different
-// list) to avoid a stale response landing in the wrong array.
-//
-// Pump every frame with plex_api_queue_fill_async_update(). Once
-// plex_api_queue_fill_async_is_done() is true, call
-// plex_api_queue_fill_async_take_result() to write the fetched tracks
-// directly into `out` at their absolute index (out[start..start+n)) and get
-// the count actually fetched (0 on failure).
-void plex_api_queue_fill_async_start(const char* key, int start, int count);
-void plex_api_queue_fill_async_cancel(void);
-void plex_api_queue_fill_async_update(void);
-bool plex_api_queue_fill_async_is_done(void);
-int plex_api_queue_fill_async_take_result(PlexTrack* out, int max);
-
 // Get playlists in account/server.
 int plex_api_get_playlists(PlexPlaylist* out, int max);
 

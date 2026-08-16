@@ -1472,34 +1472,9 @@ static UIScreen nav_pop(UIScreen fallback) {
     return fallback;
 }
 
-// Kicks off a background fetch of whatever tracks weren't loaded by the
-// initial page for the album/playlist just opened, so play_track()'s notion
-// of "the queue" (s_tracks/s_num_tracks) ends up complete even if playback
-// starts before the user scrolls far enough to lazy-load the rest. Always
-// cancels any fetch already in flight first, so a stale response left over
-// from whatever list was open before this one can never land in s_tracks
-// after it's been overwritten with a different list.
-static void start_queue_fill_if_needed(void) {
-    plex_api_queue_fill_async_cancel();
-    int remaining = s_total_items - s_loaded_items;
-    int capacity = PLEX_MAX_ITEMS - s_loaded_items;
-    if (remaining > capacity) remaining = capacity;
-    if (remaining > 0) {
-        plex_api_queue_fill_async_start(s_active_key, s_loaded_items, remaining);
-    }
-}
-
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     album_art_update();
     plex_api_timeline_async_update();
-    plex_api_queue_fill_async_update();
-    if (plex_api_queue_fill_async_is_done()) {
-        int fetched = plex_api_queue_fill_async_take_result(s_tracks, PLEX_MAX_ITEMS);
-        if (fetched > 0) {
-            s_num_tracks += fetched;
-            s_loaded_items = s_num_tracks;
-        }
-    }
     plex_api_lyrics_async_update();
     if (plex_api_lyrics_async_is_done()) {
         s_num_lyrics = plex_api_lyrics_async_take_result(s_lyrics, PLEX_MAX_LYRICS);
@@ -2116,7 +2091,6 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 char query[128] = "";
                 if (show_keyboard("Search Music Tracks", query, sizeof(query)) && query[0] != '\0') {
                     strncpy(s_current_title, "Search Results", PLEX_MAX_STR);
-                    plex_api_queue_fill_async_cancel(); // these fetch everything in one go - drop any fill still chasing a previously opened album/playlist
                     s_total_items = 0;
                     s_num_tracks = plex_api_search_tracks(query, s_tracks, PLEX_MAX_ITEMS);
                     s_loaded_items = s_num_tracks;
@@ -2125,7 +2099,6 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 }
             } else if (s_selected_idx == 3) { // Recently Added
                 strncpy(s_current_title, "Recently Added Tracks", PLEX_MAX_STR);
-                plex_api_queue_fill_async_cancel();
                 s_total_items = 0;
                 s_num_tracks = plex_api_get_recently_added(s_tracks, PLEX_MAX_ITEMS);
                 s_loaded_items = s_num_tracks;
@@ -2334,13 +2307,17 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         } else if (s_screen == SCREEN_ALBUMS && s_list_count > 0 && s_selected_idx < s_num_albums) {
             strncpy(s_current_title, s_albums[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_albums[s_selected_idx].key, PLEX_MAX_URL);
-            plex_api_queue_fill_async_cancel();
             s_total_items = 0;
             if (s_offline_browse) {
                 s_num_tracks = offline_get_tracks_for_album(s_active_key, s_tracks, PLEX_MAX_ITEMS);
             } else {
-                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
-                start_queue_fill_if_needed();
+                // Load the whole album in one request rather than paging it
+                // in and backfilling the rest with a background fetch - that
+                // background fetch shared curl/network resources with
+                // downloads, lyrics and the currently-playing track, and
+                // under load from all three at once it could stall
+                // indefinitely, leaving "Loading..." rows on screen forever.
+                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_MAX_ITEMS, &s_total_items);
             }
             s_loaded_items = s_num_tracks;
             nav_push(SCREEN_ALBUMS);
@@ -2353,14 +2330,15 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0) {
             strncpy(s_current_title, s_playlists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_playlists[s_selected_idx].key, PLEX_MAX_URL);
-            plex_api_queue_fill_async_cancel();
             s_total_items = 0;
             if (s_playlists_from_cache) s_offline_browse = true; // see the analogous SCREEN_ARTISTS case above
             if (s_offline_browse) {
                 s_num_tracks = offline_get_tracks_for_playlist(s_active_key, s_tracks, PLEX_MAX_ITEMS);
             } else {
-                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
-                start_queue_fill_if_needed();
+                // Load the whole playlist in one request - see the matching
+                // comment in the SCREEN_ALBUMS case above for why this isn't
+                // paged/backgrounded anymore.
+                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_MAX_ITEMS, &s_total_items);
             }
             s_loaded_items = s_num_tracks;
             nav_push(SCREEN_PLAYLISTS);
@@ -2371,9 +2349,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
 
     // Continuous Scrolling Lazy Loading Trigger (Artists/Albums only - Tracks
-    // screens now fetch the rest of the list in the background as soon as
-    // they're opened, via start_queue_fill_if_needed(), so the queue is
-    // complete whether or not the user ever scrolls to the bottom)
+    // screens load the whole album/playlist up front when opened, so the
+    // queue is always complete whether or not the user ever scrolls to the
+    // bottom)
     if ((s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS) && !s_is_lazy_loading) {
         int current_count = (s_screen == SCREEN_ARTISTS) ? s_num_artists : s_num_albums;
         if (current_count < s_total_items && s_selected_idx >= current_count - 5) {
