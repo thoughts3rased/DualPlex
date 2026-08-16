@@ -61,6 +61,13 @@ void offline_get_download_status(OfflineDownloadStatus* out);
 // --- Querying what's on disk -------------------------------------------------
 bool offline_track_is_downloaded(const char* rating_key);
 
+// Whether ANY track under this artist/playlist has been downloaded - used
+// to grey out an otherwise-unavailable-offline entry in a cached library
+// listing (see library_cache.h) rather than requiring it to be *fully*
+// downloaded before it's shown as accessible at all.
+bool offline_artist_has_any_downloaded(const char* artist_rating_key);
+bool offline_playlist_has_any_downloaded(const char* playlist_rating_key);
+
 // Builds the "file://<sdmc path>" URL audio_player_load_url()/
 // audio_player_start_crossfade() accept for offline playback (see
 // audio_player.c's Deck.is_local handling). Returns false if the track

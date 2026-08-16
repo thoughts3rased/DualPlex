@@ -771,6 +771,24 @@ bool offline_track_is_downloaded(const char* rating_key) {
     return find_track_index(rating_key) >= 0;
 }
 
+bool offline_artist_has_any_downloaded(const char* artist_rating_key) {
+    if (!artist_rating_key || !artist_rating_key[0]) return false;
+    for (int i = 0; i < s_num_tracks; i++) {
+        if (strcmp(artist_identity(&s_tracks[i]), artist_rating_key) == 0) return true;
+    }
+    return false;
+}
+
+bool offline_playlist_has_any_downloaded(const char* playlist_rating_key) {
+    int pi = find_playlist_index(playlist_rating_key);
+    if (pi < 0) return false;
+    OfflinePlaylistEntry* p = &s_playlists[pi];
+    for (int i = 0; i < p->track_count; i++) {
+        if (find_track_index(p->track_keys[i]) >= 0) return true;
+    }
+    return false;
+}
+
 bool offline_get_track_playback_url(const char* rating_key, char* url_out, size_t url_max) {
     int ti = find_track_index(rating_key);
     if (ti < 0) return false;

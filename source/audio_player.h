@@ -56,6 +56,17 @@ int audio_player_get_position_ms(void);
 // Set the expected duration (from Plex metadata, in ms) of the active deck.
 void audio_player_set_duration(int duration_ms);
 
+// Seeks the active deck to target_ms in place, without reloading/reopening
+// anything - only valid for a local (offline.c downloaded) deck, i.e. one
+// loaded via a "file://" URL (see audio_player_load_url()) - a network deck
+// has no such in-place seek and must instead be reloaded from a new URL at
+// the desired offset (see plex_api_get_seek_url() and
+// audio_player_set_position_offset_ms() below, which is how the UI already
+// handles seeking for online playback). Returns false (leaving playback
+// untouched) if the active deck isn't local, isn't playing anything, is
+// mid-crossfade, or the underlying codec seek failed.
+bool audio_player_seek_local_ms(int target_ms);
+
 // Offsets the value audio_player_get_position_ms() reports for the active
 // deck, without touching decoded-sample tracking. Used after a seek: the
 // reloaded stream always starts decoding from sample 0, so this is how the

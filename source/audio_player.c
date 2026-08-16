@@ -79,6 +79,8 @@ typedef struct {
     // difference.
     bool is_local;
     FILE* local_fp;
+    size_t local_file_size;  // total bytes in the local file - 0 until deck_start_stream() opens one; used by deck_flac_seek_proc() to reject an out-of-range seek
+    size_t local_stream_pos; // bytes handed to the decoder so far, i.e. drflac's notion of "current position" (deck_flac_tell_proc()/deck_flac_seek_proc()) - only meaningful for a local FLAC deck
     char current_url[PLEX_MAX_URL];
     int duration_ms;
     int samples_played;
@@ -327,22 +329,61 @@ static size_t deck_flac_read_proc(void* pUserData, void* pBufferOut, size_t byte
         }
     }
 
+    if (d->is_local) d->local_stream_pos += total_read;
     return total_read;
 }
 
-/* Seek stub for drflac — HTTP streams are not seekable, so always return failure. */
+/* Seek proc for drflac. HTTP streams still aren't seekable (no local_fp) -
+ * always fails, same as before. For a local (offline.c downloaded) file,
+ * real seeking is straightforward since the file itself supports it: move
+ * local_fp to the target byte position and throw away whatever's sitting in
+ * the ring buffer, since none of it corresponds to the new position anymore
+ * - deck_flac_read_proc()'s local branch (deck_local_pump()) will refill it
+ * starting from exactly there on the next read. Used both by an explicit
+ * user-driven seek (audio_player_seek_local_ms()) and internally by dr_flac
+ * itself while opening the stream (drflac_open() seeks around to read
+ * metadata blocks before playback ever starts).
+ *
+ * Per drflac_seek_proc's contract: `offset` is never negative, SEEK_CUR
+ * means "move forward from the current position by offset" (not backward -
+ * a seek to an earlier position always comes in as SEEK_SET with an
+ * absolute target instead), and seeking from the end of the stream doesn't
+ * need to be supported (dr_flac never actually relies on it, since it always
+ * knows the exact PCM-frame-to-byte mapping it wants well before calling
+ * this). dr_flac may also ask for a position past EOF while probing where a
+ * given PCM frame landed - local_file_size bounds that so it's rejected
+ * cleanly instead of leaving the file cursor past the end. */
 static drflac_bool32 deck_flac_seek_proc(void* pUserData, int offset, drflac_seek_origin origin) {
-    (void)pUserData;
-    (void)offset;
-    (void)origin;
-    return DRFLAC_FALSE;
+    Deck* d = (Deck*)pUserData;
+    if (!d->is_local || !d->local_fp) return DRFLAC_FALSE;
+
+    long target;
+    if (origin == DRFLAC_SEEK_SET) {
+        target = offset;
+    } else if (origin == DRFLAC_SEEK_CUR) {
+        target = (long)d->local_stream_pos + offset;
+    } else {
+        return DRFLAC_FALSE; // DRFLAC_SEEK_END - unsupported, per this callback's own documented fallback
+    }
+    if (target < 0 || (d->local_file_size > 0 && (size_t)target > d->local_file_size)) return DRFLAC_FALSE;
+    if (fseek(d->local_fp, target, SEEK_SET) != 0) return DRFLAC_FALSE;
+
+    d->ring.read_pos = d->ring.write_pos = 0;
+    d->ring.total_downloaded = (size_t)target;
+    d->ring.download_finished = false;
+    d->ring.download_error = false;
+    d->local_stream_pos = (size_t)target;
+    return DRFLAC_TRUE;
 }
 
-/* Tell stub for drflac — not meaningful for an HTTP stream, but drflac needs a non-NULL callback. */
+/* Tell proc for drflac - mirrors deck_flac_seek_proc(): only meaningful (and
+ * only ever called by dr_flac) for a local deck, where local_stream_pos is
+ * kept up to date by both deck_flac_read_proc() and deck_flac_seek_proc(). */
 static drflac_bool32 deck_flac_tell_proc(void* pUserData, drflac_int64* pCursor) {
-    (void)pUserData;
-    (void)pCursor;
-    return DRFLAC_FALSE;
+    Deck* d = (Deck*)pUserData;
+    if (!d->is_local) return DRFLAC_FALSE;
+    *pCursor = (drflac_int64)d->local_stream_pos;
+    return DRFLAC_TRUE;
 }
 
 static void deck_apply_volume(Deck* d) {
@@ -449,6 +490,11 @@ static bool deck_start_stream(Deck* d, const char* url) {
             return false;
         }
         d->is_local = true;
+        d->local_stream_pos = 0;
+        fseek(d->local_fp, 0, SEEK_END);
+        long size = ftell(d->local_fp);
+        fseek(d->local_fp, 0, SEEK_SET);
+        d->local_file_size = size > 0 ? (size_t)size : 0; // used by deck_flac_seek_proc() to bound-check a seek target
     } else {
         d->curl_easy = curl_easy_init();
         if (!d->curl_easy) {
@@ -1038,6 +1084,58 @@ void audio_player_set_duration(int duration_ms) {
 
 void audio_player_set_position_offset_ms(int offset_ms) {
     s_decks[s_active_deck].position_offset_ms = offset_ms;
+}
+
+// Real in-place seek within the active deck's already-open local file - see
+// audio_player.h for when this applies (local decks only) vs. the online
+// reload-from-a-new-URL approach.
+bool audio_player_seek_local_ms(int target_ms) {
+    Deck* d = &s_decks[s_active_deck];
+    if (!d->active || !d->is_local || s_crossfade_active) return false;
+    if (target_ms < 0) target_ms = 0;
+
+    bool ok = false;
+    int new_samples_played = 0;
+
+    if (d->codec == CODEC_FLAC && d->flac) {
+        drflac_uint64 target_frame = (drflac_uint64)(((double)target_ms / 1000.0) * d->flac->sampleRate);
+        if (drflac_seek_to_pcm_frame(d->flac, target_frame) == DRFLAC_TRUE) {
+            ok = true;
+            new_samples_played = (int)target_frame;
+        }
+    } else if (d->codec == CODEC_MP3 && d->mpg && d->local_fp) {
+        // mpg123_feedseek() is the feed-mode counterpart to mpg123_seek():
+        // it doesn't touch any input itself, just works out where in the
+        // (feed-mode) compressed stream the caller needs to resume feeding
+        // from to land on `target_sample` - so this deck's own file handle
+        // still has to be moved there manually, same idea as the FLAC path's
+        // seek_proc doing it. AUDIO_SAMPLE_RATE, not d->decode_sample_rate:
+        // MP3 is always decoded to the fixed AUDIO_SAMPLE_RATE (see
+        // mpg123_format() in deck_init_static()).
+        off_t target_sample = (off_t)(((double)target_ms / 1000.0) * AUDIO_SAMPLE_RATE);
+        off_t input_offset = 0;
+        if (mpg123_feedseek(d->mpg, target_sample, SEEK_SET, &input_offset) >= 0 &&
+            fseek(d->local_fp, (long)input_offset, SEEK_SET) == 0) {
+            d->ring.read_pos = d->ring.write_pos = 0;
+            d->ring.total_downloaded = (size_t)input_offset;
+            d->ring.download_finished = false;
+            d->ring.download_error = false;
+            ok = true;
+            new_samples_played = (int)target_sample;
+        }
+    }
+
+    if (ok) {
+        d->samples_played = new_samples_played;
+        // Whatever was already decoded and queued from before the seek is
+        // now the wrong audio - clear it so playback resumes exactly at the
+        // new position instead of finishing out a few stale pre-seek buffers
+        // first (audible as a brief "wrong spot" glitch right after seeking).
+        ndspChnWaveBufClear(d->ndsp_channel);
+        for (int i = 0; i < AUDIO_NUM_WAVE_BUFS; i++) d->wave_bufs[i].status = NDSP_WBUF_DONE;
+        d->initial_buffering = true;
+    }
+    return ok;
 }
 
 int audio_player_get_visualizer_samples(s16* out, int max_samples) {

@@ -31,18 +31,24 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
 - Star ratings - tap a star on the Now Playing Controls screen to rate the current track;
   it's saved back to your Plex library
 - **Offline downloads**: save songs, whole albums, whole artists, or whole playlists to the
-  SD card (`X` on their list screen) for playback with no server connection at all. A
+  SD card - open the context menu (**START**) on their row in Artists/Albums/Tracks/Playlists
+  and choose "Download for Offline Play" - for playback with no server connection at all. A
   background queue downloads them one at a time - original quality when the source is
   already FLAC/MP3, transcoded down to MP3 otherwise so it's guaranteed playable - along
   with one shared album-art thumbnail per album. `Hub > Downloads` browses what's saved
   (the same Artists/Albums/Tracks/Playlists screens as online, just backed by the SD card),
   shows the current download's progress, and deletes a single track/album/artist/playlist
-  (`X` again) or everything at once. The Auth Choice screen's "Continue Offline" option jumps
-  straight to the Hub with no sign-in needed, for playing an already-stocked library with no
-  WiFi at all. Offline playback keeps shuffle, repeat, the play queue, and crossfading (as a
-  plain fixed-length fade - no Sonic Analysis data available offline); it doesn't support
-  seeking (tapping the progress bar is a no-op) or lyrics/star-rating sync, which need a
-  server connection.
+  (same context menu, now offering "Delete from Downloads") or everything at once. The Auth
+  Choice screen's "Continue Offline" option jumps straight to the Hub with no sign-in needed,
+  for playing an already-stocked library with no WiFi at all. Offline playback supports
+  seeking (a real in-place seek within the downloaded file, not a server round-trip), shuffle,
+  repeat, the play queue, and crossfading (as a plain fixed-length fade - no Sonic Analysis
+  data available offline); lyrics, star-rating sync, and live timeline reporting still need a
+  server connection, so those are skipped while playing back a downloaded track.
+- **Offline-aware browsing**: if the Artists or Playlists list can't be fetched live (no
+  connection), the last-seen list is shown from a small on-SD cache instead of coming up
+  empty, with anything not actually downloaded greyed out and unselectable - same idea as
+  how other music apps keep your library visible, just not playable, while offline.
 - Shuffle and repeat (off/all/one), previous/next, and seek by tapping the progress bar
 - Playback keeps going with the 3DS lid closed instead of being suspended
 - On-screen live log viewer for troubleshooting
@@ -86,8 +92,9 @@ auth_token=YOUR_PLEX_TOKEN
 ```
 
 Downloaded tracks (see Offline downloads, above) live under `/3ds/dualplex/offline/` on the
-SD card - `tracks/` for the audio files, `thumbs/` for cached album art, and `library.json`
-recording what's been saved.
+SD card - `tracks/` for the audio files, `thumbs/` for cached album art, `library.json`
+recording what's been saved, and `browse_cache.json` holding the small library snapshot
+that backs the greyed-out offline browsing described above.
 
 ## Controls
 - **A**: Select / Play / Pause
@@ -97,9 +104,10 @@ recording what's been saved.
 - **SELECT**: Jump to the Now Playing Controls screen (press again to return)
 - **L/R**: Cycle the top screen between Now Playing, Lyrics, and Visualizer views
 - **L+R together**: Toggle the live log viewer
-- **X**: Change visualizer style (while the Visualizer view is active); on the Artists/Albums/
-  Tracks/Playlists screens this instead downloads the selected item for offline play, or - while
-  browsing `Hub > Downloads` - deletes it
+- **X**: Change visualizer style (while the Visualizer view is active)
+- **START**: On the Artists/Albums/Tracks/Playlists screens, opens a context menu for the
+  selected row - "Download for Offline Play" while browsing the live server, or "Delete from
+  Downloads" while browsing `Hub > Downloads`
 - **New 3DS C-Stick up/down**: Navigate lists
 - **New 3DS C-Stick left/right**: Toggle shuffle / cycle repeat mode (off → all → one)
 - **New 3DS ZL/ZR**: Previous / next track

@@ -3,6 +3,7 @@
 #include "audio_player.h"
 #include "album_art.h"
 #include "offline.h"
+#include "library_cache.h"
 #include "logger.h"
 #include "iconfont_bin.h" // bundled Font Awesome Free icon font (SIL OFL 1.1, see licenses/fontawesome-LICENSE.txt), embedded via bin2s from data/iconfont.bin
 
@@ -36,6 +37,14 @@
 #define LIST_VISIBLE_ITEMS 6  // items visible on bottom screen
 #define LIST_START_Y 44       // below the header
 
+// Context menu overlay geometry (see s_show_context_menu) - shared between
+// its input hit-testing and its rendering so the two can't drift apart.
+#define CTX_MENU_X 20
+#define CTX_MENU_W (BTM_WIDTH - 40)
+#define CTX_MENU_ACTION_Y 96
+#define CTX_MENU_CANCEL_Y 132
+#define CTX_MENU_ROW_H 32
+
 // Static state
 static UIScreen s_screen = SCREEN_SETUP;
 static C2D_TextBuf s_text_buf;
@@ -67,6 +76,22 @@ static bool s_need_load_libraries = false;
 // (see ui_set_screen()'s SCREEN_HUB case) so a later online browse never
 // inherits it by accident.
 static bool s_offline_browse = false;
+
+// True when s_playlists/s_artists is showing library_cache.h's last-known
+// snapshot because the live fetch that would normally populate it failed
+// (no connection) rather than the server's actual current list - drives the
+// "greyed out" treatment in draw_list_item() for whichever of those cached
+// entries aren't actually downloaded (so unplayable right now), and blocks
+// drilling into one of those from the KEY_A handling below. Always false
+// while s_offline_browse is true (Hub > Downloads already only ever shows
+// what's genuinely downloaded, nothing needs graying out there).
+static bool s_playlists_from_cache = false;
+static bool s_artists_from_cache = false;
+
+// Context menu overlay (START) - see context_menu_available()/
+// perform_context_menu_action() near play_track() for what it actually does.
+static bool s_show_context_menu = false;
+static int s_context_menu_selected = 0; // 0 = action row, 1 = Cancel row
 
 // Scratch buffers for building the full track list of an artist/album/
 // playlist being queued for download (see queue_download_artist() etc.
@@ -270,10 +295,21 @@ void ui_set_screen(UIScreen screen) {
     } else if (screen == SCREEN_DOWNLOADS) {
         s_list_count = 3;
     } else if (screen == SCREEN_PLAYLISTS) {
+        s_playlists_from_cache = false;
         if (s_offline_browse) {
             s_num_playlists = offline_get_playlists(s_playlists, PLEX_MAX_ITEMS);
         } else {
             s_num_playlists = plex_api_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+            if (s_num_playlists > 0) {
+                library_cache_save_playlists(s_playlists, s_num_playlists);
+            } else {
+                // Live fetch came back empty - almost certainly no
+                // connection rather than a genuinely playlist-less account,
+                // so fall back to the last-known list instead of just
+                // showing nothing (see s_playlists_from_cache's comment).
+                s_num_playlists = library_cache_load_playlists(s_playlists, PLEX_MAX_ITEMS);
+                s_playlists_from_cache = s_num_playlists > 0;
+            }
         }
         s_list_count = s_num_playlists;
     } else if (screen == SCREEN_LIBRARIES) {
@@ -655,19 +691,39 @@ static void draw_header(const char* title) {
     }
 }
 
-static void draw_list_item(int visual_idx, const char* title, const char* subtitle, bool selected, bool is_playing) {
+// `unavailable` dims a row and appends "(Offline unavailable)" to its
+// subtitle - for a library-cache entry (see s_playlists_from_cache/
+// s_artists_from_cache) that hasn't actually been downloaded, so it can't
+// be played (or drilled into) with no connection. Never overrides the
+// selection highlight itself - a disabled row can still be navigated onto
+// and read, just not entered (see the KEY_A handling in ui_update()).
+static void draw_list_item_ex(int visual_idx, const char* title, const char* subtitle, bool selected, bool is_playing, bool unavailable) {
     float y = LIST_START_Y + visual_idx * LIST_ITEM_HEIGHT;
     u32 bg_col = selected ? COL_HIGHLIGHT : ((visual_idx % 2 == 0) ? COL_BG : COL_SURFACE);
     C2D_DrawRectSolid(0, y, 0.5f, BTM_WIDTH, LIST_ITEM_HEIGHT - 1, bg_col);
-    
+
     if (is_playing) {
         C2D_DrawRectSolid(0, y, 0.5f, 3, LIST_ITEM_HEIGHT - 1, COL_ACCENT);
     }
-    
-    draw_text(title, 10, y + 2, 0.5f, 0.5f, selected ? COL_ACCENT : COL_TEXT);
-    if (subtitle && subtitle[0]) {
+
+    u32 title_col = unavailable ? COL_TEXT_DARK : (selected ? COL_ACCENT : COL_TEXT);
+    draw_text(title, 10, y + 2, 0.5f, 0.5f, title_col);
+
+    if (unavailable) {
+        char sub_buf[96];
+        if (subtitle && subtitle[0]) {
+            snprintf(sub_buf, sizeof(sub_buf), "%s - Offline unavailable", subtitle);
+        } else {
+            snprintf(sub_buf, sizeof(sub_buf), "Offline unavailable");
+        }
+        draw_text(sub_buf, 10, y + 16, 0.4f, 0.4f, COL_TEXT_DARK);
+    } else if (subtitle && subtitle[0]) {
         draw_text(subtitle, 10, y + 16, 0.4f, 0.4f, COL_TEXT_DIM);
     }
+}
+
+static void draw_list_item(int visual_idx, const char* title, const char* subtitle, bool selected, bool is_playing) {
+    draw_list_item_ex(visual_idx, title, subtitle, selected, is_playing, false);
 }
 
 // NETWORK_STATE, documented at 3dbrew's "Configuration Memory" page: a byte
@@ -1027,8 +1083,8 @@ static int compute_prev_track_idx(void) {
     return -1;
 }
 
-// --- Queueing downloads (X on an online Artists/Albums/Playlists/Tracks
-// screen - see the KEY_X handling in ui_update()) ----------------------------
+// --- Queueing downloads ("Download for Offline Play" in the context menu -
+// see perform_context_menu_action()) -----------------------------------------
 // Each of these does one or more blocking plex_api_* fetches to get the full
 // track list before handing it to offline.c - same "blocking is fine, it's a
 // quick LAN/localhost round-trip and perform_blocking_request() keeps audio
@@ -1085,6 +1141,85 @@ static void queue_download_playlist(const PlexPlaylist* playlist) {
     } else {
         snprintf(s_status_msg, sizeof(s_status_msg), "'%s' is already downloaded", playlist->title);
         s_status_color = COL_TEXT_DIM;
+    }
+}
+
+// --- Context menu (START) -----------------------------------------------
+// A quick, contextual action for whatever's selected on one of the 4
+// browsable list screens - "Download for Offline Play" while browsing the
+// live server, "Delete from Downloads" while browsing what's already
+// offline (s_offline_browse) - see s_show_context_menu below for why this
+// is an overlay rather than its own screen.
+
+static bool context_menu_available(void) {
+    return (s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
+            s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) &&
+           s_list_count > 0 && s_selected_idx < s_list_count;
+}
+
+// Label for the context menu's one action row, and for the header hint at
+// the bottom of these list screens - kept as a single shared source of
+// truth so the two can't drift out of sync with each other.
+static const char* context_menu_action_label(void) {
+    return s_offline_browse ? "Delete from Downloads" : "Download for Offline Play";
+}
+
+// Performs whatever context_menu_action_label() currently describes against
+// the selected row - the same download/delete logic every screen's KEY_A
+// entry-handling below already needs the matching lookups for, just fired
+// from the context menu's confirm instead of from a dedicated key.
+static void perform_context_menu_action(void) {
+    if (s_offline_browse) {
+        if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
+            offline_delete_artist(s_artists[s_selected_idx].rating_key);
+            snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_artists[s_selected_idx].title);
+            s_status_color = COL_WARN;
+            s_num_artists = offline_get_artists(s_artists, PLEX_MAX_ITEMS);
+            s_list_count = s_num_artists;
+            if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+        } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
+            offline_delete_album(s_albums[s_selected_idx].rating_key);
+            snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_albums[s_selected_idx].title);
+            s_status_color = COL_WARN;
+            s_num_albums = offline_get_albums(s_active_key, s_albums, PLEX_MAX_ITEMS);
+            s_list_count = s_num_albums;
+            if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+        } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
+            offline_delete_playlist(s_playlists[s_selected_idx].rating_key);
+            snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_playlists[s_selected_idx].title);
+            s_status_color = COL_WARN;
+            s_num_playlists = offline_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+            s_list_count = s_num_playlists;
+            if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+        } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
+            offline_delete_track(s_tracks[s_selected_idx].rating_key);
+            snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_tracks[s_selected_idx].title);
+            s_status_color = COL_WARN;
+            // Drop it straight out of the currently-displayed list rather
+            // than re-fetching - this Tracks screen may have come from
+            // either an album or a playlist and either offline_get_tracks_
+            // for_*() call needs a key we'd have to track separately.
+            if (s_selected_idx == s_current_track_idx) {
+                // Its file is gone - can't keep playing it.
+                audio_player_stop();
+                s_current_track_idx = -1;
+                s_auto_advance = false;
+            } else if (s_selected_idx < s_current_track_idx) {
+                s_current_track_idx--; // keep pointing at the same logical track after the shift below
+            }
+            for (int i = s_selected_idx; i < s_num_tracks - 1; i++) s_tracks[i] = s_tracks[i + 1];
+            s_num_tracks--;
+            s_list_count = s_num_tracks;
+            if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+        }
+    } else if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
+        queue_download_artist(&s_artists[s_selected_idx]);
+    } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
+        queue_download_album(&s_albums[s_selected_idx]);
+    } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
+        queue_download_playlist(&s_playlists[s_selected_idx]);
+    } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
+        queue_download_single_track(&s_tracks[s_selected_idx]);
     }
 }
 
@@ -1265,19 +1400,23 @@ static bool play_prev_track(void) {
 // re-fetching).
 static void seek_to(int target_ms) {
     if (s_current_track_idx < 0 || s_current_track_idx >= s_num_tracks) return;
-    // Not supported for a locally-downloaded track: plex_api_get_seek_url()
-    // below asks the server to restart a transcode from a given offset, and
-    // FLAC in particular can't just jump into an arbitrary byte offset of a
-    // local file either (drflac needs to see the stream's header first) -
-    // implementing a real local seek would need decoder-level support
-    // audio_player.c doesn't have. The progress bar simply ignores taps
-    // while playing an offline track (see SCREEN_NOW_PLAYING's touch
-    // handler) rather than doing something wrong.
-    if (s_offline_browse) return;
     PlexTrack* track = &s_tracks[s_current_track_idx];
 
     if (target_ms < 0) target_ms = 0;
     if (track->duration > 0 && target_ms > track->duration) target_ms = track->duration;
+
+    if (s_offline_browse) {
+        // A downloaded track is already fully on the SD card, so this seeks
+        // audio_player.c's already-open local deck directly in place -
+        // unlike the online path below, there's no stream to reload from a
+        // different offset. A no-op (silently ignored, same as before)
+        // rather than an error if the deck genuinely can't seek for some
+        // reason (see audio_player_seek_local_ms()'s doc comment).
+        if (audio_player_seek_local_ms(target_ms)) {
+            LOG_INFO("Seeked offline track %d to %dms", s_current_track_idx, target_ms);
+        }
+        return;
+    }
 
     char url[PLEX_MAX_URL];
     if (!plex_api_get_seek_url(track, target_ms, url, sizeof(url))) return;
@@ -1405,6 +1544,40 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (!hold_up && !hold_dn) {
             s_scroll_repeat = 0;
         }
+        return;
+    }
+
+    if (s_show_context_menu) {
+        if ((kDown & KEY_B) || (kDown & KEY_START)) {
+            s_show_context_menu = false;
+            return;
+        }
+        if (kDown & KEY_UP) s_context_menu_selected = (s_context_menu_selected > 0) ? s_context_menu_selected - 1 : 1;
+        if (kDown & KEY_DOWN) s_context_menu_selected = (s_context_menu_selected < 1) ? s_context_menu_selected + 1 : 0;
+
+        if (kDown & KEY_TOUCH) {
+            bool in_x = touch.px >= CTX_MENU_X && touch.px < CTX_MENU_X + CTX_MENU_W;
+            if (in_x && touch.py >= CTX_MENU_ACTION_Y && touch.py < CTX_MENU_ACTION_Y + CTX_MENU_ROW_H) {
+                s_context_menu_selected = 0;
+                kDown |= KEY_A;
+            } else if (in_x && touch.py >= CTX_MENU_CANCEL_Y && touch.py < CTX_MENU_CANCEL_Y + CTX_MENU_ROW_H) {
+                s_context_menu_selected = 1;
+                kDown |= KEY_A;
+            } else {
+                s_show_context_menu = false; // tapped outside the menu - dismiss, like tapping outside any other modal
+                return;
+            }
+        }
+
+        if (kDown & KEY_A) {
+            if (s_context_menu_selected == 0) perform_context_menu_action();
+            s_show_context_menu = false;
+        }
+        return;
+    }
+    if ((kDown & KEY_START) && context_menu_available()) {
+        s_show_context_menu = true;
+        s_context_menu_selected = 0;
         return;
     }
 
@@ -1593,17 +1766,13 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     if ((kDown & KEY_L) && !(kHeld & KEY_R)) {
         s_top_view = (TopView)((s_top_view + TOPVIEW_COUNT - 1) % TOPVIEW_COUNT);
     }
-    // X cycles which visualizer style is shown, only meaningful in that view -
-    // except on the Artists/Albums/Tracks/Playlists screens, where X is also
-    // "download/delete selected" (see the KEY_X handling further down): the
-    // top-screen visualizer view and the bottom-screen list screen are
-    // independent, so both could otherwise fire off the same press. Whichever
-    // list screen is actively showing takes priority in that case - visualizer
-    // style-cycling is still reachable from every other screen (Now Playing
-    // Controls chief among them).
-    if ((kDown & KEY_X) && s_top_view == TOPVIEW_VISUALIZER &&
-        s_screen != SCREEN_ARTISTS && s_screen != SCREEN_ALBUMS &&
-        s_screen != SCREEN_TRACKS && s_screen != SCREEN_PLAYLISTS) {
+    // X cycles which visualizer style is shown, only meaningful in that view.
+    // (Downloading/deleting the selected item on the Artists/Albums/Tracks/
+    // Playlists screens used to also be on X, which collided with this since
+    // the visualizer view and the bottom-screen list screen are independent
+    // of each other - that action now lives on its own context menu instead,
+    // opened with START - see s_show_context_menu below.)
+    if ((kDown & KEY_X) && s_top_view == TOPVIEW_VISUALIZER) {
         s_vis_style = (VisStyle)((s_vis_style + 1) % VIS_STYLE_COUNT);
     }
 
@@ -1906,7 +2075,15 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 if (s_num_libraries == 0) s_num_libraries = plex_api_get_music_libraries(s_libraries, PLEX_MAX_ITEMS);
                 if (s_num_libraries > 0) {
                     strncpy(s_current_title, s_libraries[0].title, PLEX_MAX_STR);
-                    s_num_artists = plex_api_get_artists(s_libraries[0].key, s_artists, PLEX_MAX_ITEMS);
+                    strncpy(s_active_key, s_libraries[0].key, PLEX_MAX_URL);
+                    s_num_artists = plex_api_get_artists(s_active_key, s_artists, PLEX_MAX_ITEMS);
+                    s_artists_from_cache = false;
+                    if (s_num_artists > 0) {
+                        library_cache_save_artists(s_active_key, s_artists, s_num_artists);
+                    } else {
+                        s_num_artists = library_cache_load_artists(s_active_key, s_artists, PLEX_MAX_ITEMS);
+                        s_artists_from_cache = s_num_artists > 0;
+                    }
                     nav_push(SCREEN_HUB);
                     ui_set_screen(SCREEN_ARTISTS);
                 } else {
@@ -1971,6 +2148,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             if (s_selected_idx == 0) { // Downloaded Artists
                 strncpy(s_current_title, "Downloaded Artists", PLEX_MAX_STR);
                 s_offline_browse = true;
+                s_artists_from_cache = false; // every entry here is downloaded by construction - nothing to grey out
                 s_num_artists = offline_get_artists(s_artists, PLEX_MAX_ITEMS);
                 s_total_items = 0;
                 nav_push(SCREEN_DOWNLOADS);
@@ -2097,11 +2275,32 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_libraries[s_selected_idx].key, PLEX_MAX_URL);
             s_loaded_items = plex_api_get_artists_page(s_active_key, s_artists, 0, PLEX_PAGE_SIZE, &s_total_items);
             s_num_artists = s_loaded_items;
+            s_artists_from_cache = false;
+            if (s_num_artists > 0) {
+                library_cache_save_artists(s_active_key, s_artists, s_num_artists);
+            } else {
+                s_num_artists = library_cache_load_artists(s_active_key, s_artists, PLEX_MAX_ITEMS);
+                s_loaded_items = s_num_artists;
+                s_total_items = 0; // the cached snapshot is a flat, complete list - nothing left to lazy-load
+                s_artists_from_cache = s_num_artists > 0;
+            }
             nav_push(SCREEN_LIBRARIES);
             ui_set_screen(SCREEN_ARTISTS);
+        } else if (s_screen == SCREEN_ARTISTS && s_list_count > 0 && s_selected_idx < s_num_artists &&
+                   s_artists_from_cache && !offline_artist_has_any_downloaded(s_artists[s_selected_idx].rating_key)) {
+            // Greyed-out row (see the render loop below) - nothing of this
+            // artist's was downloaded, so there's nothing to browse with no
+            // connection to fetch it live.
+            snprintf(s_status_msg, sizeof(s_status_msg), "'%s' isn't downloaded - connect to browse it", s_artists[s_selected_idx].title);
+            s_status_color = COL_WARN;
         } else if (s_screen == SCREEN_ARTISTS && s_list_count > 0 && s_selected_idx < s_num_artists) {
             strncpy(s_current_title, s_artists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_artists[s_selected_idx].key, PLEX_MAX_URL);
+            // This artist's list came from the cache but it does have
+            // something downloaded (the branch above catches the opposite
+            // case) - browse it the same way Hub > Downloads would, same as
+            // s_offline_browse already means everywhere else.
+            if (s_artists_from_cache) s_offline_browse = true;
             if (s_offline_browse) {
                 s_total_items = 0; // offline_get_albums() always returns the complete set - no paging
                 s_num_albums = offline_get_albums(s_active_key, s_albums, PLEX_MAX_ITEMS);
@@ -2125,11 +2324,17 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             s_loaded_items = s_num_tracks;
             nav_push(SCREEN_ALBUMS);
             ui_set_screen(SCREEN_TRACKS);
+        } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0 &&
+                   s_playlists_from_cache && !offline_playlist_has_any_downloaded(s_playlists[s_selected_idx].rating_key)) {
+            // Greyed-out row - see the SCREEN_ARTISTS case above for why.
+            snprintf(s_status_msg, sizeof(s_status_msg), "'%s' isn't downloaded - connect to browse it", s_playlists[s_selected_idx].title);
+            s_status_color = COL_WARN;
         } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0) {
             strncpy(s_current_title, s_playlists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_playlists[s_selected_idx].key, PLEX_MAX_URL);
             plex_api_queue_fill_async_cancel();
             s_total_items = 0;
+            if (s_playlists_from_cache) s_offline_browse = true; // see the analogous SCREEN_ARTISTS case above
             if (s_offline_browse) {
                 s_num_tracks = offline_get_tracks_for_playlist(s_active_key, s_tracks, PLEX_MAX_ITEMS);
             } else {
@@ -2141,65 +2346,6 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_TRACKS && s_list_count > 0 && s_selected_idx < s_num_tracks) {
             play_track(s_selected_idx);
-        }
-    }
-
-    // Download (while browsing the online library) / Delete (while browsing
-    // downloads) the selected item - X is otherwise unused on these list
-    // screens (its only other meaning, cycling visualizer style, is gated to
-    // TOPVIEW_VISUALIZER, so there's no conflict).
-    if (kDown & KEY_X) {
-        if (s_offline_browse) {
-            if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
-                offline_delete_artist(s_artists[s_selected_idx].rating_key);
-                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_artists[s_selected_idx].title);
-                s_status_color = COL_WARN;
-                s_num_artists = offline_get_artists(s_artists, PLEX_MAX_ITEMS);
-                s_list_count = s_num_artists;
-                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
-            } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
-                offline_delete_album(s_albums[s_selected_idx].rating_key);
-                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_albums[s_selected_idx].title);
-                s_status_color = COL_WARN;
-                s_num_albums = offline_get_albums(s_active_key, s_albums, PLEX_MAX_ITEMS);
-                s_list_count = s_num_albums;
-                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
-            } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
-                offline_delete_playlist(s_playlists[s_selected_idx].rating_key);
-                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_playlists[s_selected_idx].title);
-                s_status_color = COL_WARN;
-                s_num_playlists = offline_get_playlists(s_playlists, PLEX_MAX_ITEMS);
-                s_list_count = s_num_playlists;
-                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
-            } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
-                offline_delete_track(s_tracks[s_selected_idx].rating_key);
-                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_tracks[s_selected_idx].title);
-                s_status_color = COL_WARN;
-                // Drop it straight out of the currently-displayed list
-                // rather than re-fetching - this Tracks screen may have come
-                // from either an album or a playlist and either offline_get_
-                // tracks_for_*() call needs a key we'd have to track separately.
-                if (s_selected_idx == s_current_track_idx) {
-                    // Its file is gone - can't keep playing it.
-                    audio_player_stop();
-                    s_current_track_idx = -1;
-                    s_auto_advance = false;
-                } else if (s_selected_idx < s_current_track_idx) {
-                    s_current_track_idx--; // keep pointing at the same logical track after the shift below
-                }
-                for (int i = s_selected_idx; i < s_num_tracks - 1; i++) s_tracks[i] = s_tracks[i + 1];
-                s_num_tracks--;
-                s_list_count = s_num_tracks;
-                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
-            }
-        } else if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
-            queue_download_artist(&s_artists[s_selected_idx]);
-        } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
-            queue_download_album(&s_albums[s_selected_idx]);
-        } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
-            queue_download_playlist(&s_playlists[s_selected_idx]);
-        } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
-            queue_download_single_track(&s_tracks[s_selected_idx]);
         }
     }
 
@@ -2215,6 +2361,10 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             if (s_screen == SCREEN_ARTISTS) {
                 new_items = plex_api_get_artists_page(s_active_key, s_artists, current_count, PLEX_PAGE_SIZE, NULL);
                 s_num_artists += new_items;
+                // Keep the offline fallback snapshot growing as further pages
+                // load, so it's as complete as however far online browsing
+                // actually reached rather than being stuck at just page 1.
+                if (new_items > 0) library_cache_save_artists(s_active_key, s_artists, s_num_artists);
             } else if (s_screen == SCREEN_ALBUMS) {
                 new_items = plex_api_get_albums_page(s_active_key, s_albums, current_count, PLEX_PAGE_SIZE, NULL);
                 s_num_albums += new_items;
@@ -3280,7 +3430,8 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                 draw_list_item(i, s_libraries[idx].title, NULL, selected, false);
             } else if (s_screen == SCREEN_ARTISTS) {
                 if (idx < s_num_artists) {
-                    draw_list_item(i, s_artists[idx].title, NULL, selected, false);
+                    bool unavailable = s_artists_from_cache && !offline_artist_has_any_downloaded(s_artists[idx].rating_key);
+                    draw_list_item_ex(i, s_artists[idx].title, NULL, selected, false, unavailable);
                 } else {
                     draw_list_item(i, "Loading...", NULL, selected, false);
                 }
@@ -3293,7 +3444,8 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                     draw_list_item(i, "Loading...", NULL, selected, false);
                 }
             } else if (s_screen == SCREEN_PLAYLISTS) {
-                draw_list_item(i, s_playlists[idx].title, NULL, selected, false);
+                bool unavailable = s_playlists_from_cache && !offline_playlist_has_any_downloaded(s_playlists[idx].rating_key);
+                draw_list_item_ex(i, s_playlists[idx].title, NULL, selected, false, unavailable);
             } else if (s_screen == SCREEN_TRACKS) {
                 if (idx < s_num_tracks) {
                     char dur_buf[32];
@@ -3323,17 +3475,48 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
             }
         }
 
-        // X: download (online) / delete (offline) hint + the last queue
-        // action's result - see queue_download_*()/offline_delete_*() in
-        // ui_update(). Not shown on Libraries (nothing to download/delete
-        // there - it's just a section picker).
+        // START: context menu hint + the last queued/deleted item's result -
+        // see perform_context_menu_action() in ui_update(). Not shown on
+        // Libraries (nothing to download/delete there - it's just a section
+        // picker).
         if (s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
             s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) {
-            draw_text_centered(s_offline_browse ? "X: Delete Selected" : "X: Download Selected",
-                                BTM_HEIGHT - 32, BTM_WIDTH, 0.36f, 0.36f, COL_TEXT_DARK);
+            draw_text_centered("START: Options", BTM_HEIGHT - 32, BTM_WIDTH, 0.36f, 0.36f, COL_TEXT_DARK);
             if (s_status_msg[0]) {
                 draw_text_centered(s_status_msg, BTM_HEIGHT - 16, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
             }
         }
+    }
+
+    // Context menu overlay - drawn on top of whatever's above, same idea as
+    // a dialog/sheet in any other app (the screen behind it dims but stays
+    // visible, unlike the live log viewer's full-screen takeover above).
+    if (s_show_context_menu) {
+        C2D_DrawRectSolid(0, 0, 0.4f, BTM_WIDTH, BTM_HEIGHT, RGBA8(0x00, 0x00, 0x00, 0xA0));
+
+        const char* item_title = "";
+        if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) item_title = s_artists[s_selected_idx].title;
+        else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) item_title = s_albums[s_selected_idx].title;
+        else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) item_title = s_tracks[s_selected_idx].title;
+        else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) item_title = s_playlists[s_selected_idx].title;
+
+        C2D_DrawRectSolid(CTX_MENU_X, 60, 0.5f, CTX_MENU_W, 112, COL_SURFACE);
+        C2D_DrawRectSolid(CTX_MENU_X, 60, 0.5f, CTX_MENU_W, 2, COL_ACCENT);
+
+        char title_buf[40];
+        truncate_to_width(item_title, 0.42f, CTX_MENU_W - 16, title_buf, sizeof(title_buf));
+        draw_text(title_buf, CTX_MENU_X + 8, 68, 0.42f, 0.42f, COL_TEXT);
+
+        C2D_DrawRectSolid(CTX_MENU_X, CTX_MENU_ACTION_Y, 0.5f, CTX_MENU_W, CTX_MENU_ROW_H - 1,
+                           s_context_menu_selected == 0 ? COL_HIGHLIGHT : COL_BG);
+        draw_text(context_menu_action_label(), CTX_MENU_X + 8, CTX_MENU_ACTION_Y + 8, 0.42f, 0.42f,
+                   s_context_menu_selected == 0 ? COL_ACCENT : COL_TEXT);
+
+        C2D_DrawRectSolid(CTX_MENU_X, CTX_MENU_CANCEL_Y, 0.5f, CTX_MENU_W, CTX_MENU_ROW_H - 1,
+                           s_context_menu_selected == 1 ? COL_HIGHLIGHT : COL_BG);
+        draw_text("Cancel", CTX_MENU_X + 8, CTX_MENU_CANCEL_Y + 8, 0.42f, 0.42f,
+                   s_context_menu_selected == 1 ? COL_ACCENT : COL_TEXT);
+
+        draw_text_centered("A: Confirm   B: Cancel", 158, BTM_WIDTH, 0.36f, 0.36f, COL_TEXT_DIM);
     }
 }

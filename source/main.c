@@ -12,6 +12,7 @@
 #include "plex_api.h"
 #include "audio_player.h"
 #include "offline.h"
+#include "library_cache.h"
 #include "ui.h"
 #include "logger.h"
 
@@ -69,6 +70,7 @@ int main(int argc, char* argv[]) {
     LOG_INFO("DualPlex starting up...");
     audio_player_init();
     offline_init();
+    library_cache_init();
     ui_init();
     ui_set_config(&app_config);
     
@@ -125,8 +127,18 @@ int main(int argc, char* argv[]) {
         touchPosition touch;
         hidTouchRead(&touch);
 
-        // Exit on START+SELECT
-        if ((kDown & KEY_START) && (kHeld & KEY_SELECT)) break;
+        // Exit on START+SELECT - checked both ways round (whichever of the
+        // two is the one that lands as the actual "just pressed" edge this
+        // frame, with the other already held) since a real two-finger press
+        // is rarely perfectly simultaneous. Checking only one ordering (e.g.
+        // START-down-while-SELECT-held) misses the combo whenever the user
+        // happens to press START fractionally before SELECT instead - it
+        // never satisfies either half that way (by the frame SELECT goes
+        // down, START is no longer a fresh kDown edge itself).
+        if (((kDown & KEY_START) && (kHeld & KEY_SELECT)) ||
+            ((kDown & KEY_SELECT) && (kHeld & KEY_START))) {
+            break;
+        }
 
         // Keep playback going with the lid closed: closing the lid always cuts
         // the screen backlights (that's hardware, not something we control),
