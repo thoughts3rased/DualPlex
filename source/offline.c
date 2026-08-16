@@ -1094,6 +1094,14 @@ static void maybe_cache_album_thumb(const OfflineQueueItem* item) {
 // plex_api.c), this API wants the client identifier like any normal request.
 static struct curl_slist* dlq_headers(void) {
     struct curl_slist* headers = NULL;
+    // Without this, PMS answers every one of these endpoints with its legacy
+    // XML body instead (confirmed against a real server - same 200 OK either
+    // way, just a different Content-Type) - cJSON_Parse() on that silently
+    // returns NULL, which every dlq_*() caller above treats as a genuine
+    // failure. That's what made this whole API look "unsupported" from the
+    // very first call every session (see s_dlq_unsupported) despite PMS
+    // actually answering every request just fine.
+    headers = curl_slist_append(headers, "Accept: application/json");
     const char* token = plex_api_get_token();
     if (token && token[0]) {
         char hdr[256];
@@ -1106,6 +1114,19 @@ static struct curl_slist* dlq_headers(void) {
     headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
     headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
     headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
+    // Unlike the ad hoc universal-transcoder endpoint (which always forces
+    // directPlay=0 regardless of platform, so its "Chrome" spoof - see
+    // start_next_download()'s transcode branch - never actually matters),
+    // dlq_add_item() below asks for a real direct-play decision, and PMS's
+    // answer depends on which device profile this platform string maps to.
+    // Confirmed against a real server: "Chrome" gets *no* direct-play music
+    // profile for a plain http-protocol MP3/FLAC part at all (PMS falls
+    // back to converting it, defeating the point of a "direct" download),
+    // and "Generic"/"Linux"/"Plex Web" can't even get PMS to construct a
+    // decision (an immediate item status of "error"/"decisionError"), while
+    // "Android" (picked here), "iOS", and "Windows" all get a clean direct-
+    // play decision for exactly the same request.
+    headers = curl_slist_append(headers, "X-Plex-Platform: Android");
     return headers;
 }
 
