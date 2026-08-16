@@ -549,6 +549,17 @@ static void draw_loading_spinner(float cx, float cy, float radius, const char* l
 #define ICON_CP_DISCONNECTED    0xE560 // "plug-circle-xmark"
 #define ICON_CP_WIFI             0xF1EB
 #define ICON_CP_PLANE            0xF072
+#define ICON_CP_DOWNLOAD         0xF019
+
+// To add another glyph: find its codepoint at fontawesome.com/icons (solid
+// style only - that's the only style baked in), add it to the whitelist,
+// and regenerate data/iconfont.bin from the real Font Awesome Free Solid
+// TTF with devkitPro's mkbcfnt:
+//   mkbcfnt -s 24 -w whitelist.txt -o data/iconfont.bin fa-solid-900.ttf
+// (24 to match the "baked at 24px" scale draw_icon_glyph() assumes; the
+// digit glyphs used for repeat-one, e.g. 0x0031 below, come from the same
+// TTF, not a separate font). whitelist.txt is just the codepoints above,
+// whitespace-separated, each as "0x" + 4 lowercase hex digits.
 
 // Every codepoint above sits in Font Awesome's Private Use Area, always a
 // 3-byte UTF-8 sequence (U+0800-U+FFFF). Encoded manually rather than
@@ -595,6 +606,11 @@ static void draw_icon_skip_prev(float cx, float cy, float size, u32 color) {
 
 static void draw_icon_shuffle(float cx, float cy, float size, u32 color) {
     draw_icon_glyph(ICON_CP_SHUFFLE, cx, cy, size, color);
+}
+
+// Top-screen HUD background-download indicator - see ui_render_top().
+static void draw_icon_download(float cx, float cy, float size, u32 color) {
+    draw_icon_glyph(ICON_CP_DOWNLOAD, cx, cy, size, color);
 }
 
 // Font Awesome's free set has no distinct "repeat-one" glyph, so repeat-one
@@ -680,25 +696,6 @@ static void draw_icon_back_arrow(float cx, float cy, float size, u32 color) {
     C2D_DrawTriangle(cx + w * 0.4f, cy - h * 0.5f, color,
                       cx + w * 0.4f, cy + h * 0.5f, color,
                       cx - w * 0.6f, cy, color, 0.5f);
-}
-
-// Download indicator (top-screen HUD - see ui_render_top()'s "Background
-// download indicator"): a downward stem/arrowhead over a tray, the standard
-// "download" glyph shape. Hand-drawn like the icon above rather than pulled
-// from the bundled font - only the handful of Font Awesome glyphs this app
-// actually uses got baked into data/iconfont.bin (see draw_icon_glyph()'s
-// comment), and a download icon isn't among them.
-static void draw_icon_download(float cx, float cy, float size, u32 color) {
-    float stem_w = size * 0.22f;
-    C2D_DrawRectSolid(cx - stem_w / 2.0f, cy - size * 0.5f, 0.5f, stem_w, size * 0.55f, color);
-
-    float head_w = size * 0.6f;
-    C2D_DrawTriangle(cx - head_w / 2.0f, cy + size * 0.05f, color,
-                      cx + head_w / 2.0f, cy + size * 0.05f, color,
-                      cx, cy + size * 0.42f, color, 0.5f);
-
-    float tray_w = size * 0.9f;
-    C2D_DrawRectSolid(cx - tray_w / 2.0f, cy + size * 0.5f, 0.5f, tray_w, size * 0.12f, color);
 }
 
 static void draw_header(const char* title) {
