@@ -34,15 +34,18 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
   SD card - open the context menu (**START**) on their row in Artists/Albums/Tracks/Playlists
   and choose "Download for Offline Play" - for playback with no server connection at all. A
   background queue downloads them one at a time on its own thread (pinned to the extra core
-  on New3DS when available, so it costs the main thread nothing) - original quality when the
+  on New3DS when available), so downloading never slows down or stutters whatever's currently
+  playing and the app stays fully responsive while it works - original quality when the
   source is already FLAC/MP3, transcoded down to MP3 otherwise so it's guaranteed playable -
   along with one shared album-art thumbnail per album, and automatically throttles its own
   bandwidth while a track is actively streaming so it doesn't compete with (and stutter)
-  playback. An interrupted download (closing the app, or a dropped connection) picks back up
-  from where it left off rather than starting over, as long as the source file didn't need
-  transcoding; the rest of the queue survives too - closing the app mid-way through downloading
-  a big playlist picks up right where it left off next launch instead of losing whatever hadn't
-  started yet. `Settings > Downloads` browses what's saved
+  playback. Tracks that don't need transcoding go through Plex's own download system, the same
+  one official apps use, so it shows up as a real download in your Plex dashboard rather than
+  looking like an extra stream. An interrupted download (closing the app, or a dropped
+  connection) picks back up from where it left off rather than starting over, as long as the
+  source file didn't need transcoding; the rest of the queue survives too - closing the app
+  mid-way through downloading a big playlist picks up right where it left off next launch
+  instead of losing whatever hadn't started yet. `Settings > Downloads` browses what's saved
   (the same Artists/Albums/Tracks/Playlists screens as online, just backed by the SD card),
   shows the current download's progress, and deletes a single track/album/artist/playlist
   (same context menu, now offering "Delete from Downloads") or everything at once. The Auth
