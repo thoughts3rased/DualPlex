@@ -75,7 +75,6 @@ auth_token=YOUR_PLEX_TOKEN
 - **Y**: Play / Pause
 - **B**: Back / Stop
 - **D-Pad**: Navigate menus
-- **Volume Slider**: Adjust volume, like any other 3DS app
 - **SELECT**: Jump to the Now Playing Controls screen (press again to return)
 - **L/R**: Cycle the top screen between Now Playing, Lyrics, and Visualizer views
 - **L+R together**: Toggle the live log viewer
@@ -89,10 +88,6 @@ auth_token=YOUR_PLEX_TOKEN
 - **Now Playing Controls** (bottom screen) also has touch buttons for shuffle, prev,
   play/pause, next, repeat, and jumping to the Play Queue
 - **START+SELECT**: Exit application
-
-Hub > **Settings** has app-level preferences: 12/24-hour clock format for the top-screen HUD
-(the 3DS doesn't expose its own Date & Time "24-hour" toggle to homebrew, so DualPlex remembers
-its own preference instead) and a toggle for smart crossfade.
 
 ## Project Structure
 - `source/`: Contains the main application C source files
