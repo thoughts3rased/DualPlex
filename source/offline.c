@@ -147,6 +147,9 @@ typedef struct {
     char final_path[512];
     size_t bytes_done;
     curl_off_t bytes_total;
+    size_t resume_offset; // bytes already on disk when this transfer started (0 for a fresh
+                           // download) - see the bytes_total fix in dl_thread_func() for why
+                           // this has to be remembered instead of folded straight into bytes_done
 } ActiveDownload;
 
 // --- Shared state - see the module comment at the top for the locking rules ---
@@ -1163,8 +1166,24 @@ static void start_next_download(void) {
         snprintf(hdr, sizeof(hdr), "X-Plex-Token: %s", token);
         s_active.headers = curl_slist_append(s_active.headers, hdr);
     }
+    // A plain file download (this branch) isn't the universal transcoder,
+    // so the "PMS 400s if X-Plex-Client-Identifier is present" quirk
+    // audio_player.c works around (see its comment) doesn't apply here -
+    // and *including* it is what tells PMS which known device/client is
+    // asking, the same identity every other request in this app asserts.
+    // Omitted before, which is almost certainly why a download never showed
+    // up as this console's activity server-side: with no client id on the
+    // request, PMS has nothing to attribute it to. A transcoded download
+    // (the `else` below, going through the same universal-transcoder
+    // endpoint as streaming) keeps omitting it, matching audio_player.c.
+    if (direct) {
+        char id_hdr[96];
+        snprintf(id_hdr, sizeof(id_hdr), "X-Plex-Client-Identifier: %s", plex_api_get_client_id());
+        s_active.headers = curl_slist_append(s_active.headers, id_hdr);
+        s_active.headers = curl_slist_append(s_active.headers, "X-Plex-Version: " PLEX_VERSION);
+    }
     s_active.headers = curl_slist_append(s_active.headers, "X-Plex-Product: " PLEX_PRODUCT);
-    s_active.headers = curl_slist_append(s_active.headers, "X-Plex-Device: Nintendo 3DS");
+    s_active.headers = curl_slist_append(s_active.headers, "X-Plex-Device: " PLEX_DEVICE);
     s_active.headers = curl_slist_append(s_active.headers, "X-Plex-Platform: Chrome");
 
     curl_easy_setopt(s_active.easy, CURLOPT_URL, url);
@@ -1188,6 +1207,7 @@ static void start_next_download(void) {
     strncpy(s_active.item_ext, ext, sizeof(s_active.item_ext) - 1);
     s_active.bytes_done = (size_t)existing_size;
     s_active.bytes_total = 0;
+    s_active.resume_offset = (size_t)existing_size;
     s_active.valid = true;
 
     if (direct) save_resume_record(&item);
@@ -1316,23 +1336,61 @@ static void dl_thread_func(void* arg) {
             int numfds = 0;
             curl_multi_wait(multi, NULL, 0, 200, &numfds);
 
-            LightLock_Lock(&s_lock);
-            if (s_active.valid) { // could have been cancelled while the wait above was unlocked
-                curl_off_t cap = s_network_streaming_hint ? OFFLINE_DL_THROTTLED_BYTES_PER_SEC : 0;
-                curl_easy_setopt(s_active.easy, CURLOPT_MAX_RECV_SPEED_LARGE, cap);
+            // curl_multi_perform() - and the SD card write dl_write_cb() does
+            // for every chunk it hands back - used to run with s_lock held,
+            // same as the wait above didn't. Unlike the once-per-track
+            // manifest/queue writes (see save_manifest()/save_queue()), this
+            // one fires continuously for the whole length of every transfer,
+            // so holding the lock across it meant the main thread's per-
+            // frame offline_get_download_status() call (and anything else
+            // touching s_lock - opening the Downloads screen, queueing a new
+            // album, etc.) could be blocked behind an SD card write on
+            // essentially every frame a download was active, not just at
+            // start/finish. It's safe unlocked: s_dl_multi and s_active.easy/
+            // fp are only ever touched by this one thread - the main thread
+            // never calls into libcurl or the partial file directly - and
+            // the only field dl_write_cb() mutates (s_active.bytes_done) is
+            // read without the lock by offline_get_download_status() for
+            // exactly that reason, same as s_network_streaming_hint below is
+            // read without it here: a torn read isn't possible on a single
+            // word this size, so at worst a reader catches a moment-old
+            // count for one frame, self-correcting the next.
+            curl_off_t cap = s_network_streaming_hint ? OFFLINE_DL_THROTTLED_BYTES_PER_SEC : 0;
+            curl_easy_setopt(s_active.easy, CURLOPT_MAX_RECV_SPEED_LARGE, cap);
 
-                int running = 0;
-                curl_multi_perform(s_dl_multi, &running);
+            int running = 0;
+            curl_multi_perform(multi, &running);
 
-                if (s_active.bytes_total <= 0 && s_active.easy) {
-                    curl_off_t cl = 0;
-                    if (curl_easy_getinfo(s_active.easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0) {
-                        s_active.bytes_total = cl;
-                    }
+            if (s_active.bytes_total <= 0 && s_active.easy) {
+                curl_off_t cl = 0;
+                if (curl_easy_getinfo(s_active.easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK && cl > 0) {
+                    // On a resumed (Range/206) request, cl is only the
+                    // *remaining* length the server is sending back, not the
+                    // full file size - bytes_done, though, starts counting
+                    // from resume_offset (see start_next_download()), i.e.
+                    // already includes what was on disk before this attempt.
+                    // Comparing that against just the remainder overstated
+                    // the percentage for the entire rest of the download
+                    // (reported as over 200% once a resumed transfer neared
+                    // completion) - add the offset back in so bytes_total
+                    // means the same "whole file" thing bytes_done does.
+                    s_active.bytes_total = cl + (curl_off_t)s_active.resume_offset;
                 }
-                if (running == 0) finish_active_download();
             }
-            LightLock_Unlock(&s_lock);
+
+            // s_active.valid can't have changed since it was snapshotted
+            // into `active` above - the only thing that ever invalidates it
+            // (cancel_active_download(), via dl_thread_tick_locked() or the
+            // shutdown path below) runs on this same thread, and this thread
+            // doesn't reach either of those between here and the top of the
+            // loop. finish_active_download() itself does need the lock
+            // though: it mutates s_tracks/s_queue, which offline_get_*()
+            // calls read concurrently from the main thread.
+            if (running == 0) {
+                LightLock_Lock(&s_lock);
+                finish_active_download();
+                LightLock_Unlock(&s_lock);
+            }
         } else {
             // Nothing to do this round (empty queue, or the front item's
             // still backing off after a failure) - a short idle poll rather

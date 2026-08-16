@@ -133,6 +133,13 @@ void plex_api_cleanup(void);
 const char* plex_api_get_token(void);
 const char* plex_api_get_server_url(void);
 
+// The per-console id set by plex_api_set_client_id() (or the default shared
+// PLEX_CLIENT_ID if that was never called) - for building an
+// "X-Plex-Client-Identifier" header outside plex_api.c itself (see
+// offline.c's direct-download requests, which build their own header list
+// rather than going through a plex_api_* helper).
+const char* plex_api_get_client_id(void);
+
 // Whether the current connection is HTTPS rather than plain HTTP.
 bool plex_api_is_https(void);
 

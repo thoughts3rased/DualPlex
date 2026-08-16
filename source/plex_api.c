@@ -32,6 +32,10 @@ void plex_api_set_client_id(const char* client_id) {
     s_client_id[sizeof(s_client_id) - 1] = '\0';
 }
 
+const char* plex_api_get_client_id(void) {
+    return s_client_id;
+}
+
 // Formats "X-Plex-Client-Identifier: <id>" for curl_slist_append(). Returns
 // a pointer to a reused static buffer - curl_slist_append() copies the
 // string immediately, so it's fine that the buffer gets overwritten by the
