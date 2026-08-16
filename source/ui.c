@@ -70,8 +70,8 @@ static int s_num_playlists = 0;
 static bool s_need_load_libraries = false;
 
 // True while SCREEN_ARTISTS/ALBUMS/TRACKS/PLAYLISTS are showing offline.c's
-// on-SD-card downloads (reached via Hub > Downloads) rather than the live
-// server - same screens, same s_artists/s_albums/s_tracks/s_playlists
+// on-SD-card downloads (reached via Settings > Downloads) rather than the
+// live server - same screens, same s_artists/s_albums/s_tracks/s_playlists
 // arrays, just a different data source and, in play_track(), a different
 // (local file) playback path. Reset to false on the way back to the Hub
 // (see ui_set_screen()'s SCREEN_HUB case) so a later online browse never
@@ -84,8 +84,8 @@ static bool s_offline_browse = false;
 // "greyed out" treatment in draw_list_item() for whichever of those cached
 // entries aren't actually downloaded (so unplayable right now), and blocks
 // drilling into one of those from the KEY_A handling below. Always false
-// while s_offline_browse is true (Hub > Downloads already only ever shows
-// what's genuinely downloaded, nothing needs graying out there).
+// while s_offline_browse is true (Settings > Downloads already only ever
+// shows what's genuinely downloaded, nothing needs graying out there).
 static bool s_playlists_from_cache = false;
 static bool s_artists_from_cache = false;
 
@@ -288,7 +288,7 @@ void ui_set_screen(UIScreen screen) {
         s_setup_field = 0;
         s_list_count = 3;
     } else if (screen == SCREEN_HUB) {
-        s_list_count = 6;
+        s_list_count = 5;
         // Leaving the offline-downloads subtree (if we were even in it) -
         // every online Hub option (Artists/Playlists/Search/etc.) populates
         // its own screen explicitly, so this only matters as a safety net.
@@ -680,6 +680,25 @@ static void draw_icon_back_arrow(float cx, float cy, float size, u32 color) {
     C2D_DrawTriangle(cx + w * 0.4f, cy - h * 0.5f, color,
                       cx + w * 0.4f, cy + h * 0.5f, color,
                       cx - w * 0.6f, cy, color, 0.5f);
+}
+
+// Download indicator (top-screen HUD - see ui_render_top()'s "Background
+// download indicator"): a downward stem/arrowhead over a tray, the standard
+// "download" glyph shape. Hand-drawn like the icon above rather than pulled
+// from the bundled font - only the handful of Font Awesome glyphs this app
+// actually uses got baked into data/iconfont.bin (see draw_icon_glyph()'s
+// comment), and a download icon isn't among them.
+static void draw_icon_download(float cx, float cy, float size, u32 color) {
+    float stem_w = size * 0.22f;
+    C2D_DrawRectSolid(cx - stem_w / 2.0f, cy - size * 0.5f, 0.5f, stem_w, size * 0.55f, color);
+
+    float head_w = size * 0.6f;
+    C2D_DrawTriangle(cx - head_w / 2.0f, cy + size * 0.05f, color,
+                      cx + head_w / 2.0f, cy + size * 0.05f, color,
+                      cx, cy + size * 0.42f, color, 0.5f);
+
+    float tray_w = size * 0.9f;
+    C2D_DrawRectSolid(cx - tray_w / 2.0f, cy + size * 0.5f, 0.5f, tray_w, size * 0.12f, color);
 }
 
 static void draw_header(const char* title) {
@@ -1961,10 +1980,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             if (s_selected_idx == 0) ui_set_screen(SCREEN_LINK_PIN);
             else if (s_selected_idx == 1) ui_set_screen(SCREEN_LOGIN_DIRECT);
             else if (s_selected_idx == 2) ui_set_screen(SCREEN_SETUP);
-            // Browse/play whatever's already been downloaded with no server
-            // connection at all - Hub > Downloads works fully offline; every
-            // other Hub option just comes back empty until a server's set up.
-            else if (s_selected_idx == 3) ui_set_screen(SCREEN_HUB);
+            // Straight to managing/playing whatever's already been downloaded
+            // with no server connection at all - Settings > Downloads works
+            // fully offline; every other Hub option just comes back empty
+            // until a server's set up. B from here falls back to the Hub
+            // (nav_pop()'s fallback - nothing was pushed to return to here).
+            else if (s_selected_idx == 3) ui_set_screen(SCREEN_DOWNLOADS);
         }
         return;
     }
@@ -2060,12 +2081,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // 5. Main Hub Screen
     if (s_screen == SCREEN_HUB) {
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 6;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 6) ? s_selected_idx + 1 : 0;
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 5;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 5) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx < 7) {
+            if (idx >= 0 && idx < 6) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
@@ -2116,19 +2137,17 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             } else if (s_selected_idx == 4) { // All Libraries
                 nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_LIBRARIES);
-            } else if (s_selected_idx == 5) { // Downloads
-                s_status_msg[0] = '\0';
-                nav_push(SCREEN_HUB);
-                ui_set_screen(SCREEN_DOWNLOADS);
-            } else if (s_selected_idx == 6) { // Settings
+            } else if (s_selected_idx == 5) { // Settings
                 ui_set_screen(SCREEN_SETTINGS);
             }
         }
         return;
     }
 
-    // Downloads Hub Screen (3 rows: Downloaded Artists, Downloaded
-    // Playlists, Delete All Downloads)
+    // Downloads management screen (3 rows: Downloaded Artists, Downloaded
+    // Playlists, Delete All Downloads) - reached from Settings, not the Hub
+    // directly, since this is squarely a "manage what's on the SD card"
+    // settings-style screen rather than a way to browse/play music.
     if (s_screen == SCREEN_DOWNLOADS) {
         if (kDown & KEY_B) {
             ui_set_screen(nav_pop(SCREEN_HUB));
@@ -2167,18 +2186,18 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         return;
     }
 
-    // Settings Screen (2 rows: Clock Format, Crossfade)
+    // Settings Screen (3 rows: Clock Format, Crossfade, Downloads)
     if (s_screen == SCREEN_SETTINGS) {
         if (kDown & KEY_B) {
             ui_set_screen(SCREEN_HUB);
             return;
         }
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 1;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 1) ? s_selected_idx + 1 : 0;
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx <= 1) {
+            if (idx >= 0 && idx <= 2) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
@@ -2190,6 +2209,10 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 config_save(s_config);
             } else if (s_selected_idx == 1) {
                 s_crossfade_enabled = !s_crossfade_enabled;
+            } else if (s_selected_idx == 2) { // Downloads
+                s_status_msg[0] = '\0';
+                nav_push(SCREEN_SETTINGS);
+                ui_set_screen(SCREEN_DOWNLOADS);
             }
         }
         return;
@@ -2299,8 +2322,8 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_active_key, s_artists[s_selected_idx].key, PLEX_MAX_URL);
             // This artist's list came from the cache but it does have
             // something downloaded (the branch above catches the opposite
-            // case) - browse it the same way Hub > Downloads would, same as
-            // s_offline_browse already means everywhere else.
+            // case) - browse it the same way Settings > Downloads would,
+            // same as s_offline_browse already means everywhere else.
             if (s_artists_from_cache) s_offline_browse = true;
             if (s_offline_browse) {
                 s_total_items = 0; // offline_get_albums() always returns the complete set - no paging
@@ -2843,25 +2866,6 @@ void ui_render_top(C3D_RenderTarget* top) {
         }
     }
 
-    // Background download indicator (offline.c) - shown whenever something's
-    // actively downloading or still waiting in the queue, regardless of
-    // which screen is up, same idea as the connection-status icons above.
-    {
-        OfflineDownloadStatus dl_hud;
-        offline_get_download_status(&dl_hud);
-        if (dl_hud.active || dl_hud.queue_remaining > 0) {
-            char dl_str[48];
-            if (dl_hud.active && dl_hud.bytes_total > 0) {
-                snprintf(dl_str, sizeof(dl_str), "DL %d%%", (int)((dl_hud.bytes_done * 100) / dl_hud.bytes_total));
-            } else if (dl_hud.active) {
-                snprintf(dl_str, sizeof(dl_str), "DL %.1fMB", dl_hud.bytes_done / (1024.0f * 1024.0f));
-            } else {
-                snprintf(dl_str, sizeof(dl_str), "DL %d queued", dl_hud.queue_remaining);
-            }
-            draw_text(dl_str, 145, 12, 0.38f, 0.38f, COL_ACCENT);
-        }
-    }
-
     // Top-Right HUD: Time, right-aligned. 12/24-hour format: the 3DS has a
     // user-facing "Display 24-Hour Time" toggle (System Settings > Other
     // Settings > Date & Time), but it isn't exposed through any documented
@@ -2884,6 +2888,42 @@ void ui_render_top(C3D_RenderTarget* top) {
     C2D_TextOptimize(&time_text);
     C2D_TextGetDimensions(&time_text, 0.42f, 0.42f, &tw, &th);
     C2D_DrawText(&time_text, C2D_WithColor, TOP_WIDTH - 10 - tw, 10, 0.5f, 0.42f, 0.42f, COL_TEXT_DIM);
+
+    // Background download indicator (offline.c) - shown whenever something's
+    // actively downloading or still waiting in the queue, regardless of
+    // which screen is up, same idea as the connection-status icons above.
+    // Anchored off the clock's own left edge (computed just above) rather
+    // than a fixed x, so it's always right-aligned clear of it - a fixed
+    // position here previously overlapped the centered "DUALPLEX" title
+    // instead.
+    {
+        OfflineDownloadStatus dl_hud;
+        offline_get_download_status(&dl_hud);
+        if (dl_hud.active || dl_hud.queue_remaining > 0) {
+            char dl_str[16];
+            if (dl_hud.active && dl_hud.bytes_total > 0) {
+                snprintf(dl_str, sizeof(dl_str), "%d%%", (int)((dl_hud.bytes_done * 100) / dl_hud.bytes_total));
+            } else if (dl_hud.active) {
+                snprintf(dl_str, sizeof(dl_str), "%.1fMB", dl_hud.bytes_done / (1024.0f * 1024.0f));
+            } else {
+                snprintf(dl_str, sizeof(dl_str), "%d", dl_hud.queue_remaining);
+            }
+
+            float dw, dh;
+            C2D_Text dl_text;
+            C2D_TextParse(&dl_text, s_text_buf, dl_str);
+            C2D_TextOptimize(&dl_text);
+            C2D_TextGetDimensions(&dl_text, 0.4f, 0.4f, &dw, &dh);
+
+            float icon_size = 13.0f;
+            float group_right = TOP_WIDTH - 10 - tw - 12.0f; // 12px gap left of the clock
+            float text_x = group_right - dw;
+            float icon_x = text_x - icon_size - 4.0f;
+
+            draw_icon_download(icon_x, 16, icon_size, COL_ACCENT);
+            C2D_DrawText(&dl_text, C2D_WithColor, text_x, 10, 0.5f, 0.4f, 0.4f, COL_ACCENT);
+        }
+    }
 
     if (s_screen == SCREEN_LINK_PIN) {
         draw_text_centered("LINK DEVICE WITH PLEX", 45, TOP_WIDTH, 0.65f, 0.65f, COL_TEXT);
@@ -2933,8 +2973,18 @@ void ui_render_top(C3D_RenderTarget* top) {
         }
     }
     
-    // Bottom of Top Screen: Build Timestamp & Live Log Hint
-    draw_text_centered("L/R: Change View  |  L+R Together: Logs", TOP_HEIGHT - 16, TOP_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+    // Bottom of Top Screen: the context menu hint and the last queued/
+    // deleted item's result (see perform_context_menu_action()) live here
+    // rather than on the bottom screen - with 6 visible list rows there's no
+    // room left below them there without covering part of the last one.
+    if ((s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
+         s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) && s_status_msg[0]) {
+        draw_text_centered(s_status_msg, TOP_HEIGHT - 30, TOP_WIDTH, 0.4f, 0.4f, s_status_color);
+    }
+    const char* footer = context_menu_available()
+        ? "L/R: Change View  |  L+R: Logs  |  START: Options"
+        : "L/R: Change View  |  L+R Together: Logs";
+    draw_text_centered(footer, TOP_HEIGHT - 16, TOP_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
 }
 
 static void draw_log_entry_wrapped(const char* line, float x, float* y, float max_w, u32 color) {
@@ -3051,8 +3101,7 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         draw_list_item(2, "Search Library", "Search tracks, artists & albums", s_selected_idx == 2, false);
         draw_list_item(3, "Recently Added", "Stream newly added tracks", s_selected_idx == 3, false);
         draw_list_item(4, "All Libraries", "Select music library section", s_selected_idx == 4, false);
-        draw_list_item(5, "Downloads", "Play offline / manage downloads", s_selected_idx == 5, false);
-        draw_list_item(6, "Settings", "Clock format & app preferences", s_selected_idx == 6, false);
+        draw_list_item(5, "Settings", "Clock format, crossfade & downloads", s_selected_idx == 5, false);
     } else if (s_screen == SCREEN_DOWNLOADS) {
         draw_header("Downloads");
         char artists_sub[64], playlists_sub[64], storage_sub[64];
@@ -3094,7 +3143,11 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         draw_header("Settings");
         draw_list_item(0, "Clock Format", s_config->clock_24h ? "24-hour" : "12-hour (AM/PM)", s_selected_idx == 0, false);
         draw_list_item(1, "Smart Crossfade", s_crossfade_enabled ? "On" : "Off", s_selected_idx == 1, false);
-        draw_text_centered("Tap a row (or D-Pad + A) to toggle it", LIST_START_Y + 2 * LIST_ITEM_HEIGHT + 8, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+        char downloads_sub[64];
+        snprintf(downloads_sub, sizeof(downloads_sub), "%d track(s) - %.1f MB",
+                 offline_get_track_count(), offline_get_storage_used_bytes() / (1024.0f * 1024.0f));
+        draw_list_item(2, "Downloads", downloads_sub, s_selected_idx == 2, false);
+        draw_text_centered("Tap a row (or D-Pad + A) to open/toggle it", LIST_START_Y + 3 * LIST_ITEM_HEIGHT + 8, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
 
         bool is_n3ds = false;
         APT_CheckNew3DS(&is_n3ds);
@@ -3309,18 +3362,10 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                 }
             }
         }
-
-        // START: context menu hint + the last queued/deleted item's result -
-        // see perform_context_menu_action() in ui_update(). Not shown on
-        // Libraries (nothing to download/delete there - it's just a section
-        // picker).
-        if (s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
-            s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) {
-            draw_text_centered("START: Options", BTM_HEIGHT - 32, BTM_WIDTH, 0.36f, 0.36f, COL_TEXT_DARK);
-            if (s_status_msg[0]) {
-                draw_text_centered(s_status_msg, BTM_HEIGHT - 16, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
-            }
-        }
+        // The START context menu hint and the last queued/deleted item's
+        // result used to be drawn here, but at 6 visible rows there's no
+        // room left below them without covering part of the last row - see
+        // the top screen's footer (ui_render_top()) for where they live now.
     }
 
     // Context menu overlay - drawn on top of whatever's above, same idea as

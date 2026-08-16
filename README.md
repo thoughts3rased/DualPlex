@@ -35,12 +35,12 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
   and choose "Download for Offline Play" - for playback with no server connection at all. A
   background queue downloads them one at a time - original quality when the source is
   already FLAC/MP3, transcoded down to MP3 otherwise so it's guaranteed playable - along
-  with one shared album-art thumbnail per album. `Hub > Downloads` browses what's saved
+  with one shared album-art thumbnail per album. `Settings > Downloads` browses what's saved
   (the same Artists/Albums/Tracks/Playlists screens as online, just backed by the SD card),
   shows the current download's progress, and deletes a single track/album/artist/playlist
   (same context menu, now offering "Delete from Downloads") or everything at once. The Auth
-  Choice screen's "Continue Offline" option jumps straight to the Hub with no sign-in needed,
-  for playing an already-stocked library with no WiFi at all. Offline playback supports
+  Choice screen's "Continue Offline" option jumps straight there with no sign-in needed, for
+  playing an already-stocked library with no WiFi at all. Offline playback supports
   seeking (a real in-place seek within the downloaded file, not a server round-trip), shuffle,
   repeat, the play queue, and crossfading (as a plain fixed-length fade - no Sonic Analysis
   data available offline); lyrics, star-rating sync, and live timeline reporting still need a
@@ -77,8 +77,8 @@ On first launch, DualPlex walks you through choosing how to connect:
 - **Sign in directly**: username/password (with a 2FA code if your account needs one),
   then the same server list
 - **Manual setup**: type a server URL and Plex token yourself, no account sign-in required
-- **Continue Offline**: skip signing in and go straight to `Hub > Downloads` to play whatever's
-  already been saved to the SD card from a previous session
+- **Continue Offline**: skip signing in and go straight to `Settings > Downloads` to play
+  whatever's already been saved to the SD card from a previous session
 
 Whichever path you take, the result is saved to `/3ds/dualplex/config.txt` on your SD card
 so you won't have to sign in again. If you're upgrading from the old "3DS Plex Client" build,
@@ -107,7 +107,7 @@ that backs the greyed-out offline browsing described above.
 - **X**: Change visualizer style (while the Visualizer view is active)
 - **START**: On the Artists/Albums/Tracks/Playlists screens, opens a context menu for the
   selected row - "Download for Offline Play" while browsing the live server, or "Delete from
-  Downloads" while browsing `Hub > Downloads`
+  Downloads" while browsing `Settings > Downloads`
 - **New 3DS C-Stick up/down**: Navigate lists
 - **New 3DS C-Stick left/right**: Toggle shuffle / cycle repeat mode (off → all → one)
 - **New 3DS ZL/ZR**: Previous / next track
