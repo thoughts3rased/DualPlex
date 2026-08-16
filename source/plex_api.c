@@ -1497,12 +1497,16 @@ static bool plex_http_get_binary(const char* url, const char* token, u8** respon
     return false;
 }
 
-// Shared by plex_api_get_transcode_url() (offset_sec=0) and
-// plex_api_get_seek_url() (offset_sec = where the user scrubbed to) - a seek
-// is just a fresh transcode reload starting from a different point in the
-// track, using Plex's own "offset" param so the server does the real seeking
-// (accurate regardless of codec/bitrate, unlike guessing a byte offset).
-static bool build_transcode_url(const PlexTrack* track, int offset_sec, char* url_out, size_t url_max) {
+// Shared by plex_api_get_transcode_url() (offset_sec=0), plex_api_get_seek_
+// url() (offset_sec = where the user scrubbed to), and offline.c's transcoded
+// downloads (plex_api_get_download_transcode_url(), session_suffix="-dl") - a
+// seek is just a fresh transcode reload starting from a different point in
+// the track, using Plex's own "offset" param so the server does the real
+// seeking (accurate regardless of codec/bitrate, unlike guessing a byte
+// offset). `session_suffix` distinguishes a background download's transcode
+// session from a concurrent live-playback one for the *same* track (see the
+// session id comment below) - pass "" for the two playback callers.
+static bool build_transcode_url_ex(const PlexTrack* track, int offset_sec, const char* session_suffix, char* url_out, size_t url_max) {
     if (!s_initialized || !track) return false;
 
     char raw_path[512];
@@ -1551,11 +1555,21 @@ static bool build_transcode_url(const PlexTrack* track, int offset_sec, char* ur
     // playing track's session, which 400s both requests. Built from the
     // per-console client id (not the shared PLEX_CLIENT_ID literal) so two
     // different 3DS's transcoding the same track at the same time still get
-    // distinct session ids too.
+    // distinct session ids too. `session_suffix` covers the same collision
+    // between a live-playback transcode and a background *download* transcode
+    // of the exact same track - without it, both calls (this function is the
+    // only thing that ever builds one of these session ids) land on the
+    // identical string, and PMS treats the second request as re-targeting the
+    // first's already-open session, breaking whichever one asked second
+    // (surfaced as sporadic 401/400s on whichever side lost the race - this
+    // is what offline.c's downloads were hitting when they shared this same
+    // path with live playback, hence offline.c always passing a non-empty
+    // suffix here).
     const char* rkey_tail = strrchr(track->rating_key, '/');
     rkey_tail = (rkey_tail && rkey_tail[1]) ? rkey_tail + 1 : track->rating_key;
     char session_id[PLEX_MAX_STR + 32];
-    snprintf(session_id, sizeof(session_id), "%s-%s", s_client_id, rkey_tail[0] ? rkey_tail : "0");
+    snprintf(session_id, sizeof(session_id), "%s-%s%s", s_client_id, rkey_tail[0] ? rkey_tail : "0",
+             session_suffix ? session_suffix : "");
 
     // Auth and client identity go on the request as X-Plex-* headers (set by
     // audio_player.c when it fetches this URL), not as query params here -
@@ -1573,11 +1587,11 @@ static bool build_transcode_url(const PlexTrack* track, int offset_sec, char* ur
 }
 
 bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
-    return build_transcode_url(track, 0, url_out, url_max);
+    return build_transcode_url_ex(track, 0, "", url_out, url_max);
 }
 
 bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, size_t url_max) {
-    return build_transcode_url(track, seek_ms / 1000, url_out, url_max);
+    return build_transcode_url_ex(track, seek_ms / 1000, "", url_out, url_max);
 }
 
 bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_max) {
@@ -1637,6 +1651,14 @@ bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url
     if (!s_initialized || !track || track->part_key[0] == '\0') return false;
     snprintf(url_out, url_max, "%s%s", s_server_url, track->part_key);
     return true;
+}
+
+// Same as plex_api_get_transcode_url(), for offline.c's background download
+// engine specifically - see build_transcode_url_ex()'s session_suffix
+// comment for why this can't just be plex_api_get_transcode_url() itself
+// whenever the track being downloaded is also the one currently playing.
+bool plex_api_get_download_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
+    return build_transcode_url_ex(track, 0, "-dl", url_out, url_max);
 }
 
 void plex_api_report_timeline(const char* rating_key, const char* state, int time_ms, int duration_ms) {

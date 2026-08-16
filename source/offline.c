@@ -150,6 +150,12 @@ typedef struct {
     size_t resume_offset; // bytes already on disk when this transfer started (0 for a fresh
                            // download) - see the bytes_total fix in dl_thread_func() for why
                            // this has to be remembered instead of folded straight into bytes_done
+    int dlq_item_id; // >0 if this transfer is being served through the Download Queue API (see
+                      // the dlq_*() helpers below) - the item to clean up server-side once this
+                      // attempt is done with it (see finish_active_download()). 0 for a transcoded
+                      // download (still routed through the plain universal-transcoder URL - see
+                      // start_next_download()) or the plain-file fallback used when a server
+                      // doesn't support the Download Queue API at all.
 } ActiveDownload;
 
 // --- Shared state - see the module comment at the top for the locking rules ---
@@ -170,6 +176,17 @@ static int s_queue_capacity = 0;
 
 static CURLM* s_dl_multi = NULL;
 static ActiveDownload s_active = {0};
+
+// Download Queue API state (see the dlq_*() helpers near start_next_
+// download()) - like s_dl_multi/s_active.easy above, only ever touched by
+// the download thread itself, even though it's "shared" in the sense that
+// it persists across calls - no lock needed for the same reason those
+// aren't individually lock-protected either.
+static int s_dlq_id = 0; // this client's Download Queue id, created lazily - 0 until then
+static bool s_dlq_unsupported = false; // set once if this PMS's /downloadQueue 404s (an older
+                                        // server without the API) - falls back to the plain
+                                        // file-download URL for the rest of this session rather
+                                        // than retrying a nonexistent endpoint on every download
 
 // Main thread -> download thread: "cancel whatever's active and delete its
 // partial file" (an explicit user delete, or offline_delete_all()) - see the
@@ -925,17 +942,18 @@ static void add_track_manifest_entry(const OfflineQueueItem* q, const char* ext,
     e->ref_count += 1;
 }
 
-// Growable-buffer write callback for fetch_album_art_bytes() below - same
-// shape as the equivalent callbacks in plex_api.c/album_art.c, just a local
-// copy so this file doesn't need to reach into either of theirs.
+// Growable-buffer write callback for fetch_album_art_bytes() and the dlq_*()
+// Download Queue API helpers below - same shape as the equivalent callbacks
+// in plex_api.c/album_art.c, just a local copy so this file doesn't need to
+// reach into either of theirs.
 typedef struct {
     char* data;
     size_t size;
     size_t capacity;
-} ThumbBuf;
+} HttpBuf;
 
-static size_t thumb_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    ThumbBuf* buf = (ThumbBuf*)userdata;
+static size_t http_buf_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    HttpBuf* buf = (HttpBuf*)userdata;
     size_t total = size * nmemb;
     if (buf->size + total + 1 > buf->capacity) {
         size_t new_cap = buf->capacity ? buf->capacity * 2 : 16384;
@@ -977,7 +995,7 @@ static bool fetch_album_art_bytes(const char* thumb_path, u8** out_data, size_t*
     CURL* curl = curl_easy_init();
     if (!curl) return false;
 
-    ThumbBuf buf = {0};
+    HttpBuf buf = {0};
     struct curl_slist* headers = NULL;
     const char* token = plex_api_get_token();
     if (token && token[0]) {
@@ -988,7 +1006,7 @@ static bool fetch_album_art_bytes(const char* thumb_path, u8** out_data, size_t*
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, thumb_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_buf_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
@@ -1050,6 +1068,263 @@ static void maybe_cache_album_thumb(const OfflineQueueItem* item) {
     if (data) free(data);
 }
 
+// --- Download Queue API -------------------------------------------------------
+// PMS's dedicated download mechanism (https://developer.plex.tv/pms/#tag/
+// Download-Queue) - a small queue system distinct from live playback's
+// streaming/transcode sessions entirely: create a queue for this client,
+// add a track to it, poll until PMS reports it ready, then fetch it from
+// its own media endpoint. Used for direct (untranscoded) downloads only -
+// see start_next_download() - since its "add" endpoint has no equivalent of
+// the universal transcoder's audioCodec/container params to force MP3
+// output, so a transcode still goes through plex_api_get_download_transcode_
+// url() instead (with its own distinct session id - see that function).
+// Being a wholly separate subsystem from streaming is exactly what makes it
+// immune to the session-collision 401s downloads were hitting before: it
+// doesn't touch playback's transcode-session bookkeeping at all.
+//
+// Every function here does a single plain blocking curl_easy_perform() call
+// (like fetch_album_art_bytes() above, and for the same reason - these all
+// run on the download thread, never the main one) and is meant to be called
+// with s_lock *not* held (see start_next_download()) - a full prepare (queue
+// + add + poll) is a handful of real network round-trips, worth keeping off
+// the lock the same as every other slow-I/O spot fixed this session.
+
+// Full X-Plex-* header set every Download Queue endpoint's spec declares -
+// unlike the universal transcoder (see build_transcode_url_ex()'s comment in
+// plex_api.c), this API wants the client identifier like any normal request.
+static struct curl_slist* dlq_headers(void) {
+    struct curl_slist* headers = NULL;
+    const char* token = plex_api_get_token();
+    if (token && token[0]) {
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr), "X-Plex-Token: %s", token);
+        headers = curl_slist_append(headers, hdr);
+    }
+    char id_hdr[96];
+    snprintf(id_hdr, sizeof(id_hdr), "X-Plex-Client-Identifier: %s", plex_api_get_client_id());
+    headers = curl_slist_append(headers, id_hdr);
+    headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
+    headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
+    headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
+    return headers;
+}
+
+// POST /downloadQueue - creates this client's download queue, or just
+// returns the existing one (per the API's own doc comment, it's scoped to
+// "this client...and user", so calling this again next session is fine and
+// expected - no need to persist the id anywhere).
+static bool dlq_ensure_queue(void) {
+    if (s_dlq_id > 0) return true;
+    if (s_dlq_unsupported) return false;
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s/downloadQueue", plex_api_get_server_url());
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    struct curl_slist* headers = dlq_headers();
+    HttpBuf buf = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_buf_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    bool ok = false;
+    if (res == CURLE_OK && http_code == 200 && buf.data) {
+        cJSON* root = cJSON_Parse(buf.data);
+        if (root) {
+            cJSON* mc = cJSON_GetObjectItem(root, "MediaContainer");
+            cJSON* dq = mc ? cJSON_GetObjectItem(mc, "DownloadQueue") : NULL;
+            cJSON* first = (dq && cJSON_IsArray(dq)) ? cJSON_GetArrayItem(dq, 0) : NULL;
+            cJSON* id = first ? cJSON_GetObjectItem(first, "id") : NULL;
+            if (id && cJSON_IsNumber(id) && id->valueint > 0) {
+                s_dlq_id = id->valueint;
+                ok = true;
+            }
+            cJSON_Delete(root);
+        }
+    }
+    if (buf.data) free(buf.data);
+
+    if (!ok) {
+        // Most likely an older PMS build that predates this API (404) -
+        // fall back to the plain file-download URL for the rest of this
+        // session instead of retrying a nonexistent endpoint on every
+        // single download attempt.
+        s_dlq_unsupported = true;
+        LOG_WARN("offline: /downloadQueue unavailable (http=%ld) - falling back to direct file URLs", http_code);
+    }
+    return ok;
+}
+
+// POST /downloadQueue/<id>/add?keys=<path> - queues one track. `rating_key`
+// may be a bare id or an already-prefixed "/library/metadata/..." path, same
+// flexibility plex_api.c's own transcode/stream URL builders allow.
+static bool dlq_add_item(const char* rating_key, int* item_id_out) {
+    if (!dlq_ensure_queue()) return false;
+
+    char raw_path[512];
+    if (strncmp(rating_key, "/library/metadata/", 18) == 0 || rating_key[0] == '/') {
+        snprintf(raw_path, sizeof(raw_path), "%s", rating_key);
+    } else {
+        snprintf(raw_path, sizeof(raw_path), "/library/metadata/%s", rating_key);
+    }
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    char* encoded_path = curl_easy_escape(curl, raw_path, 0);
+    if (!encoded_path) {
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url),
+             "%s/downloadQueue/%d/add?keys=%s&protocol=http&directPlay=1&directStream=1&directStreamAudio=1",
+             plex_api_get_server_url(), s_dlq_id, encoded_path);
+    curl_free(encoded_path);
+
+    struct curl_slist* headers = dlq_headers();
+    HttpBuf buf = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_buf_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    bool ok = false;
+    if (res == CURLE_OK && http_code == 200 && buf.data) {
+        cJSON* root = cJSON_Parse(buf.data);
+        if (root) {
+            cJSON* mc = cJSON_GetObjectItem(root, "MediaContainer");
+            cJSON* items = mc ? cJSON_GetObjectItem(mc, "AddedQueueItems") : NULL;
+            cJSON* first = (items && cJSON_IsArray(items)) ? cJSON_GetArrayItem(items, 0) : NULL;
+            cJSON* id = first ? cJSON_GetObjectItem(first, "id") : NULL;
+            if (id && cJSON_IsNumber(id) && id->valueint > 0) {
+                *item_id_out = id->valueint;
+                ok = true;
+            }
+            cJSON_Delete(root);
+        }
+    }
+    if (buf.data) free(buf.data);
+    if (!ok) LOG_WARN("offline: couldn't add '%s' to the download queue (http=%ld)", rating_key, http_code);
+    return ok;
+}
+
+// GET /downloadQueue/<id>/items/<item_id> - one item's current status
+// ("deciding"/"waiting"/"processing"/"available"/"error"/"expired").
+static bool dlq_poll_item_status(int item_id, char* status_out, size_t status_max) {
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s/downloadQueue/%d/items/%d", plex_api_get_server_url(), s_dlq_id, item_id);
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    struct curl_slist* headers = dlq_headers();
+    HttpBuf buf = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_buf_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&buf);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    bool ok = false;
+    if (res == CURLE_OK && http_code == 200 && buf.data) {
+        cJSON* root = cJSON_Parse(buf.data);
+        if (root) {
+            cJSON* mc = cJSON_GetObjectItem(root, "MediaContainer");
+            cJSON* items = mc ? cJSON_GetObjectItem(mc, "DownloadQueueItem") : NULL;
+            cJSON* first = (items && cJSON_IsArray(items)) ? cJSON_GetArrayItem(items, 0) : NULL;
+            cJSON* status = first ? cJSON_GetObjectItem(first, "status") : NULL;
+            if (status && cJSON_IsString(status)) {
+                strncpy(status_out, status->valuestring, status_max - 1);
+                status_out[status_max - 1] = '\0';
+                ok = true;
+            }
+            cJSON_Delete(root);
+        }
+    }
+    if (buf.data) free(buf.data);
+    return ok;
+}
+
+// DELETE /downloadQueue/<id>/items/<item_id> - best-effort cleanup once an
+// item's been fetched (or given up on) - see finish_active_download(). Not
+// fatal if this fails; a leftover item just expires server-side eventually.
+static void dlq_remove_item(int item_id) {
+    if (s_dlq_id <= 0 || item_id <= 0) return;
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s/downloadQueue/%d/items/%d", plex_api_get_server_url(), s_dlq_id, item_id);
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+    struct curl_slist* headers = dlq_headers();
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+}
+
+// Runs the whole create-queue/add/poll sequence for one direct download and,
+// on success, builds the media URL to actually fetch it from - see
+// start_next_download(). Blocking (real network round-trips, occasionally a
+// few seconds waiting on PMS's decision) - the module comment above explains
+// why this is fine to call without s_lock held.
+static bool dlq_prepare_direct_item(const char* rating_key, int* item_id_out, char* url_out, size_t url_max) {
+    if (!dlq_ensure_queue()) return false;
+
+    int item_id = 0;
+    if (!dlq_add_item(rating_key, &item_id)) return false;
+
+    char status[32] = "";
+    bool ready = false;
+    for (int attempt = 0; attempt < 20; attempt++) { // ~10s worst case (20 * 500ms) - plenty for
+                                                       // a direct (no actual transcode work) item
+        if (!dlq_poll_item_status(item_id, status, sizeof(status))) break;
+        if (strcmp(status, "available") == 0) { ready = true; break; }
+        if (strcmp(status, "error") == 0 || strcmp(status, "expired") == 0) break;
+        svcSleepThread(500 * 1000 * 1000LL);
+    }
+
+    if (!ready) {
+        LOG_WARN("offline: download queue item for '%s' never became available (last status '%s')",
+                 rating_key, status[0] ? status : "?");
+        dlq_remove_item(item_id); // best-effort - don't leak a half-decided item server-side
+        return false;
+    }
+
+    *item_id_out = item_id;
+    snprintf(url_out, url_max, "%s/downloadQueue/%d/item/%d/media", plex_api_get_server_url(), s_dlq_id, item_id);
+    return true;
+}
+
 // Tears down whatever the active transfer's curl/file handles are.
 // `delete_partial` distinguishes an explicit cancel (user deleted this item,
 // or offline_delete_all() wiped everything - remove the .part file and its
@@ -1075,6 +1350,19 @@ static void cancel_active_download(bool delete_partial) {
         clear_resume_record();
     }
     memset(&s_active, 0, sizeof(s_active));
+}
+
+// 5s, 10s, 20s, 40s, 80s, capped at 120s - short enough that a real blip
+// recovers quickly, long enough that a genuinely unreachable server isn't
+// hammered every frame's worth of retries. Used both by finish_active_
+// download()'s failed-transfer retry and start_next_download()'s failed-
+// prepare retry (see the Download Queue branch there) - the same backoff
+// makes sense for either kind of failure.
+static u64 retry_backoff_ticks(int retry_count) {
+    int shift = retry_count < 5 ? retry_count : 5;
+    double secs = 5.0 * (double)(1 << shift);
+    if (secs > 120.0) secs = 120.0;
+    return (u64)(secs * 268123480.0); // 3DS tick rate - matches the constant already used elsewhere (e.g. audio_player.c)
 }
 
 static void start_next_download(void) {
@@ -1118,8 +1406,54 @@ static void start_next_download(void) {
     strncpy(stub.part_key, item.part_key, sizeof(stub.part_key) - 1);
 
     char url[PLEX_MAX_URL];
-    bool got_url = direct ? plex_api_get_download_url(&stub, url, sizeof(url))
-                           : plex_api_get_transcode_url(&stub, url, sizeof(url));
+    bool got_url = false;
+    int dlq_item_id = 0;
+    bool via_dlq = false;
+
+    if (direct) {
+        // Route through the dedicated Download Queue API (see the dlq_*()
+        // helpers above) rather than the plain file URL: it's a wholly
+        // separate subsystem from playback's streaming/transcode sessions,
+        // so a background download here can never collide with (and 401) a
+        // live playback session the way reusing the universal transcoder
+        // did for the non-direct branch below. Preparing an item (queue +
+        // add + poll) can take a few seconds of real network round-trips -
+        // drop the lock around it, same reasoning as every other slow-I/O
+        // spot fixed this session (see save_manifest()/maybe_cache_album_
+        // thumb()) - safe here since `item`/`stub` are both plain local
+        // copies nothing below still needs from shared state during the gap.
+        LightLock_Unlock(&s_lock);
+        bool prepared = dlq_prepare_direct_item(item.rating_key, &dlq_item_id, url, sizeof(url));
+        LightLock_Lock(&s_lock);
+
+        if (prepared) {
+            got_url = true;
+            via_dlq = true;
+        } else if (s_dlq_unsupported) {
+            // No /downloadQueue on this PMS at all - fall back to exactly
+            // what this branch did before that API existed.
+            got_url = plex_api_get_download_url(&stub, url, sizeof(url));
+        } else {
+            // A real (presumably transient) failure preparing this specific
+            // item - back off and retry later like any other failed
+            // attempt, rather than dropping it silently.
+            if (item.retry_count < OFFLINE_MAX_RETRIES) {
+                item.retry_count++;
+                item.retry_not_before = svcGetSystemTick() + retry_backoff_ticks(item.retry_count);
+                queue_push_front(&item);
+                save_queue();
+                LOG_WARN("offline: couldn't prepare '%s' for download - will retry (%d/%d)",
+                         item.title, item.retry_count, OFFLINE_MAX_RETRIES);
+            } else {
+                LOG_ERROR("offline: giving up preparing '%s' for download after %d attempt(s)",
+                          item.title, item.retry_count + 1);
+            }
+            return;
+        }
+    } else {
+        got_url = plex_api_get_download_transcode_url(&stub, url, sizeof(url));
+    }
+
     if (!got_url) {
         LOG_ERROR("offline: couldn't build a download URL for '%s' - skipping", item.title);
         return;
@@ -1166,14 +1500,16 @@ static void start_next_download(void) {
         snprintf(hdr, sizeof(hdr), "X-Plex-Token: %s", token);
         s_active.headers = curl_slist_append(s_active.headers, hdr);
     }
-    // A plain file download (this branch) isn't the universal transcoder,
-    // so the "PMS 400s if X-Plex-Client-Identifier is present" quirk
-    // audio_player.c works around (see its comment) doesn't apply here -
-    // and *including* it is what tells PMS which known device/client is
-    // asking, the same identity every other request in this app asserts.
-    // Omitted before, which is almost certainly why a download never showed
-    // up as this console's activity server-side: with no client id on the
-    // request, PMS has nothing to attribute it to. A transcoded download
+    // Neither a Download Queue media fetch nor the plain-file fallback (this
+    // branch, `direct`) is the universal transcoder, so the "PMS 400s if
+    // X-Plex-Client-Identifier is present" quirk audio_player.c works around
+    // (see its comment) doesn't apply to either - and *including* it is what
+    // tells PMS which known device/client is asking, the same identity every
+    // other request in this app asserts (the Download Queue API's own spec
+    // lists it as an expected header on every one of its endpoints). Omitted
+    // before this download engine reused plex_api_get_download_url() for
+    // this branch, which is almost certainly why a download never showed up
+    // as this console's activity server-side. The actual transcode branch
     // (the `else` below, going through the same universal-transcoder
     // endpoint as streaming) keeps omitting it, matching audio_player.c.
     if (direct) {
@@ -1208,6 +1544,7 @@ static void start_next_download(void) {
     s_active.bytes_done = (size_t)existing_size;
     s_active.bytes_total = 0;
     s_active.resume_offset = (size_t)existing_size;
+    s_active.dlq_item_id = via_dlq ? dlq_item_id : 0;
     s_active.valid = true;
 
     if (direct) save_resume_record(&item);
@@ -1215,18 +1552,9 @@ static void start_next_download(void) {
     if (existing_size > 0) {
         LOG_INFO("offline: resuming '%s' from %ld bytes -> %s", item.title, existing_size, s_active.final_path);
     } else {
-        LOG_INFO("offline: downloading '%s' -> %s", item.title, s_active.final_path);
+        LOG_INFO("offline: downloading '%s' -> %s (%s)", item.title, s_active.final_path,
+                 via_dlq ? "download queue" : (direct ? "direct" : "transcode"));
     }
-}
-
-// 5s, 10s, 20s, 40s, 80s, capped at 120s - short enough that a real blip
-// recovers quickly, long enough that a genuinely unreachable server isn't
-// hammered every frame's worth of retries.
-static u64 retry_backoff_ticks(int retry_count) {
-    int shift = retry_count < 5 ? retry_count : 5;
-    double secs = 5.0 * (double)(1 << shift);
-    if (secs > 120.0) secs = 120.0;
-    return (u64)(secs * 268123480.0); // 3DS tick rate - matches the constant already used elsewhere (e.g. audio_player.c)
 }
 
 static void finish_active_download(void) {
@@ -1297,6 +1625,22 @@ static void finish_active_download(void) {
         clear_resume_record();
         save_manifest();
         LOG_INFO("offline: finished '%s' (%d bytes)", s_active.item.title, (int)s_active.bytes_done);
+    }
+
+    // Whether this attempt just finished, is about to be retried, or gave
+    // up entirely, a Download Queue item created for it (see start_next_
+    // download()) is done being useful either way - a fresh one gets added
+    // on the next attempt regardless (queue items aren't reused across
+    // attempts, since the underlying byte-range resume only needs the file
+    // on disk, not any particular item id - see start_next_download()'s
+    // resume-detection comment), so release this one now rather than
+    // leaving it to expire server-side on its own. Network call - drop the
+    // lock around it, same pattern as maybe_cache_album_thumb() above.
+    if (s_active.dlq_item_id > 0) {
+        int dlq_item_id = s_active.dlq_item_id;
+        LightLock_Unlock(&s_lock);
+        dlq_remove_item(dlq_item_id);
+        LightLock_Lock(&s_lock);
     }
 
     memset(&s_active, 0, sizeof(s_active));

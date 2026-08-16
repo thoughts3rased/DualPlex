@@ -249,6 +249,16 @@ bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, s
 // concurrent transcode sessions.
 bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url_max);
 
+// Same idea as plex_api_get_download_url(), for a track that isn't already
+// in a format the 3DS can decode (offline.c's downloader falls back to this
+// when the source needs transcoding) - unlike that one, this DOES go through
+// the same universal transcoder as live playback, since forcing MP3 output
+// has no equivalent on the plain file-download path. Uses its own transcode
+// session id (distinct from plex_api_get_transcode_url()'s, even for the
+// exact same track) so downloading a track doesn't collide with - and break
+// - a live-playback transcode session for that same track.
+bool plex_api_get_download_transcode_url(const PlexTrack* track, char* url_out, size_t url_max);
+
 typedef struct {
     int time_ms;
     char text[128];
