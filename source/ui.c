@@ -2333,9 +2333,7 @@ void ui_render_top(C3D_RenderTarget* top) {
         
         C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 32, C2D_Color32(0x28, 0x28, 0x38, 0xFF));
         C2D_DrawCircleSolid(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 0.5f, 24, C2D_Color32(0x18, 0x18, 0x24, 0xFF));
-        
-        draw_loading_spinner(art_x + art_size / 2.0f, art_y + art_size / 2.0f, 10, NULL);
-        
+
         draw_text_centered("NO TRACK PLAYING", 145, TOP_WIDTH, 0.65f, 0.65f, COL_ACCENT);
         draw_text_centered("Select a track to start playback", 170, TOP_WIDTH, 0.45f, 0.45f, COL_TEXT_DIM);
         
