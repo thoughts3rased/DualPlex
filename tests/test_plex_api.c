@@ -27,6 +27,7 @@ extern bool g_stub_is_new3ds;
 extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
 extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
 extern bool resolve_host_is_local_via_dns(const char* host);
+extern int parse_tracks_from_json(const char* response, PlexTrack* out, int start, int max, int* out_total);
 
 /* ---------------------------------------------------------------- test framework */
 
@@ -445,6 +446,84 @@ TEST(stream_url_flac_direct_tier_on_old3ds_falls_back_to_transcode_with_valid_bi
 }
 
 /* ================================================================== */
+/* plex_api_get_download_url() (offline.c's download engine): must always
+ * point at the track's original file via its part_key, with no transcode
+ * params at all - unlike plex_api_get_stream_url()/get_transcode_url(),
+ * quality tier and console model don't factor in here. */
+
+TEST(download_url_uses_part_key_with_no_transcode_params) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_MP3_64); // must not affect the download URL at all
+
+    PlexTrack track;
+    make_track(&track, "777", "/library/parts/777/1/song.flac", "flac", 900);
+
+    char url[2048];
+    CHECK(plex_api_get_download_url(&track, url, sizeof(url)));
+    CHECK_STR_EQ(url, "http://192.168.0.200:32400/library/parts/777/1/song.flac");
+    CHECK(strstr(url, "transcode") == NULL);
+}
+
+TEST(download_url_fails_gracefully_with_no_part_key) {
+    init_plex_api();
+
+    PlexTrack track;
+    make_track(&track, "777", NULL, "flac", 900);
+
+    char url[2048];
+    CHECK(!plex_api_get_download_url(&track, url, sizeof(url)));
+}
+
+/* ================================================================== */
+/* parse_tracks_from_json(): offline.c groups downloaded tracks back into
+ * artists/albums by parentRatingKey/grandparentRatingKey (not just their
+ * display titles, which can collide) - regression coverage for actually
+ * reading those two fields off the real MediaContainer.Metadata[] shape,
+ * both as PMS sends them (JSON numbers) and as a string would parse too. */
+
+TEST(parse_tracks_extracts_album_and_artist_rating_keys_from_numbers) {
+    const char* json =
+        "{\"MediaContainer\":{\"totalSize\":1,\"Metadata\":[{"
+        "\"ratingKey\":111,\"title\":\"Song\","
+        "\"parentRatingKey\":222,\"grandparentRatingKey\":333,"
+        "\"grandparentTitle\":\"Artist\",\"parentTitle\":\"Album\","
+        "\"duration\":180000,\"index\":3,"
+        "\"Media\":[{\"audioCodec\":\"flac\",\"bitrate\":900,"
+        "\"Part\":[{\"key\":\"/library/parts/111/1/song.flac\"}]}]"
+        "}]}}";
+
+    PlexTrack tracks[4];
+    int total = 0;
+    int parsed = parse_tracks_from_json(json, tracks, 0, 4, &total);
+
+    CHECK(parsed == 1);
+    CHECK_STR_EQ(tracks[0].rating_key, "111");
+    CHECK_STR_EQ(tracks[0].album_rating_key, "222");
+    CHECK_STR_EQ(tracks[0].artist_rating_key, "333");
+    CHECK_STR_EQ(tracks[0].grandparent_title, "Artist");
+    CHECK_STR_EQ(tracks[0].parent_title, "Album");
+}
+
+TEST(parse_tracks_extracts_album_and_artist_rating_keys_from_strings) {
+    /* Some Plex agents/library types return these as strings rather than
+     * numbers - both must work since parse_tracks_from_json() is shared by
+     * every track-list endpoint regardless of library/agent. */
+    const char* json =
+        "{\"MediaContainer\":{\"Metadata\":[{"
+        "\"ratingKey\":\"111\",\"title\":\"Song\","
+        "\"parentRatingKey\":\"222\",\"grandparentRatingKey\":\"333\","
+        "\"Media\":[{\"Part\":[{\"key\":\"/library/parts/111/1/song.mp3\"}]}]"
+        "}]}}";
+
+    PlexTrack tracks[4];
+    int parsed = parse_tracks_from_json(json, tracks, 0, 4, NULL);
+
+    CHECK(parsed == 1);
+    CHECK_STR_EQ(tracks[0].album_rating_key, "222");
+    CHECK_STR_EQ(tracks[0].artist_rating_key, "333");
+}
+
+/* ================================================================== */
 /* parse_lyrics_stream_response(): the actual bug report - lyrics always
  * showed "No time-synced lyrics available" for every track. Root cause: the
  * code assumed the lyrics stream endpoint returned either raw LRC text or a
@@ -773,6 +852,10 @@ int main(void) {
     RUN(stream_url_flac_direct_declines_hi_res_source_even_on_new3ds);
     RUN(stream_url_flac_direct_allows_48khz_on_new3ds);
     RUN(stream_url_flac_direct_tier_on_old3ds_falls_back_to_transcode_with_valid_bitrate);
+    RUN(download_url_uses_part_key_with_no_transcode_params);
+    RUN(download_url_fails_gracefully_with_no_part_key);
+    RUN(parse_tracks_extracts_album_and_artist_rating_keys_from_numbers);
+    RUN(parse_tracks_extracts_album_and_artist_rating_keys_from_strings);
     RUN(parse_lyrics_stream_response_real_plex_json_shape);
     RUN(parse_lyrics_stream_response_respects_max_cap);
     RUN(parse_lyrics_stream_response_flat_array_fallback_shape);

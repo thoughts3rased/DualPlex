@@ -1,5 +1,6 @@
 #include <3ds.h>
 #include <citro2d.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
@@ -123,76 +124,127 @@ void album_art_load_async(const char* thumb_path, const char* server_url, const 
     LOG_INFO("Started async background download for album art: %s", url);
 }
 
+// Decodes raw image bytes (JPEG/PNG - whatever stb_image handles) and, on
+// success, uploads them into s_tex/s_image as a 128x128 tiled RGBA8 texture,
+// same resampling+rotation as the network path always did. Shared by the
+// async network completion handler below and album_art_load_local() (offline
+// playback's on-SD-card cached thumbnails) - decoding is identical either
+// way, only how the bytes were obtained differs. Does not touch s_is_loading
+// (callers manage that themselves, since only the network path has a
+// meaningful "loading" state).
+static bool decode_and_upload(const u8* data, size_t size) {
+    if (!data || size == 0) return false;
+
+    int w = 0, h = 0, channels = 0;
+    u8* pixels = stbi_load_from_memory(data, (int)size, &w, &h, &channels, 4);
+    if (!pixels) {
+        LOG_WARN("stbi_load_from_memory failed on %d bytes", (int)size);
+        return false;
+    }
+
+    u32 tex_w = 128;
+    u32 tex_h = 128;
+    if (!C3D_TexInit(&s_tex, tex_w, tex_h, GPU_RGBA8)) {
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    u32* tex_data = (u32*)s_tex.data;
+    memset(tex_data, 0, tex_w * tex_h * 4);
+
+    // Resample & rotate 90 deg CCW to counteract 90 deg CW hardware rotation
+    for (u32 ty = 0; ty < tex_h; ty++) {
+        for (u32 tx = 0; tx < tex_w; tx++) {
+            u32 sx = ((tex_h - 1 - ty) * (u32)w) / tex_h;
+            u32 sy = (tx * (u32)h) / tex_w;
+
+            u32 src_idx = (sy * (u32)w + sx) * 4;
+            u8 r = pixels[src_idx + 0];
+            u8 g = pixels[src_idx + 1];
+            u8 b = pixels[src_idx + 2];
+            u8 a = pixels[src_idx + 3];
+
+            // 3DS PICA200 GPU_RGBA8 format: R, G, B, A
+            u32 color = (r << 24) | (g << 16) | (b << 8) | a;
+
+            u32 tile_x = tx / 8;
+            u32 tile_y = ty / 8;
+            u32 in_tile_x = tx % 8;
+            u32 in_tile_y = ty % 8;
+
+            u32 tile_index = (tile_y * (tex_w / 8)) + tile_x;
+            u32 pixel_index = (tile_index * 64) + get_morton_offset(in_tile_x, in_tile_y);
+            tex_data[pixel_index] = color;
+        }
+    }
+    stbi_image_free(pixels);
+    GSPGPU_FlushDataCache(s_tex.data, tex_w * tex_h * 4);
+
+    s_subtex.width = 128;
+    s_subtex.height = 128;
+    s_subtex.left = 0.0f;
+    s_subtex.top = 0.0f;
+    s_subtex.right = 1.0f;
+    s_subtex.bottom = 1.0f;
+
+    s_image.tex = &s_tex;
+    s_image.subtex = &s_subtex;
+    s_has_texture = true;
+    LOG_INFO("Album art resampled & decoded into 128x128 texture (%dx%d source)", w, h);
+    return true;
+}
+
+// Loads a thumbnail straight off the SD card (offline.c's per-album cache -
+// see offline_get_thumb_path()) instead of over the network - used for the
+// Now Playing screen while playing back a downloaded track, where there may
+// be no server connection at all to fetch from. Synchronous (the file's
+// already local, so there's no "in flight" state to pump), unlike
+// album_art_load_async().
+void album_art_load_local(const char* path) {
+    album_art_cleanup();
+    if (!path || !path[0]) return;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return;
+    }
+
+    u8* buf = (u8*)malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+
+    if (got == (size_t)sz) {
+        decode_and_upload(buf, got);
+    }
+    free(buf);
+}
+
 void album_art_update(void) {
     if (!s_is_loading || !s_curl_multi || !s_curl_easy) return;
-    
+
     int running_handles = 0;
     CURLMcode mres = curl_multi_perform(s_curl_multi, &running_handles);
-    
+
     if (mres != CURLM_OK || running_handles == 0) {
         s_is_loading = false;
         long http_code = 0;
         curl_easy_getinfo(s_curl_easy, CURLINFO_RESPONSE_CODE, &http_code);
-        
+
         if (http_code == 200 && s_buf.data && s_buf.size > 0) {
-            int w = 0, h = 0, channels = 0;
-            u8* pixels = stbi_load_from_memory((const u8*)s_buf.data, (int)s_buf.size, &w, &h, &channels, 4);
-            if (pixels) {
-                u32 tex_w = 128;
-                u32 tex_h = 128;
-                if (C3D_TexInit(&s_tex, tex_w, tex_h, GPU_RGBA8)) {
-                    u32* tex_data = (u32*)s_tex.data;
-                    memset(tex_data, 0, tex_w * tex_h * 4);
-                    
-                    // Resample & rotate 90 deg CCW to counteract 90 deg CW hardware rotation
-                    for (u32 ty = 0; ty < tex_h; ty++) {
-                        for (u32 tx = 0; tx < tex_w; tx++) {
-                            u32 sx = ((tex_h - 1 - ty) * (u32)w) / tex_h;
-                            u32 sy = (tx * (u32)h) / tex_w;
-                            
-                            u32 src_idx = (sy * (u32)w + sx) * 4;
-                            u8 r = pixels[src_idx + 0];
-                            u8 g = pixels[src_idx + 1];
-                            u8 b = pixels[src_idx + 2];
-                            u8 a = pixels[src_idx + 3];
-                            
-                            // 3DS PICA200 GPU_RGBA8 format: R, G, B, A
-                            u32 color = (r << 24) | (g << 16) | (b << 8) | a;
-                            
-                            u32 tile_x = tx / 8;
-                            u32 tile_y = ty / 8;
-                            u32 in_tile_x = tx % 8;
-                            u32 in_tile_y = ty % 8;
-                            
-                            u32 tile_index = (tile_y * (tex_w / 8)) + tile_x;
-                            u32 pixel_index = (tile_index * 64) + get_morton_offset(in_tile_x, in_tile_y);
-                            tex_data[pixel_index] = color;
-                        }
-                    }
-                    stbi_image_free(pixels);
-                    GSPGPU_FlushDataCache(s_tex.data, tex_w * tex_h * 4);
-                    
-                    s_subtex.width = 128;
-                    s_subtex.height = 128;
-                    s_subtex.left = 0.0f;
-                    s_subtex.top = 0.0f;
-                    s_subtex.right = 1.0f;
-                    s_subtex.bottom = 1.0f;
-                    
-                    s_image.tex = &s_tex;
-                    s_image.subtex = &s_subtex;
-                    s_has_texture = true;
-                    LOG_INFO("Async album art resampled & decoded into 128x128 texture (%dx%d source)", w, h);
-                } else {
-                    stbi_image_free(pixels);
-                }
-            } else {
-                LOG_WARN("stbi_load_from_memory failed on %d bytes", (int)s_buf.size);
-            }
+            decode_and_upload((const u8*)s_buf.data, s_buf.size);
         } else {
             LOG_WARN("Async album art HTTP download failed (code=%ld)", http_code);
         }
-        
+
         curl_multi_remove_handle(s_curl_multi, s_curl_easy);
         curl_easy_cleanup(s_curl_easy);
         s_curl_easy = NULL;

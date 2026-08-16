@@ -1107,7 +1107,13 @@ int plex_api_get_albums(const char* artist_key, PlexAlbum* out, int max) {
     return plex_api_get_albums_page(artist_key, out, 0, max, &total);
 }
 
-static int parse_tracks_from_json(const char* response, PlexTrack* out, int start, int max, int* out_total) {
+// Shared by every track-list endpoint (album/playlist tracks, search,
+// recently-added, async queue fill) - all of them return the same
+// MediaContainer.Metadata[] shape. Not declared in plex_api.h (an internal
+// implementation detail); given external linkage only so tests/test_plex_api.c
+// can exercise its field parsing directly against captured server JSON,
+// same reasoning as parse_lyrics_stream_response() above.
+int parse_tracks_from_json(const char* response, PlexTrack* out, int start, int max, int* out_total) {
     if (!response || !out) return 0;
     int items_parsed = 0;
     cJSON* json = cJSON_Parse(response);
@@ -1137,7 +1143,9 @@ static int parse_tracks_from_json(const char* response, PlexTrack* out, int star
                     cJSON* duration = cJSON_GetObjectItem(item, "duration");
                     cJSON* index = cJSON_GetObjectItem(item, "index");
                     cJSON* userRating = cJSON_GetObjectItem(item, "userRating"); // 0.0-10.0, omitted entirely if the track has never been rated
-                    
+                    cJSON* parentRatingKey = cJSON_GetObjectItem(item, "parentRatingKey");
+                    cJSON* grandparentRatingKey = cJSON_GetObjectItem(item, "grandparentRatingKey");
+
                     if (ratingKey) {
                         if (cJSON_IsString(ratingKey) && ratingKey->valuestring) {
                             strncpy(out[idx].rating_key, ratingKey->valuestring, sizeof(out[idx].rating_key) - 1);
@@ -1158,6 +1166,20 @@ static int parse_tracks_from_json(const char* response, PlexTrack* out, int star
                     if (duration && cJSON_IsNumber(duration)) out[idx].duration = duration->valueint;
                     if (index && cJSON_IsNumber(index)) out[idx].index = index->valueint;
                     if (userRating && cJSON_IsNumber(userRating)) out[idx].user_rating = (float)userRating->valuedouble;
+                    if (parentRatingKey) {
+                        if (cJSON_IsString(parentRatingKey) && parentRatingKey->valuestring) {
+                            strncpy(out[idx].album_rating_key, parentRatingKey->valuestring, sizeof(out[idx].album_rating_key) - 1);
+                        } else if (cJSON_IsNumber(parentRatingKey)) {
+                            snprintf(out[idx].album_rating_key, sizeof(out[idx].album_rating_key), "%d", parentRatingKey->valueint);
+                        }
+                    }
+                    if (grandparentRatingKey) {
+                        if (cJSON_IsString(grandparentRatingKey) && grandparentRatingKey->valuestring) {
+                            strncpy(out[idx].artist_rating_key, grandparentRatingKey->valuestring, sizeof(out[idx].artist_rating_key) - 1);
+                        } else if (cJSON_IsNumber(grandparentRatingKey)) {
+                            snprintf(out[idx].artist_rating_key, sizeof(out[idx].artist_rating_key), "%d", grandparentRatingKey->valueint);
+                        }
+                    }
 
                     cJSON* media = cJSON_GetObjectItem(item, "Media");
                     if (media && cJSON_IsArray(media)) {
@@ -1603,6 +1625,12 @@ bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_m
     }
     
     // Fallback: direct stream the part_key as-is
+    snprintf(url_out, url_max, "%s%s", s_server_url, track->part_key);
+    return true;
+}
+
+bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url_max) {
+    if (!s_initialized || !track || track->part_key[0] == '\0') return false;
     snprintf(url_out, url_max, "%s%s", s_server_url, track->part_key);
     return true;
 }

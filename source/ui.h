@@ -18,6 +18,7 @@ typedef enum {
     SCREEN_ALBUMS,        // List of albums for an artist
     SCREEN_TRACKS,        // List of tracks for an album or playlist
     SCREEN_PLAYLISTS,     // List of playlists
+    SCREEN_DOWNLOADS,     // Offline downloads hub - browse/manage what's saved to the SD card
     SCREEN_SEARCH,        // Search tracks screen
     SCREEN_NOW_PLAYING,   // Dedicated Now Playing controls screen
     SCREEN_QUEUE,         // Play Queue / Up Next screen

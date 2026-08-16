@@ -60,6 +60,17 @@ typedef struct {
     int duration;
     int index;
     float user_rating; // Plex's 0.0-10.0 star rating (0 = unrated); each star = 2.0
+    // Rating keys of this track's parent album/artist ("parentRatingKey" /
+    // "grandparentRatingKey" in Plex's JSON) - not used for anything in the
+    // normal online browsing flow (grandparent_title/parent_title above
+    // already cover display), but offline.c needs stable ids (not just
+    // display titles, which can collide) to group downloaded tracks back
+    // into artists/albums and to know which tracks a given album/artist
+    // download should include. Populated for every track-list endpoint
+    // (they all funnel through parse_tracks_from_json()), so it's available
+    // regardless of which screen a download was queued from.
+    char album_rating_key[PLEX_MAX_STR];
+    char artist_rating_key[PLEX_MAX_STR];
 } PlexTrack;
 
 typedef struct {
@@ -221,6 +232,15 @@ bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t ur
 // implementing seeking (the player reloads from this URL and calls
 // audio_player_set_position_offset_ms(seek_ms) to match).
 bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, size_t url_max);
+
+// Build a URL for saving a track to the SD card for offline playback
+// (offline.c). Unlike plex_api_get_stream_url(), this never transcodes -
+// it always points at the track's original file (server_url + part_key),
+// regardless of the current adaptive quality tier or console model, so a
+// download captures the source file as-is and a download in progress never
+// contends with a currently-playing track for one of the server's limited
+// concurrent transcode sessions.
+bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url_max);
 
 typedef struct {
     int time_ms;

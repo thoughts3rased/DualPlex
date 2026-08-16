@@ -11,6 +11,7 @@
 #include "config.h"
 #include "plex_api.h"
 #include "audio_player.h"
+#include "offline.h"
 #include "ui.h"
 #include "logger.h"
 
@@ -67,6 +68,7 @@ int main(int argc, char* argv[]) {
     logger_init();
     LOG_INFO("DualPlex starting up...");
     audio_player_init();
+    offline_init();
     ui_init();
     ui_set_config(&app_config);
     
@@ -142,6 +144,7 @@ int main(int argc, char* argv[]) {
 
         // Update
         audio_player_update();
+        offline_update(); // background download queue - see offline.h
         ui_update(kDown, kHeld, touch);
         
         // Render
@@ -167,6 +170,7 @@ int main(int argc, char* argv[]) {
     // Cleanup (reverse order)
     ui_cleanup();
     audio_player_cleanup();
+    offline_cleanup();
     plex_api_cleanup();
     curl_global_cleanup();
     

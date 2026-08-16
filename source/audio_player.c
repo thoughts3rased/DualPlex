@@ -71,6 +71,14 @@ typedef struct {
     CURL* curl_easy;
     struct curl_slist* headers;
     bool curl_paused;
+    // Local (SD card) playback - see deck_start_stream()'s "file://" handling
+    // for offline.c downloaded tracks. When set, the ring buffer is filled by
+    // deck_local_pump() reading straight off the filesystem instead of by
+    // curl/deck_curl_write_cb() - everything downstream of the ring buffer
+    // (decode, NDSP feed, crossfade) is unchanged and doesn't know the
+    // difference.
+    bool is_local;
+    FILE* local_fp;
     char current_url[PLEX_MAX_URL];
     int duration_ms;
     int samples_played;
@@ -232,6 +240,47 @@ static size_t deck_curl_write_cb(void* ptr, size_t size, size_t nmemb, void* use
     return total;
 }
 
+// Fills as much of `d`'s ring buffer as there's room for by reading straight
+// off d->local_fp (an already-open SD card file - see deck_start_stream()'s
+// "file://" handling). Local reads are fast and unconditionally blocking
+// (there's no "try again later" backpressure concept like curl's paused-
+// write callback), so this just does one bounded read per call - capped so
+// a single call can't hog a whole frame - rather than looping to fully drain
+// the file. Sets ring.download_finished once fread() hits EOF, same meaning
+// as the network path: no more bytes will ever be added, though the ring may
+// still have unread bytes left to decode.
+#define LOCAL_PUMP_MAX_BYTES (256 * 1024)
+static void deck_local_pump(Deck* d) {
+    if (!d->is_local || !d->local_fp || d->ring.download_finished || d->ring.download_error) return;
+
+    size_t pumped = 0;
+    u8 chunk_buf[8192];
+    while (pumped < LOCAL_PUMP_MAX_BYTES) {
+        size_t avail = deck_ring_available_write(d);
+        if (avail == 0) break;
+        size_t want = sizeof(chunk_buf) < avail ? sizeof(chunk_buf) : avail;
+        size_t got = fread(chunk_buf, 1, want, d->local_fp);
+        if (got > 0) {
+            deck_ring_write(d, chunk_buf, got);
+            d->ring.total_downloaded += got;
+            pumped += got;
+        }
+        if (got < want) {
+            // Short read: either EOF or a real file error - either way,
+            // nothing more is coming from this file.
+            if (ferror(d->local_fp)) {
+                LOG_ERROR("Deck %d: error reading local file mid-playback", d->ndsp_channel);
+                d->ring.download_error = true;
+            } else {
+                d->ring.download_finished = true;
+            }
+            fclose(d->local_fp);
+            d->local_fp = NULL;
+            break;
+        }
+    }
+}
+
 static size_t deck_flac_read_proc(void* pUserData, void* pBufferOut, size_t bytesToRead) {
     Deck* d = (Deck*)pUserData;
     size_t total_read = 0;
@@ -245,6 +294,12 @@ static size_t deck_flac_read_proc(void* pUserData, void* pBufferOut, size_t byte
             total_read += chunk;
         } else {
             if (d->ring.download_finished || d->ring.download_error) break;
+
+            if (d->is_local) {
+                deck_local_pump(d);
+                if (deck_ring_available_read(d) == 0 && (d->ring.download_finished || d->ring.download_error)) break;
+                continue;
+            }
 
             if (s_curl_multi && d->curl_easy) {
                 int running_handles = 0;
@@ -313,6 +368,11 @@ static void deck_teardown(Deck* d) {
         curl_slist_free_all(d->headers);
         d->headers = NULL;
     }
+    if (d->local_fp) {
+        fclose(d->local_fp);
+        d->local_fp = NULL;
+    }
+    d->is_local = false;
 
     ndspChnWaveBufClear(d->ndsp_channel);
     for (int i = 0; i < AUDIO_NUM_WAVE_BUFS; i++) {
@@ -375,47 +435,63 @@ static bool deck_start_stream(Deck* d, const char* url) {
     LOG_INFO("Loading audio stream (%s) on deck %d from URL: %s",
              (d->codec == CODEC_FLAC) ? "FLAC Lossless" : "MP3", d->ndsp_channel, d->current_url);
 
-    d->curl_easy = curl_easy_init();
-    if (!d->curl_easy) {
-        LOG_ERROR("Failed to initialize libcurl easy handle for deck %d!", d->ndsp_channel);
-        return false;
-    }
+    // "file://<absolute sdmc path>" - a track offline.c already downloaded
+    // to the SD card (see offline_get_track_local_path()). Everything past
+    // the ring buffer (decode, NDSP feed, crossfade) is identical either
+    // way; only how the ring buffer gets filled differs (deck_local_pump()
+    // instead of curl) - see the Deck struct's is_local/local_fp comment.
+    static const char LOCAL_FILE_PREFIX[] = "file://";
+    if (strncmp(url, LOCAL_FILE_PREFIX, sizeof(LOCAL_FILE_PREFIX) - 1) == 0) {
+        const char* path = url + (sizeof(LOCAL_FILE_PREFIX) - 1);
+        d->local_fp = fopen(path, "rb");
+        if (!d->local_fp) {
+            LOG_ERROR("Deck %d: failed to open local file for playback: %s", d->ndsp_channel, path);
+            return false;
+        }
+        d->is_local = true;
+    } else {
+        d->curl_easy = curl_easy_init();
+        if (!d->curl_easy) {
+            LOG_ERROR("Failed to initialize libcurl easy handle for deck %d!", d->ndsp_channel);
+            return false;
+        }
 
-    const char* token = plex_api_get_token();
-    if (token && token[0]) {
-        char token_hdr[256];
-        snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
-        d->headers = curl_slist_append(d->headers, token_hdr);
-    }
-    // NOTE: deliberately no X-Plex-Client-Identifier header here - PMS's universal
-    // transcoder rejects the request with a 400 if that header is present at all
-    // (confirmed against real server, PMS 1.43.3). It's not needed to fetch the
-    // stream since the token alone authenticates the request.
-    d->headers = curl_slist_append(d->headers, "X-Plex-Product: " PLEX_PRODUCT);
-    d->headers = curl_slist_append(d->headers, "X-Plex-Device: Nintendo 3DS");
-    // "Chrome" rather than "Nintendo 3DS": PMS's transcoder matches X-Plex-Platform
-    // against its known device-profile list and 400s on anything it doesn't
-    // recognize (confirmed: "Generic" itself has since stopped covering http-
-    // protocol conversion in newer PMS builds - "Chrome" backs Plex Web, one of
-    // Plex's own primary supported clients, and PMS keeps its transcode profile
-    // current for it).
-    d->headers = curl_slist_append(d->headers, "X-Plex-Platform: Chrome");
+        const char* token = plex_api_get_token();
+        if (token && token[0]) {
+            char token_hdr[256];
+            snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
+            d->headers = curl_slist_append(d->headers, token_hdr);
+        }
+        // NOTE: deliberately no X-Plex-Client-Identifier header here - PMS's universal
+        // transcoder rejects the request with a 400 if that header is present at all
+        // (confirmed against real server, PMS 1.43.3). It's not needed to fetch the
+        // stream since the token alone authenticates the request.
+        d->headers = curl_slist_append(d->headers, "X-Plex-Product: " PLEX_PRODUCT);
+        d->headers = curl_slist_append(d->headers, "X-Plex-Device: Nintendo 3DS");
+        // "Chrome" rather than "Nintendo 3DS": PMS's transcoder matches X-Plex-Platform
+        // against its known device-profile list and 400s on anything it doesn't
+        // recognize (confirmed: "Generic" itself has since stopped covering http-
+        // protocol conversion in newer PMS builds - "Chrome" backs Plex Web, one of
+        // Plex's own primary supported clients, and PMS keeps its transcode profile
+        // current for it).
+        d->headers = curl_slist_append(d->headers, "X-Plex-Platform: Chrome");
 
-    curl_easy_setopt(d->curl_easy, CURLOPT_URL, d->current_url);
-    curl_easy_setopt(d->curl_easy, CURLOPT_HTTPHEADER, d->headers);
-    curl_easy_setopt(d->curl_easy, CURLOPT_WRITEFUNCTION, deck_curl_write_cb);
-    curl_easy_setopt(d->curl_easy, CURLOPT_WRITEDATA, (void*)d);
-    curl_easy_setopt(d->curl_easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(d->curl_easy, CURLOPT_UNRESTRICTED_AUTH, 1L);
-    curl_easy_setopt(d->curl_easy, CURLOPT_NOPROGRESS, 1L);
-    curl_easy_setopt(d->curl_easy, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(d->curl_easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
-    curl_easy_setopt(d->curl_easy, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
+        curl_easy_setopt(d->curl_easy, CURLOPT_URL, d->current_url);
+        curl_easy_setopt(d->curl_easy, CURLOPT_HTTPHEADER, d->headers);
+        curl_easy_setopt(d->curl_easy, CURLOPT_WRITEFUNCTION, deck_curl_write_cb);
+        curl_easy_setopt(d->curl_easy, CURLOPT_WRITEDATA, (void*)d);
+        curl_easy_setopt(d->curl_easy, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(d->curl_easy, CURLOPT_UNRESTRICTED_AUTH, 1L);
+        curl_easy_setopt(d->curl_easy, CURLOPT_NOPROGRESS, 1L);
+        curl_easy_setopt(d->curl_easy, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(d->curl_easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+        curl_easy_setopt(d->curl_easy, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
 
-    if (!s_curl_multi) {
-        s_curl_multi = curl_multi_init();
+        if (!s_curl_multi) {
+            s_curl_multi = curl_multi_init();
+        }
+        curl_multi_add_handle(s_curl_multi, d->curl_easy);
     }
-    curl_multi_add_handle(s_curl_multi, d->curl_easy);
 
     d->curl_paused = false;
     d->active = true;
@@ -767,6 +843,17 @@ bool audio_player_active_download_finished(void) {
 void audio_player_update(void) {
     if (s_state == PLAYER_STOPPED || s_state == PLAYER_ERROR) return;
 
+    // Fill any local (offline.c downloaded) deck's ring straight from its
+    // open file - the network path below only ever touches curl handles, so
+    // a local deck needs its own pump here instead. deck_local_pump() itself
+    // sets ring.download_finished/download_error once the file's exhausted,
+    // same as the curl completion handling further down does for the
+    // network path.
+    for (int i = 0; i < 2; i++) {
+        Deck* d = &s_decks[i];
+        if (d->active && d->is_local) deck_local_pump(d);
+    }
+
     // Resume any paused curl transfers once their deck's ring has room.
     for (int i = 0; i < 2; i++) {
         Deck* d = &s_decks[i];
@@ -776,10 +863,12 @@ void audio_player_update(void) {
         }
     }
 
+    // Local decks are excluded here - they're pumped above, and have no
+    // curl_easy handle for the block below to poll.
     bool any_downloading = false;
     for (int i = 0; i < 2; i++) {
         Deck* d = &s_decks[i];
-        if (d->active && !d->ring.download_finished && !d->ring.download_error) any_downloading = true;
+        if (d->active && !d->is_local && !d->ring.download_finished && !d->ring.download_error) any_downloading = true;
     }
 
     if (s_curl_multi && any_downloading) {
@@ -793,7 +882,7 @@ void audio_player_update(void) {
 
         for (int i = 0; i < 2; i++) {
             Deck* d = &s_decks[i];
-            if (!d->active || d->ring.download_finished || d->ring.download_error) continue;
+            if (!d->active || d->is_local || d->ring.download_finished || d->ring.download_error) continue;
 
             long http_code = 0;
             curl_easy_getinfo(d->curl_easy, CURLINFO_RESPONSE_CODE, &http_code);
@@ -818,7 +907,7 @@ void audio_player_update(void) {
             LOG_ERROR("libcurl multi perform failed with code %d", (int)mres);
             for (int i = 0; i < 2; i++) {
                 Deck* d = &s_decks[i];
-                if (d->active && !d->ring.download_finished) d->ring.download_error = true;
+                if (d->active && !d->is_local && !d->ring.download_finished) d->ring.download_error = true;
             }
         } else {
             CURLMsg* msg;
@@ -840,9 +929,13 @@ void audio_player_update(void) {
             }
         }
 
-        // Measure download speed over 2-second windows - active/primary deck only.
+        // Measure download speed over 2-second windows - active/primary deck
+        // only, and only meaningful for a real network transfer (a local
+        // deck's "download speed" would just be SD card read throughput,
+        // which would wrongly feed plex_api_suggest_quality()'s adaptive
+        // quality logic in ui.c).
         Deck* primary = &s_decks[s_active_deck];
-        if (primary->active) {
+        if (primary->active && !primary->is_local) {
             u64 now = svcGetSystemTick();
             u64 elapsed_ticks = now - s_speed_window_start;
             // 268MHz tick rate: 2 seconds = 536,000,000 ticks

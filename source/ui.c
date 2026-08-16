@@ -2,6 +2,7 @@
 #include "plex_api.h"
 #include "audio_player.h"
 #include "album_art.h"
+#include "offline.h"
 #include "logger.h"
 #include "iconfont_bin.h" // bundled Font Awesome Free icon font (SIL OFL 1.1, see licenses/fontawesome-LICENSE.txt), embedded via bin2s from data/iconfont.bin
 
@@ -57,6 +58,28 @@ static int s_num_albums = 0;
 static int s_num_tracks = 0;
 static int s_num_playlists = 0;
 static bool s_need_load_libraries = false;
+
+// True while SCREEN_ARTISTS/ALBUMS/TRACKS/PLAYLISTS are showing offline.c's
+// on-SD-card downloads (reached via Hub > Downloads) rather than the live
+// server - same screens, same s_artists/s_albums/s_tracks/s_playlists
+// arrays, just a different data source and, in play_track(), a different
+// (local file) playback path. Reset to false on the way back to the Hub
+// (see ui_set_screen()'s SCREEN_HUB case) so a later online browse never
+// inherits it by accident.
+static bool s_offline_browse = false;
+
+// Scratch buffers for building the full track list of an artist/album/
+// playlist being queued for download (see queue_download_artist() etc.
+// below) - kept separate from s_albums/s_tracks above since those may
+// belong to whatever the user is *currently* browsing (including a queue
+// that's actively playing, indexed by s_current_track_idx) and queueing a
+// download must not clobber that. Capped below PLEX_MAX_ITEMS to keep this
+// pair of static arrays a reasonable size - an artist with more albums, or
+// an album/playlist with more tracks, than this just has the rest silently
+// left off a single download request.
+#define DL_SCRATCH_MAX 200
+static PlexAlbum s_dl_scratch_albums[DL_SCRATCH_MAX];
+static PlexTrack s_dl_scratch_tracks[DL_SCRATCH_MAX];
 
 // Continuous Lazy Loading State
 static int s_total_items = 0;
@@ -211,7 +234,7 @@ void ui_set_screen(UIScreen screen) {
     s_selected_idx = 0;
     
     if (screen == SCREEN_AUTH_CHOICE) {
-        s_list_count = 3;
+        s_list_count = 4;
         s_setup_field = 0;
     } else if (screen == SCREEN_LINK_PIN) {
         snprintf(s_status_msg, sizeof(s_status_msg), "Creating PIN...");
@@ -239,9 +262,19 @@ void ui_set_screen(UIScreen screen) {
         s_setup_field = 0;
         s_list_count = 3;
     } else if (screen == SCREEN_HUB) {
-        s_list_count = 5;
+        s_list_count = 6;
+        // Leaving the offline-downloads subtree (if we were even in it) -
+        // every online Hub option (Artists/Playlists/Search/etc.) populates
+        // its own screen explicitly, so this only matters as a safety net.
+        s_offline_browse = false;
+    } else if (screen == SCREEN_DOWNLOADS) {
+        s_list_count = 3;
     } else if (screen == SCREEN_PLAYLISTS) {
-        s_num_playlists = plex_api_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+        if (s_offline_browse) {
+            s_num_playlists = offline_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+        } else {
+            s_num_playlists = plex_api_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+        }
         s_list_count = s_num_playlists;
     } else if (screen == SCREEN_LIBRARIES) {
         s_list_count = s_num_libraries;
@@ -994,6 +1027,111 @@ static int compute_prev_track_idx(void) {
     return -1;
 }
 
+// --- Queueing downloads (X on an online Artists/Albums/Playlists/Tracks
+// screen - see the KEY_X handling in ui_update()) ----------------------------
+// Each of these does one or more blocking plex_api_* fetches to get the full
+// track list before handing it to offline.c - same "blocking is fine, it's a
+// quick LAN/localhost round-trip and perform_blocking_request() keeps audio
+// fed while it waits" reasoning every other list-screen navigation in this
+// file already relies on. Only the *metadata* fetch blocks; the actual byte
+// transfer happens in the background afterward (offline_update(), pumped
+// from main.c).
+
+static void queue_download_single_track(const PlexTrack* track) {
+    int new_count = offline_queue_tracks(track, 1);
+    if (new_count > 0) {
+        snprintf(s_status_msg, sizeof(s_status_msg), "Queued '%s' for offline", track->title);
+        s_status_color = COL_PLAYING;
+    } else {
+        snprintf(s_status_msg, sizeof(s_status_msg), "'%s' is already downloaded", track->title);
+        s_status_color = COL_TEXT_DIM;
+    }
+}
+
+static void queue_download_album(const PlexAlbum* album) {
+    int n = plex_api_get_tracks(album->key, s_dl_scratch_tracks, DL_SCRATCH_MAX);
+    int new_count = offline_queue_tracks(s_dl_scratch_tracks, n);
+    if (new_count > 0) {
+        snprintf(s_status_msg, sizeof(s_status_msg), "Queued %d track(s) from '%s'", new_count, album->title);
+        s_status_color = COL_PLAYING;
+    } else {
+        snprintf(s_status_msg, sizeof(s_status_msg), "'%s' is already downloaded", album->title);
+        s_status_color = COL_TEXT_DIM;
+    }
+}
+
+static void queue_download_artist(const PlexArtist* artist) {
+    int n_albums = plex_api_get_albums(artist->key, s_dl_scratch_albums, DL_SCRATCH_MAX);
+    int total_new = 0;
+    for (int i = 0; i < n_albums; i++) {
+        int n_tracks = plex_api_get_tracks(s_dl_scratch_albums[i].key, s_dl_scratch_tracks, DL_SCRATCH_MAX);
+        total_new += offline_queue_tracks(s_dl_scratch_tracks, n_tracks);
+    }
+    if (total_new > 0) {
+        snprintf(s_status_msg, sizeof(s_status_msg), "Queued %d track(s) from '%s'", total_new, artist->title);
+        s_status_color = COL_PLAYING;
+    } else {
+        snprintf(s_status_msg, sizeof(s_status_msg), "'%s' is already fully downloaded", artist->title);
+        s_status_color = COL_TEXT_DIM;
+    }
+}
+
+static void queue_download_playlist(const PlexPlaylist* playlist) {
+    int n = plex_api_get_tracks(playlist->key, s_dl_scratch_tracks, DL_SCRATCH_MAX);
+    int new_count = offline_queue_playlist(playlist->rating_key, playlist->title, s_dl_scratch_tracks, n);
+    if (new_count > 0) {
+        snprintf(s_status_msg, sizeof(s_status_msg), "Queued %d track(s) from '%s'", new_count, playlist->title);
+        s_status_color = COL_PLAYING;
+    } else {
+        snprintf(s_status_msg, sizeof(s_status_msg), "'%s' is already downloaded", playlist->title);
+        s_status_color = COL_TEXT_DIM;
+    }
+}
+
+// Timeline/art/lyrics/analysis bookkeeping for whatever just became "the"
+// current track (index into s_tracks) - shared by play_track() (an
+// immediate hard-cut) and ui_update()'s crossfade-completion handling (which
+// never calls play_track() itself, since the audio's already transitioned by
+// the time that fires - see its comment). Branches on s_offline_browse:
+// none of the network-only pieces (timeline reporting, lyrics, Sonic
+// Analysis) make sense - or are even reachable - with no server connection,
+// and album art comes from offline.c's on-SD-card thumbnail cache instead of
+// a fresh network fetch.
+static void activate_track_metadata(int idx) {
+    if (!s_offline_browse) {
+        plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
+    }
+
+    if (s_offline_browse) {
+        char thumb_path[512];
+        if (offline_get_thumb_path(s_tracks[idx].rating_key, thumb_path, sizeof(thumb_path))) {
+            album_art_load_local(thumb_path);
+        } else {
+            album_art_cleanup();
+        }
+    } else if (s_tracks[idx].thumb[0] != '\0' && s_config) {
+        album_art_load_async(s_tracks[idx].thumb, s_config->server_url, s_config->auth_token);
+    } else {
+        album_art_cleanup();
+    }
+
+    s_num_lyrics = 0;
+    memset(&s_current_analysis, 0, sizeof(s_current_analysis));
+    s_next_analysis_track_idx = -1;
+    memset(&s_next_analysis, 0, sizeof(s_next_analysis));
+    if (s_offline_browse) {
+        // No Sonic Analysis data available offline - compute_crossfade_plan()
+        // already falls back to a plain fixed-duration crossfade whenever
+        // s_current_analysis.valid is false, which it stays here since it's
+        // never fetched.
+        s_analysis_stage = ANALYSIS_STAGE_IDLE;
+    } else {
+        plex_api_lyrics_async_start(s_tracks[idx].rating_key);
+        plex_api_analysis_async_start(s_tracks[idx].rating_key, /*want_tail=*/true);
+        s_analysis_stage = ANALYSIS_STAGE_FETCHING_CURRENT;
+    }
+}
+
 // Hard-cuts to track idx: hard as in immediate, not a crossfade - use this
 // for manual track changes (skip/seek/quality-restart) where an instant
 // response matters more than a smooth transition. Advancing to the next
@@ -1004,23 +1142,27 @@ static void play_track(int idx) {
     if (idx < 0 || idx >= s_num_tracks) return;
     char url[PLEX_MAX_URL];
 
-    // Adaptive quality: suggest tier based on measured download speed
-    int speed = audio_player_get_download_speed();
-    if (speed > 0) {
-        bool is_n3ds = false;
-        APT_CheckNew3DS(&is_n3ds);
-        PlexQualityTier suggested = plex_api_suggest_quality(speed, is_n3ds);
-        PlexQualityTier current = plex_api_get_quality_tier();
-        // Only auto-upgrade if current tier was set by auto-negotiation (don't override manual)
-        // Allow upgrading by at most one tier at a time to be conservative
-        if (suggested < current && current > 0) {
-            plex_api_set_quality_tier(current - 1);
-            LOG_INFO("Adaptive quality: upgrading to %s (speed=%d KB/s)",
-                     plex_api_get_quality_label(current - 1), speed / 1024);
+    if (s_offline_browse) {
+        if (!offline_get_track_playback_url(s_tracks[idx].rating_key, url, sizeof(url))) return;
+    } else {
+        // Adaptive quality: suggest tier based on measured download speed
+        int speed = audio_player_get_download_speed();
+        if (speed > 0) {
+            bool is_n3ds = false;
+            APT_CheckNew3DS(&is_n3ds);
+            PlexQualityTier suggested = plex_api_suggest_quality(speed, is_n3ds);
+            PlexQualityTier current = plex_api_get_quality_tier();
+            // Only auto-upgrade if current tier was set by auto-negotiation (don't override manual)
+            // Allow upgrading by at most one tier at a time to be conservative
+            if (suggested < current && current > 0) {
+                plex_api_set_quality_tier(current - 1);
+                LOG_INFO("Adaptive quality: upgrading to %s (speed=%d KB/s)",
+                         plex_api_get_quality_label(current - 1), speed / 1024);
+            }
         }
-    }
 
-    if (!plex_api_get_stream_url(&s_tracks[idx], url, sizeof(url))) return;
+        if (!plex_api_get_stream_url(&s_tracks[idx], url, sizeof(url))) return;
+    }
 
     audio_player_set_duration(s_tracks[idx].duration);
     audio_player_load_url(url); // hard cut - also cancels any crossfade in progress
@@ -1039,26 +1181,11 @@ static void play_track(int idx) {
     if (s_shuffle_enabled) shuffle_order_sync(idx);
 
     LOG_INFO("Playing track %d: %s", idx, s_tracks[idx].title);
-    plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
-
-    // Start non-blocking async background download of album cover art
-    if (s_tracks[idx].thumb[0] != '\0' && s_config) {
-        album_art_load_async(s_tracks[idx].thumb, s_config->server_url, s_config->auth_token);
-    } else {
-        album_art_cleanup();
-    }
-
-    s_num_lyrics = 0;
-    plex_api_lyrics_async_start(s_tracks[idx].rating_key);
-
-    // Kick off this track's own Sonic Analysis fetch (tail curve + gain) -
-    // needed later to time a crossfade out of it. Any next-track analysis
-    // fetched for whatever track used to be "next" is stale now.
-    memset(&s_current_analysis, 0, sizeof(s_current_analysis));
-    s_next_analysis_track_idx = -1;
-    memset(&s_next_analysis, 0, sizeof(s_next_analysis));
-    plex_api_analysis_async_start(s_tracks[idx].rating_key, /*want_tail=*/true);
-    s_analysis_stage = ANALYSIS_STAGE_FETCHING_CURRENT;
+    // Also fires off this track's own Sonic Analysis fetch (tail curve +
+    // gain), needed later to time a crossfade out of it - any next-track
+    // analysis fetched for whatever track used to be "next" is stale now,
+    // which activate_track_metadata() also resets.
+    activate_track_metadata(idx);
 }
 
 #define CROSSFADE_DEFAULT_MS 4000
@@ -1138,6 +1265,15 @@ static bool play_prev_track(void) {
 // re-fetching).
 static void seek_to(int target_ms) {
     if (s_current_track_idx < 0 || s_current_track_idx >= s_num_tracks) return;
+    // Not supported for a locally-downloaded track: plex_api_get_seek_url()
+    // below asks the server to restart a transcode from a given offset, and
+    // FLAC in particular can't just jump into an arbitrary byte offset of a
+    // local file either (drflac needs to see the stream's header first) -
+    // implementing a real local seek would need decoder-level support
+    // audio_player.c doesn't have. The progress bar simply ignores taps
+    // while playing an offline track (see SCREEN_NOW_PLAYING's touch
+    // handler) rather than doing something wrong.
+    if (s_offline_browse) return;
     PlexTrack* track = &s_tracks[s_current_track_idx];
 
     if (target_ms < 0) target_ms = 0;
@@ -1291,30 +1427,16 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             if (s_shuffle_enabled) shuffle_order_sync(idx);
 
             LOG_INFO("Crossfade complete - now playing track %d: %s", idx, s_tracks[idx].title);
-            plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
-
-            if (s_tracks[idx].thumb[0] != '\0' && s_config) {
-                album_art_load_async(s_tracks[idx].thumb, s_config->server_url, s_config->auth_token);
-            } else {
-                album_art_cleanup();
-            }
-
-            s_num_lyrics = 0;
-            plex_api_lyrics_async_start(s_tracks[idx].rating_key);
-
-            memset(&s_current_analysis, 0, sizeof(s_current_analysis));
-            s_next_analysis_track_idx = -1;
-            memset(&s_next_analysis, 0, sizeof(s_next_analysis));
-            plex_api_analysis_async_start(s_tracks[idx].rating_key, /*want_tail=*/true);
-            s_analysis_stage = ANALYSIS_STAGE_FETCHING_CURRENT;
+            activate_track_metadata(idx);
         }
         s_crossfade_target_idx = -1;
         pstate = audio_player_get_state(); // re-read - audio_player.c sets PLAYER_PLAYING for the newly-promoted deck as part of completing the crossfade
     }
     s_was_crossfading = is_crossfading_now;
 
-    // Periodic timeline reporting to Plex Media Server (every 5 seconds while playing)
-    if (pstate == PLAYER_PLAYING && s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
+    // Periodic timeline reporting to Plex Media Server (every 5 seconds while
+    // playing) - nothing to report to with no server connection.
+    if (!s_offline_browse && pstate == PLAYER_PLAYING && s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
         static u64 s_last_timeline_tick = 0;
         u64 now_tick = svcGetSystemTick();
         if (now_tick - s_last_timeline_tick >= 1340617400ULL) { // 5 sec @ 268MHz
@@ -1337,7 +1459,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     // there, s_next_analysis_track_idx just won't match and it's ignored
     // (see the crossfade trigger below), same "costs bandwidth, not
     // correctness" tradeoff the old prefetch mismatch had.
-    if (s_analysis_stage == ANALYSIS_STAGE_IDLE && pstate == PLAYER_PLAYING &&
+    if (!s_offline_browse && s_analysis_stage == ANALYSIS_STAGE_IDLE && pstate == PLAYER_PLAYING &&
         audio_player_active_download_finished()) {
         int next_idx = compute_next_track_idx();
         if (next_idx >= 0 && next_idx < s_num_tracks && s_next_analysis_track_idx != next_idx) {
@@ -1367,8 +1489,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             int remaining_ms = cur->duration - audio_player_get_position_ms();
             if (remaining_ms <= lead_ms) {
                 char next_url[PLEX_MAX_URL];
-                if (plex_api_get_stream_url(&s_tracks[next_idx], next_url, sizeof(next_url))) {
-                    float next_gain_db = (s_next_analysis_track_idx == next_idx && s_next_analysis.valid)
+                bool got_next_url = s_offline_browse
+                    ? offline_get_track_playback_url(s_tracks[next_idx].rating_key, next_url, sizeof(next_url))
+                    : plex_api_get_stream_url(&s_tracks[next_idx], next_url, sizeof(next_url));
+                if (got_next_url) {
+                    // Offline crossfades never have Sonic Analysis data to level-match
+                    // with (s_next_analysis is never fetched - see activate_track_metadata()),
+                    // so next_gain_db is always 0 (no adjustment) in that case.
+                    float next_gain_db = (!s_offline_browse && s_next_analysis_track_idx == next_idx && s_next_analysis.valid)
                                               ? s_next_analysis.gain_db : 0.0f;
                     if (audio_player_start_crossfade(next_url, next_gain_db, s_tracks[next_idx].duration, fade_ms)) {
                         LOG_INFO("Smart crossfade starting -> track %d: %s (lead=%dms fade=%dms)",
@@ -1383,8 +1511,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     }
 
-    // Adaptive quality: handle quality downgrade requests
-    if (pstate == PLAYER_PLAYING && audio_player_needs_quality_downgrade()) {
+    // Adaptive quality: handle quality downgrade requests. Not meaningful
+    // offline - a local file has no quality tier to step down, and
+    // audio_player.c's underrun detection already skips local decks (see
+    // its comment on why a local "download speed" would be nonsense) - this
+    // guard is just cheap extra insurance against a stray flag.
+    if (!s_offline_browse && pstate == PLAYER_PLAYING && audio_player_needs_quality_downgrade()) {
         audio_player_clear_downgrade_flag();
         
         if (plex_api_quality_step_down()) {
@@ -1411,7 +1543,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         snprintf(s_status_msg, sizeof(s_status_msg), "Track %d failed (HTTP 400). Skipping...", s_current_track_idx + 1);
         s_status_color = COL_ERROR;
 
-        plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
+        if (!s_offline_browse) {
+            plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
+        }
 
         if (!s_auto_advance || !play_next_track()) {
             s_auto_advance = false;
@@ -1420,7 +1554,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         }
     } else if (pstate == PLAYER_STOPPED && s_current_track_idx >= 0 && s_auto_advance) {
         if (audio_player_get_position_ms() > 1000) {
-            plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", s_tracks[s_current_track_idx].duration, s_tracks[s_current_track_idx].duration);
+            if (!s_offline_browse) {
+                plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, "stopped", s_tracks[s_current_track_idx].duration, s_tracks[s_current_track_idx].duration);
+            }
             if (!play_next_track()) {
                 s_auto_advance = false;
                 s_current_track_idx = -1;
@@ -1457,8 +1593,17 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     if ((kDown & KEY_L) && !(kHeld & KEY_R)) {
         s_top_view = (TopView)((s_top_view + TOPVIEW_COUNT - 1) % TOPVIEW_COUNT);
     }
-    // X cycles which visualizer style is shown, only meaningful in that view.
-    if ((kDown & KEY_X) && s_top_view == TOPVIEW_VISUALIZER) {
+    // X cycles which visualizer style is shown, only meaningful in that view -
+    // except on the Artists/Albums/Tracks/Playlists screens, where X is also
+    // "download/delete selected" (see the KEY_X handling further down): the
+    // top-screen visualizer view and the bottom-screen list screen are
+    // independent, so both could otherwise fire off the same press. Whichever
+    // list screen is actively showing takes priority in that case - visualizer
+    // style-cycling is still reachable from every other screen (Now Playing
+    // Controls chief among them).
+    if ((kDown & KEY_X) && s_top_view == TOPVIEW_VISUALIZER &&
+        s_screen != SCREEN_ARTISTS && s_screen != SCREEN_ALBUMS &&
+        s_screen != SCREEN_TRACKS && s_screen != SCREEN_PLAYLISTS) {
         s_vis_style = (VisStyle)((s_vis_style + 1) % VIS_STYLE_COUNT);
     }
 
@@ -1488,7 +1633,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     if (kDown & KEY_Y) {
         audio_player_toggle();
         PlayerState new_st = audio_player_get_state();
-        if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
+        if (!s_offline_browse && s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
             plex_api_report_timeline_async(s_tracks[s_current_track_idx].rating_key, new_st == PLAYER_PAUSED ? "paused" : "playing", audio_player_get_position_ms(), s_tracks[s_current_track_idx].duration);
         }
         if (new_st == PLAYER_STOPPED) {
@@ -1631,21 +1776,25 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // 2. Auth Choice Screen
     if (s_screen == SCREEN_AUTH_CHOICE) {
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
-        
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 3;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 3) ? s_selected_idx + 1 : 0;
+
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx < 3) {
+            if (idx >= 0 && idx < 4) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
         }
-        
+
         if (kDown & KEY_A) {
             if (s_selected_idx == 0) ui_set_screen(SCREEN_LINK_PIN);
             else if (s_selected_idx == 1) ui_set_screen(SCREEN_LOGIN_DIRECT);
             else if (s_selected_idx == 2) ui_set_screen(SCREEN_SETUP);
+            // Browse/play whatever's already been downloaded with no server
+            // connection at all - Hub > Downloads works fully offline; every
+            // other Hub option just comes back empty until a server's set up.
+            else if (s_selected_idx == 3) ui_set_screen(SCREEN_HUB);
         }
         return;
     }
@@ -1741,12 +1890,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // 5. Main Hub Screen
     if (s_screen == SCREEN_HUB) {
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 5;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 5) ? s_selected_idx + 1 : 0;
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 6;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 6) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx < 6) {
+            if (idx >= 0 && idx < 7) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
@@ -1789,8 +1938,51 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             } else if (s_selected_idx == 4) { // All Libraries
                 nav_push(SCREEN_HUB);
                 ui_set_screen(SCREEN_LIBRARIES);
-            } else if (s_selected_idx == 5) { // Settings
+            } else if (s_selected_idx == 5) { // Downloads
+                s_status_msg[0] = '\0';
+                nav_push(SCREEN_HUB);
+                ui_set_screen(SCREEN_DOWNLOADS);
+            } else if (s_selected_idx == 6) { // Settings
                 ui_set_screen(SCREEN_SETTINGS);
+            }
+        }
+        return;
+    }
+
+    // Downloads Hub Screen (3 rows: Downloaded Artists, Downloaded
+    // Playlists, Delete All Downloads)
+    if (s_screen == SCREEN_DOWNLOADS) {
+        if (kDown & KEY_B) {
+            ui_set_screen(nav_pop(SCREEN_HUB));
+            return;
+        }
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
+
+        if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y) {
+            int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
+            if (idx >= 0 && idx <= 2) {
+                s_selected_idx = idx;
+                kDown |= KEY_A;
+            }
+        }
+
+        if (kDown & KEY_A) {
+            if (s_selected_idx == 0) { // Downloaded Artists
+                strncpy(s_current_title, "Downloaded Artists", PLEX_MAX_STR);
+                s_offline_browse = true;
+                s_num_artists = offline_get_artists(s_artists, PLEX_MAX_ITEMS);
+                s_total_items = 0;
+                nav_push(SCREEN_DOWNLOADS);
+                ui_set_screen(SCREEN_ARTISTS);
+            } else if (s_selected_idx == 1) { // Downloaded Playlists
+                s_offline_browse = true;
+                nav_push(SCREEN_DOWNLOADS);
+                ui_set_screen(SCREEN_PLAYLISTS); // populates s_playlists itself via s_offline_browse
+            } else if (s_selected_idx == 2) { // Delete All Downloads
+                offline_delete_all();
+                snprintf(s_status_msg, sizeof(s_status_msg), "All downloads deleted");
+                s_status_color = COL_WARN;
             }
         }
         return;
@@ -1910,27 +2102,104 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         } else if (s_screen == SCREEN_ARTISTS && s_list_count > 0 && s_selected_idx < s_num_artists) {
             strncpy(s_current_title, s_artists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_artists[s_selected_idx].key, PLEX_MAX_URL);
-            s_loaded_items = plex_api_get_albums_page(s_active_key, s_albums, 0, PLEX_PAGE_SIZE, &s_total_items);
-            s_num_albums = s_loaded_items;
+            if (s_offline_browse) {
+                s_total_items = 0; // offline_get_albums() always returns the complete set - no paging
+                s_num_albums = offline_get_albums(s_active_key, s_albums, PLEX_MAX_ITEMS);
+                s_loaded_items = s_num_albums;
+            } else {
+                s_loaded_items = plex_api_get_albums_page(s_active_key, s_albums, 0, PLEX_PAGE_SIZE, &s_total_items);
+                s_num_albums = s_loaded_items;
+            }
             ui_set_screen(SCREEN_ALBUMS);
         } else if (s_screen == SCREEN_ALBUMS && s_list_count > 0 && s_selected_idx < s_num_albums) {
             strncpy(s_current_title, s_albums[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_albums[s_selected_idx].key, PLEX_MAX_URL);
-            s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
-            s_num_tracks = s_loaded_items;
-            start_queue_fill_if_needed();
+            plex_api_queue_fill_async_cancel();
+            s_total_items = 0;
+            if (s_offline_browse) {
+                s_num_tracks = offline_get_tracks_for_album(s_active_key, s_tracks, PLEX_MAX_ITEMS);
+            } else {
+                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
+                start_queue_fill_if_needed();
+            }
+            s_loaded_items = s_num_tracks;
             nav_push(SCREEN_ALBUMS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_PLAYLISTS && s_list_count > 0) {
             strncpy(s_current_title, s_playlists[s_selected_idx].title, PLEX_MAX_STR);
             strncpy(s_active_key, s_playlists[s_selected_idx].key, PLEX_MAX_URL);
-            s_loaded_items = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
-            s_num_tracks = s_loaded_items;
-            start_queue_fill_if_needed();
+            plex_api_queue_fill_async_cancel();
+            s_total_items = 0;
+            if (s_offline_browse) {
+                s_num_tracks = offline_get_tracks_for_playlist(s_active_key, s_tracks, PLEX_MAX_ITEMS);
+            } else {
+                s_num_tracks = plex_api_get_tracks_page(s_active_key, s_tracks, 0, PLEX_PAGE_SIZE, &s_total_items);
+                start_queue_fill_if_needed();
+            }
+            s_loaded_items = s_num_tracks;
             nav_push(SCREEN_PLAYLISTS);
             ui_set_screen(SCREEN_TRACKS);
         } else if (s_screen == SCREEN_TRACKS && s_list_count > 0 && s_selected_idx < s_num_tracks) {
             play_track(s_selected_idx);
+        }
+    }
+
+    // Download (while browsing the online library) / Delete (while browsing
+    // downloads) the selected item - X is otherwise unused on these list
+    // screens (its only other meaning, cycling visualizer style, is gated to
+    // TOPVIEW_VISUALIZER, so there's no conflict).
+    if (kDown & KEY_X) {
+        if (s_offline_browse) {
+            if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
+                offline_delete_artist(s_artists[s_selected_idx].rating_key);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_artists[s_selected_idx].title);
+                s_status_color = COL_WARN;
+                s_num_artists = offline_get_artists(s_artists, PLEX_MAX_ITEMS);
+                s_list_count = s_num_artists;
+                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+            } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
+                offline_delete_album(s_albums[s_selected_idx].rating_key);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_albums[s_selected_idx].title);
+                s_status_color = COL_WARN;
+                s_num_albums = offline_get_albums(s_active_key, s_albums, PLEX_MAX_ITEMS);
+                s_list_count = s_num_albums;
+                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+            } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
+                offline_delete_playlist(s_playlists[s_selected_idx].rating_key);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_playlists[s_selected_idx].title);
+                s_status_color = COL_WARN;
+                s_num_playlists = offline_get_playlists(s_playlists, PLEX_MAX_ITEMS);
+                s_list_count = s_num_playlists;
+                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+            } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
+                offline_delete_track(s_tracks[s_selected_idx].rating_key);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Deleted '%s' from downloads", s_tracks[s_selected_idx].title);
+                s_status_color = COL_WARN;
+                // Drop it straight out of the currently-displayed list
+                // rather than re-fetching - this Tracks screen may have come
+                // from either an album or a playlist and either offline_get_
+                // tracks_for_*() call needs a key we'd have to track separately.
+                if (s_selected_idx == s_current_track_idx) {
+                    // Its file is gone - can't keep playing it.
+                    audio_player_stop();
+                    s_current_track_idx = -1;
+                    s_auto_advance = false;
+                } else if (s_selected_idx < s_current_track_idx) {
+                    s_current_track_idx--; // keep pointing at the same logical track after the shift below
+                }
+                for (int i = s_selected_idx; i < s_num_tracks - 1; i++) s_tracks[i] = s_tracks[i + 1];
+                s_num_tracks--;
+                s_list_count = s_num_tracks;
+                if (s_selected_idx >= s_list_count) s_selected_idx = s_list_count > 0 ? s_list_count - 1 : 0;
+            }
+        } else if (s_screen == SCREEN_ARTISTS && s_selected_idx < s_num_artists) {
+            queue_download_artist(&s_artists[s_selected_idx]);
+        } else if (s_screen == SCREEN_ALBUMS && s_selected_idx < s_num_albums) {
+            queue_download_album(&s_albums[s_selected_idx]);
+        } else if (s_screen == SCREEN_PLAYLISTS && s_selected_idx < s_num_playlists) {
+            queue_download_playlist(&s_playlists[s_selected_idx]);
+        } else if (s_screen == SCREEN_TRACKS && s_selected_idx < s_num_tracks) {
+            queue_download_single_track(&s_tracks[s_selected_idx]);
         }
     }
 
@@ -2589,6 +2858,25 @@ void ui_render_top(C3D_RenderTarget* top) {
         }
     }
 
+    // Background download indicator (offline.c) - shown whenever something's
+    // actively downloading or still waiting in the queue, regardless of
+    // which screen is up, same idea as the connection-status icons above.
+    {
+        OfflineDownloadStatus dl_hud;
+        offline_get_download_status(&dl_hud);
+        if (dl_hud.active || dl_hud.queue_remaining > 0) {
+            char dl_str[48];
+            if (dl_hud.active && dl_hud.bytes_total > 0) {
+                snprintf(dl_str, sizeof(dl_str), "DL %d%%", (int)((dl_hud.bytes_done * 100) / dl_hud.bytes_total));
+            } else if (dl_hud.active) {
+                snprintf(dl_str, sizeof(dl_str), "DL %.1fMB", dl_hud.bytes_done / (1024.0f * 1024.0f));
+            } else {
+                snprintf(dl_str, sizeof(dl_str), "DL %d queued", dl_hud.queue_remaining);
+            }
+            draw_text(dl_str, 145, 12, 0.38f, 0.38f, COL_ACCENT);
+        }
+    }
+
     // Top-Right HUD: Time, right-aligned. 12/24-hour format: the 3DS has a
     // user-facing "Display 24-Hour Time" toggle (System Settings > Other
     // Settings > Date & Time), but it isn't exposed through any documented
@@ -2734,6 +3022,7 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         draw_list_item(0, "1. Link Device (plex.tv/link)", "Recommended - easy auth on phone/PC", s_selected_idx == 0, false);
         draw_list_item(1, "2. Direct Login (User + Pass + 2FA)", "Enter credentials with 3DS keyboard", s_selected_idx == 1, false);
         draw_list_item(2, "3. Manual Server IP & Token", "Direct IP connection", s_selected_idx == 2, false);
+        draw_list_item(3, "4. Continue Offline", "Play whatever's already downloaded", s_selected_idx == 3, false);
         draw_text_centered("Use D-Pad to navigate, A to select", BTM_HEIGHT - 20, BTM_WIDTH, 0.4f, 0.4f, COL_TEXT_DIM);
     } else if (s_screen == SCREEN_LINK_PIN) {
         draw_header("Link Device");
@@ -2777,7 +3066,45 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         draw_list_item(2, "Search Library", "Search tracks, artists & albums", s_selected_idx == 2, false);
         draw_list_item(3, "Recently Added", "Stream newly added tracks", s_selected_idx == 3, false);
         draw_list_item(4, "All Libraries", "Select music library section", s_selected_idx == 4, false);
-        draw_list_item(5, "Settings", "Clock format & app preferences", s_selected_idx == 5, false);
+        draw_list_item(5, "Downloads", "Play offline / manage downloads", s_selected_idx == 5, false);
+        draw_list_item(6, "Settings", "Clock format & app preferences", s_selected_idx == 6, false);
+    } else if (s_screen == SCREEN_DOWNLOADS) {
+        draw_header("Downloads");
+        char artists_sub[64], playlists_sub[64], storage_sub[64];
+        snprintf(artists_sub, sizeof(artists_sub), "%d artist(s), %d album(s)",
+                 offline_get_artist_count(), offline_get_album_count());
+        snprintf(playlists_sub, sizeof(playlists_sub), "%d playlist(s)", offline_get_playlist_count());
+        snprintf(storage_sub, sizeof(storage_sub), "%.1f MB used - press A to delete everything",
+                 offline_get_storage_used_bytes() / (1024.0f * 1024.0f));
+        draw_list_item(0, "Downloaded Artists", artists_sub, s_selected_idx == 0, false);
+        draw_list_item(1, "Downloaded Playlists", playlists_sub, s_selected_idx == 1, false);
+        draw_list_item(2, "Delete All Downloads", storage_sub, s_selected_idx == 2, false);
+
+        OfflineDownloadStatus dl;
+        offline_get_download_status(&dl);
+        char status_line[128];
+        if (dl.active) {
+            if (dl.bytes_total > 0) {
+                int pct = (int)((dl.bytes_done * 100) / dl.bytes_total);
+                snprintf(status_line, sizeof(status_line), "Downloading: %s (%d%%)", dl.title, pct);
+            } else {
+                snprintf(status_line, sizeof(status_line), "Downloading: %s (%.1f MB)", dl.title, dl.bytes_done / (1024.0f * 1024.0f));
+            }
+        } else if (dl.queue_remaining > 0) {
+            snprintf(status_line, sizeof(status_line), "%d track(s) queued", dl.queue_remaining);
+        } else {
+            snprintf(status_line, sizeof(status_line), "No downloads in progress");
+        }
+        draw_text_centered(status_line, LIST_START_Y + 3 * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.42f, 0.42f, COL_TEXT_DIM);
+        if (dl.queue_remaining > 0 && dl.active) {
+            char remaining_line[48];
+            snprintf(remaining_line, sizeof(remaining_line), "%d more queued", dl.queue_remaining);
+            draw_text_centered(remaining_line, LIST_START_Y + 3 * LIST_ITEM_HEIGHT + 26, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DARK);
+        }
+
+        if (s_status_msg[0]) {
+            draw_text_centered(s_status_msg, BTM_HEIGHT - 20, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
+        }
     } else if (s_screen == SCREEN_SETTINGS) {
         draw_header("Settings");
         draw_list_item(0, "Clock Format", s_config->clock_24h ? "24-hour" : "12-hour (AM/PM)", s_selected_idx == 0, false);
@@ -2993,6 +3320,19 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                 } else {
                     draw_list_item(i, "Loading...", NULL, selected, false);
                 }
+            }
+        }
+
+        // X: download (online) / delete (offline) hint + the last queue
+        // action's result - see queue_download_*()/offline_delete_*() in
+        // ui_update(). Not shown on Libraries (nothing to download/delete
+        // there - it's just a section picker).
+        if (s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
+            s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) {
+            draw_text_centered(s_offline_browse ? "X: Delete Selected" : "X: Download Selected",
+                                BTM_HEIGHT - 32, BTM_WIDTH, 0.36f, 0.36f, COL_TEXT_DARK);
+            if (s_status_msg[0]) {
+                draw_text_centered(s_status_msg, BTM_HEIGHT - 16, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
             }
         }
     }
