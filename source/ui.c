@@ -137,6 +137,7 @@ static TopView s_top_view = TOPVIEW_NOW_PLAYING;
 typedef enum {
     VIS_STYLE_BARS,
     VIS_STYLE_OSCILLOSCOPE,
+    VIS_STYLE_ALCHEMY,
     VIS_STYLE_COUNT
 } VisStyle;
 static VisStyle s_vis_style = VIS_STYLE_BARS;
@@ -2029,7 +2030,323 @@ static void draw_visualizer_oscilloscope(float x, float y, float w, float h) {
     }
 }
 
+// Alchemy: a kaleidoscopic, beat-reactive particle bloom loosely modeled on
+// Windows Media Player's "Alchemy" visualization set to its "Randomization"
+// preset - rather than one fixed pattern, the particle motion, mirror
+// symmetry and color palette all periodically reroll on their own (and can
+// reroll early on a strong beat), so the shape never settles into something
+// repetitive.
+typedef enum {
+    ALCH_ORBIT,     // circles the center, drifting slowly outward
+    ALCH_SPIRAL,    // spirals outward, its spin slowing as it grows
+    ALCH_FOUNTAIN,  // launched from the center, arcs under "gravity"
+    ALCH_DRIFT,     // gentle random-walk
+    ALCH_BURST,     // shoots outward in a line, decelerating
+    ALCH_MOTION_COUNT
+} AlchMotion;
+
+#define ALCH_MAX_PARTICLES 28
+#define ALCH_TRAIL_LEN 3
+
+typedef struct {
+    bool alive;
+    AlchMotion motion;
+    float angle, radius, spin, growth;  // polar state (ORBIT/SPIRAL)
+    float vx, vy;                       // cartesian state (FOUNTAIN/DRIFT/BURST)
+    float rx, ry;                       // current offset from the visualizer's center
+    float life, max_life;
+    float size;
+    u32 color;
+    float trail_rx[ALCH_TRAIL_LEN], trail_ry[ALCH_TRAIL_LEN];
+    int trail_count;
+} AlchParticle;
+
+static AlchParticle s_alch_particles[ALCH_MAX_PARTICLES];
+static float s_alch_time = 0.0f;
+static float s_alch_spawn_accum = 0.0f;
+static float s_alch_energy_avg = 0.0f;
+static float s_alch_beat_cooldown = 0.0f;
+static float s_alch_phase_timer = 0.0f;
+static float s_alch_phase_duration = 6.0f;
+static AlchMotion s_alch_motion = ALCH_DRIFT;
+static int s_alch_symmetry = 4;
+static int s_alch_palette_idx = 0;
+
+// 4 fixed palettes below, plus a 5th "rainbow" palette handled specially in
+// alch_pick_color() (hue-cycled rather than picked from a fixed array).
+#define ALCH_PALETTE_COUNT 5
+static const u32 s_alch_palettes[4][3] = {
+    { RGBA8(0xE5, 0xA0, 0x0D, 0xFF), RGBA8(0xFF, 0xD5, 0x4F, 0xFF), RGBA8(0xB3, 0x4A, 0x0A, 0xFF) }, // gold
+    { RGBA8(0x4F, 0x7C, 0xFF, 0xFF), RGBA8(0xB0, 0x6A, 0xFF, 0xFF), RGBA8(0x2A, 0x2F, 0xB8, 0xFF) }, // blue/violet
+    { RGBA8(0x35, 0xE0, 0x9A, 0xFF), RGBA8(0x1A, 0xB3, 0xC9, 0xFF), RGBA8(0x0A, 0x7A, 0x55, 0xFF) }, // green/teal
+    { RGBA8(0xFF, 0x4F, 0xA0, 0xFF), RGBA8(0xFF, 0x9A, 0xD5, 0xFF), RGBA8(0xB8, 0x1A, 0x6A, 0xFF) }, // magenta/pink
+};
+
+static float alch_randf(void) { return (float)rand() / (float)RAND_MAX; }
+static float alch_randf2(void) { return alch_randf() * 2.0f - 1.0f; }
+
+// Scales just the alpha byte of an RGBA8 color, leaving RGB untouched.
+static u32 alch_with_alpha(u32 color, float mul) {
+    if (mul < 0.0f) mul = 0.0f;
+    if (mul > 1.0f) mul = 1.0f;
+    u32 a = (u32)(((color >> 24) & 0xFF) * mul);
+    return (color & 0x00FFFFFF) | (a << 24);
+}
+
+static u32 alch_hsv(float h, float s, float v) {
+    h -= floorf(h);
+    float i = floorf(h * 6.0f);
+    float f = h * 6.0f - i;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - f * s);
+    float t = v * (1.0f - (1.0f - f) * s);
+    float r, g, b;
+    switch ((int)i % 6) {
+        case 0:  r = v; g = t; b = p; break;
+        case 1:  r = q; g = v; b = p; break;
+        case 2:  r = p; g = v; b = t; break;
+        case 3:  r = p; g = q; b = v; break;
+        case 4:  r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return RGBA8((u8)(r * 255), (u8)(g * 255), (u8)(b * 255), 0xFF);
+}
+
+static u32 alch_pick_color(int seed) {
+    if (s_alch_palette_idx == 4) {
+        return alch_hsv(fmodf(s_alch_time * 0.07f + seed * 0.15f, 1.0f), 0.75f, 1.0f);
+    }
+    return s_alch_palettes[s_alch_palette_idx][seed % 3];
+}
+
+// Rerolls motion pattern, mirror symmetry and color palette - called on a
+// timer, and occasionally early on a strong beat.
+static void alch_randomize_phase(void) {
+    static const int symmetries[] = { 2, 3, 4, 5, 6, 8 };
+    s_alch_motion = (AlchMotion)(rand() % ALCH_MOTION_COUNT);
+    s_alch_symmetry = symmetries[rand() % (sizeof(symmetries) / sizeof(symmetries[0]))];
+    s_alch_palette_idx = rand() % ALCH_PALETTE_COUNT;
+    s_alch_phase_duration = 5.0f + alch_randf() * 5.0f;
+}
+
+static void alch_spawn_particle(float energy) {
+    AlchParticle* p = NULL;
+    for (int i = 0; i < ALCH_MAX_PARTICLES; i++) {
+        if (!s_alch_particles[i].alive) { p = &s_alch_particles[i]; break; }
+    }
+    if (!p) return; // pool full - drop it, the oldest ones will free up soon
+
+    memset(p, 0, sizeof(*p));
+    p->alive = true;
+    p->motion = s_alch_motion;
+    p->max_life = 2.0f + alch_randf() * 2.5f;
+    p->life = p->max_life;
+    p->size = 3.0f + alch_randf() * 4.0f + energy * 4.0f;
+    p->color = alch_pick_color(rand());
+
+    switch (p->motion) {
+        case ALCH_ORBIT:
+            p->angle = alch_randf() * 6.2831853f;
+            p->radius = 3.0f + alch_randf() * 8.0f;
+            p->spin = (0.6f + alch_randf() * 1.2f) * (rand() % 2 ? 1.0f : -1.0f);
+            p->growth = 6.0f + alch_randf() * 6.0f;
+            break;
+        case ALCH_SPIRAL:
+            p->angle = alch_randf() * 6.2831853f;
+            p->radius = 2.0f + alch_randf() * 4.0f;
+            p->spin = (2.0f + alch_randf() * 2.0f) * (rand() % 2 ? 1.0f : -1.0f);
+            p->growth = 14.0f + alch_randf() * 10.0f;
+            break;
+        case ALCH_FOUNTAIN: {
+            float a = -1.5708f + alch_randf2() * 0.6f; // roughly upward, +/- spread
+            float speed = 30.0f + energy * 60.0f + alch_randf() * 20.0f;
+            p->vx = cosf(a) * speed;
+            p->vy = sinf(a) * speed;
+            break;
+        }
+        case ALCH_DRIFT:
+            p->vx = alch_randf2() * 10.0f;
+            p->vy = alch_randf2() * 10.0f;
+            break;
+        case ALCH_BURST: {
+            float a = alch_randf() * 6.2831853f;
+            float speed = 40.0f + energy * 90.0f;
+            p->vx = cosf(a) * speed;
+            p->vy = sinf(a) * speed;
+            break;
+        }
+        default: break;
+    }
+}
+
+static void alch_update_particle(AlchParticle* p, float dt, float max_radius) {
+    for (int t = ALCH_TRAIL_LEN - 1; t > 0; t--) {
+        p->trail_rx[t] = p->trail_rx[t - 1];
+        p->trail_ry[t] = p->trail_ry[t - 1];
+    }
+    p->trail_rx[0] = p->rx;
+    p->trail_ry[0] = p->ry;
+    if (p->trail_count < ALCH_TRAIL_LEN) p->trail_count++;
+
+    switch (p->motion) {
+        case ALCH_ORBIT:
+            p->angle += p->spin * dt;
+            p->radius += p->growth * dt;
+            p->rx = cosf(p->angle) * p->radius;
+            p->ry = sinf(p->angle) * p->radius;
+            break;
+        case ALCH_SPIRAL:
+            p->angle += (p->spin / (1.0f + p->radius * 0.06f)) * dt;
+            p->radius += p->growth * dt;
+            p->rx = cosf(p->angle) * p->radius;
+            p->ry = sinf(p->angle) * p->radius;
+            break;
+        case ALCH_FOUNTAIN:
+            p->vy += 70.0f * dt; // gravity, arcs it back downward
+            p->rx += p->vx * dt;
+            p->ry += p->vy * dt;
+            break;
+        case ALCH_DRIFT:
+            p->vx += alch_randf2() * 20.0f * dt;
+            p->vy += alch_randf2() * 20.0f * dt;
+            p->rx += p->vx * dt;
+            p->ry += p->vy * dt;
+            break;
+        case ALCH_BURST:
+            p->vx *= 0.985f;
+            p->vy *= 0.985f;
+            p->rx += p->vx * dt;
+            p->ry += p->vy * dt;
+            break;
+        default: break;
+    }
+
+    // Contain within a circle around the center. This is deliberately a
+    // *circle*, not the visualizer's actual (wide) rectangle: rotation
+    // preserves distance from the center, so every mirrored copy drawn by
+    // draw_visualizer_alchemy() stays in-bounds too, without needing a
+    // scissor test. The rectangle is filled back in visually by stretching
+    // just the x axis at render time.
+    float r = sqrtf(p->rx * p->rx + p->ry * p->ry);
+    if (r > max_radius) {
+        float scale = max_radius / r;
+        p->rx *= scale;
+        p->ry *= scale;
+        p->vx *= -0.4f;
+        p->vy *= -0.4f;
+        if (p->radius > max_radius) p->radius = max_radius;
+    }
+
+    p->life -= dt;
+    if (p->life <= 0.0f) p->alive = false;
+}
+
+static void draw_visualizer_alchemy(float x, float y, float w, float h) {
+    s16 samples[VIS_MAX_SAMPLES];
+    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+
+    // Overall loudness this frame - paces ambient particle spawning and
+    // feeds the beat-onset detector below.
+    float energy = 0.0f;
+    if (n > 0) {
+        double sum_sq = 0.0;
+        for (int i = 0; i < n; i++) { double v = samples[i]; sum_sq += v * v; }
+        energy = (float)(sqrt(sum_sq / n) / 32768.0);
+        if (energy > 1.0f) energy = 1.0f;
+    }
+
+    const float dt = 0.016f; // matches the fixed-step convention used elsewhere in this file
+    s_alch_time += dt;
+
+    // Beat detection: a spike well above the recent running-average energy,
+    // rate-limited so one loud passage doesn't register as many beats.
+    s_alch_beat_cooldown -= dt;
+    bool beat = false;
+    if (energy > s_alch_energy_avg * 1.5f + 0.03f && s_alch_beat_cooldown <= 0.0f) {
+        beat = true;
+        s_alch_beat_cooldown = 0.15f;
+    }
+    s_alch_energy_avg = s_alch_energy_avg * 0.93f + energy * 0.07f;
+
+    // Reroll the look on a timer, or occasionally early on a beat - this is
+    // what gives it the "Randomization" preset's ever-mutating feel instead
+    // of settling into one repeating pattern.
+    s_alch_phase_timer += dt;
+    if (s_alch_phase_timer > s_alch_phase_duration || (beat && (rand() % 100) < 15)) {
+        alch_randomize_phase();
+        s_alch_phase_timer = 0.0f;
+    }
+
+    float cx = x + w / 2.0f;
+    float cy = y + h / 2.0f;
+    float margin = 12.0f;
+    float max_radius = (h / 2.0f) - margin;
+    if (max_radius < 4.0f) max_radius = 4.0f;
+    float stretch_x = ((w / 2.0f) - margin) / max_radius;
+    if (stretch_x < 1.0f) stretch_x = 1.0f;
+
+    // Ambient spawn rate scales with loudness so it's never static during
+    // quiet passages, and livens up during loud ones.
+    s_alch_spawn_accum += dt * (3.0f + energy * 14.0f);
+    while (s_alch_spawn_accum >= 1.0f) {
+        alch_spawn_particle(energy);
+        s_alch_spawn_accum -= 1.0f;
+    }
+    if (beat) {
+        int burst = 4 + (rand() % 4);
+        for (int i = 0; i < burst; i++) alch_spawn_particle(energy);
+    }
+
+    // Background first, then only circular draws after - citro2d's docs
+    // call out switching in/out of "circle mode" as an expensive state
+    // change, so every particle draw below is kept grouped together.
+    C2D_DrawRectSolid(x, y, 0.4f, w, h, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
+
+    for (int i = 0; i < ALCH_MAX_PARTICLES; i++) {
+        AlchParticle* p = &s_alch_particles[i];
+        if (!p->alive) continue;
+        alch_update_particle(p, dt, max_radius);
+        if (!p->alive) continue;
+
+        float t = 1.0f - p->life / p->max_life;
+        float fade = (t < 0.15f) ? (t / 0.15f) : (1.0f - (t - 0.15f) / 0.85f);
+
+        for (int s = 0; s < s_alch_symmetry; s++) {
+            float mirror_angle = s * (6.2831853f / s_alch_symmetry);
+            float ca = cosf(mirror_angle), sa = sinf(mirror_angle);
+
+            // Fading echoes of recent positions first, then the bright core
+            // on top - a cheap "flowing trail" that needs no offscreen
+            // accumulation buffer.
+            for (int tI = ALCH_TRAIL_LEN - 1; tI >= 0; tI--) {
+                if (tI >= p->trail_count) continue;
+                float mx = p->trail_rx[tI] * ca - p->trail_ry[tI] * sa;
+                float my = p->trail_rx[tI] * sa + p->trail_ry[tI] * ca;
+                float wx = cx + mx * stretch_x;
+                float wy = cy + my;
+                float echo_fade = fade * (0.55f - tI * 0.15f);
+                if (echo_fade <= 0.0f) continue;
+                C2D_DrawCircleSolid(wx, wy, 0.45f, p->size * 0.7f, alch_with_alpha(p->color, echo_fade));
+            }
+
+            float mx = p->rx * ca - p->ry * sa;
+            float my = p->rx * sa + p->ry * ca;
+            float wx = cx + mx * stretch_x;
+            float wy = cy + my;
+
+            // Soft outer glow plus a brighter core reads as a glowing blob
+            // rather than a flat dot.
+            C2D_DrawCircleSolid(wx, wy, 0.48f, p->size * 1.7f, alch_with_alpha(p->color, fade * 0.30f));
+            C2D_DrawCircleSolid(wx, wy, 0.5f, p->size * 0.85f, alch_with_alpha(p->color, fade * 0.9f));
+        }
+    }
+}
+
 static void draw_visualizer(VisStyle style, float x, float y, float w, float h) {
+    if (style == VIS_STYLE_ALCHEMY) {
+        draw_visualizer_alchemy(x, y, w, h); // draws its own background
+        return;
+    }
     C2D_DrawRectSolid(x, y, 0.4f, w, h, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
     switch (style) {
         case VIS_STYLE_OSCILLOSCOPE: draw_visualizer_oscilloscope(x, y, w, h); break;
@@ -2180,7 +2497,8 @@ static void draw_top_visualizer(PlexTrack* track, PlayerState state) {
              track->title, track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", state_str);
     draw_text_centered(info_line, 40, TOP_WIDTH, 0.45f, 0.45f, state == PLAYER_LOADING ? COL_WARN : COL_TEXT);
 
-    const char* style_name = (s_vis_style == VIS_STYLE_OSCILLOSCOPE) ? "Oscilloscope" : "VU Bars";
+    const char* style_name = (s_vis_style == VIS_STYLE_OSCILLOSCOPE) ? "Oscilloscope" :
+                              (s_vis_style == VIS_STYLE_ALCHEMY) ? "Alchemy" : "VU Bars";
     char style_line[64];
     snprintf(style_line, sizeof(style_line), "%s  (X: change style)", style_name);
     draw_text_centered(style_line, 58, TOP_WIDTH, 0.35f, 0.35f, COL_TEXT_DIM);
