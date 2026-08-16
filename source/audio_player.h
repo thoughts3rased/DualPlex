@@ -87,6 +87,15 @@ int audio_player_get_visualizer_samples(s16* out, int max_samples);
 // active deck only).
 int audio_player_get_download_speed(void);
 
+// True while any deck (the active one, or the incoming one mid-crossfade) is
+// actively pulling a stream over the network - false if nothing's playing,
+// or what's playing is a local (offline.c downloaded) file. offline.c uses
+// this to throttle its own background download bandwidth: without it, a
+// download competing for the same WiFi link as a live stream can starve the
+// stream's ring buffer and cause audible stutter, especially on higher-
+// bitrate FLAC where there's little headroom to begin with.
+bool audio_player_is_streaming_over_network(void);
+
 // Returns true if buffer underruns indicate the quality should be reduced.
 bool audio_player_needs_quality_downgrade(void);
 

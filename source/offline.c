@@ -5,6 +5,7 @@
 // manifest's on-disk JSON format.
 #include "offline.h"
 #include "plex_api.h"
+#include "audio_player.h"
 #include "logger.h"
 
 #include <3ds.h>
@@ -27,6 +28,18 @@
 #define OFFLINE_MAX_PLAYLISTS 30
 #define OFFLINE_PLAYLIST_MAX_TRACKS 100
 #define OFFLINE_MAX_QUEUE 150
+
+// Caps the active download's transfer rate while audio_player.c is actively
+// streaming a track over the network (see offline_update()) - otherwise the
+// download happily saturates however much of the WiFi link it's given,
+// competing with the stream for the same bandwidth and starving its ring
+// buffer, audible as stutter. 128 KB/s (~1 Mbps) comfortably covers even a
+// direct N3DS FLAC stream (typically well under that on its own) with room
+// to spare on any WiFi link that can sustain both at all, while still
+// making real download progress in the background rather than stalling it
+// outright. No cap at all (0) once nothing's streaming over the network -
+// see audio_player_is_streaming_over_network().
+#define OFFLINE_DL_THROTTLED_BYTES_PER_SEC (128 * 1024)
 
 // A track that has finished downloading and is recorded in library.json.
 // ref_count is how many still-active download requests (standalone track,
@@ -735,6 +748,13 @@ void offline_cleanup(void) {
 
 void offline_update(void) {
     if (s_active.valid) {
+        // Re-checked every pump (cheap - just a curl_easy_setopt()) rather
+        // than only once at download start, so throttling engages/lifts
+        // within a frame of playback actually starting/stopping, not just
+        // whenever the next download happens to begin.
+        curl_off_t cap = audio_player_is_streaming_over_network() ? OFFLINE_DL_THROTTLED_BYTES_PER_SEC : 0;
+        curl_easy_setopt(s_active.easy, CURLOPT_MAX_RECV_SPEED_LARGE, cap);
+
         int running = 0;
         curl_multi_perform(s_dl_multi, &running);
 

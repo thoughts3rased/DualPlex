@@ -35,7 +35,9 @@ A Plex music client for the Nintendo 3DS family of systems, using the HTTP API t
   and choose "Download for Offline Play" - for playback with no server connection at all. A
   background queue downloads them one at a time - original quality when the source is
   already FLAC/MP3, transcoded down to MP3 otherwise so it's guaranteed playable - along
-  with one shared album-art thumbnail per album. `Settings > Downloads` browses what's saved
+  with one shared album-art thumbnail per album, and automatically throttles its own
+  bandwidth while a track is actively streaming so it doesn't compete with (and stutter)
+  playback. `Settings > Downloads` browses what's saved
   (the same Artists/Albums/Tracks/Playlists screens as online, just backed by the SD card),
   shows the current download's progress, and deletes a single track/album/artist/playlist
   (same context menu, now offering "Delete from Downloads") or everything at once. The Auth

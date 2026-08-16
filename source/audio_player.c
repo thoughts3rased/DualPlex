@@ -886,6 +886,14 @@ bool audio_player_active_download_finished(void) {
     return d->ring.download_finished || d->ring.download_error;
 }
 
+bool audio_player_is_streaming_over_network(void) {
+    for (int i = 0; i < 2; i++) {
+        Deck* d = &s_decks[i];
+        if (d->active && !d->is_local && !d->ring.download_finished && !d->ring.download_error) return true;
+    }
+    return false;
+}
+
 void audio_player_update(void) {
     if (s_state == PLAYER_STOPPED || s_state == PLAYER_ERROR) return;
 
