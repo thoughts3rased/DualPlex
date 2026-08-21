@@ -88,6 +88,14 @@ int main(int argc, char* argv[]) {
         plex_api_init(app_config.server_url, app_config.auth_token);
         if (plex_api_test_connection()) {
             connected = true;
+        } else if (app_config.server_url_locked) {
+            // The user pinned this exact address from Settings > Server
+            // Address (see ui.c) precisely because Plex's own connection
+            // guessing (build_connection_candidates() in plex_api.c) picks
+            // wrong for their network/router - so on failure here, respect
+            // that and stop, rather than falling back into the very
+            // auto-discovery the override exists to bypass.
+            LOG_WARN("Saved server address unreachable - override is locked, not attempting auto-discovery");
         } else {
             // The saved address didn't work - this happens whenever the
             // console launches on a different network than last time (a
