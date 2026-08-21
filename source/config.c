@@ -75,6 +75,8 @@ static void parse_config_file(FILE* f, AppConfig* config) {
                     strncpy(config->server_name, val, sizeof(config->server_name) - 1);
                 } else if (strcmp(key, "clock_24h") == 0) {
                     config->clock_24h = (strcmp(val, "1") == 0);
+                } else if (strcmp(key, "server_url_locked") == 0) {
+                    config->server_url_locked = (strcmp(val, "1") == 0);
                 } else if (strcmp(key, "client_id") == 0) {
                     strncpy(config->client_id, val, sizeof(config->client_id) - 1);
                 }
@@ -125,6 +127,7 @@ bool config_save(const AppConfig* config) {
     fprintf(f, "auth_token=%s\n", config->auth_token);
     fprintf(f, "server_name=%s\n", config->server_name);
     fprintf(f, "clock_24h=%d\n", config->clock_24h ? 1 : 0);
+    fprintf(f, "server_url_locked=%d\n", config->server_url_locked ? 1 : 0);
     fprintf(f, "client_id=%s\n", config->client_id);
 
     fclose(f);

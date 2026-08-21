@@ -20,6 +20,18 @@ typedef struct {
     // its other advertised addresses, rather than just giving up. See
     // plex_api_reconnect_via_account().
     char server_name[PLEX_MAX_STR];
+    // When true, server_url is a user-set override (Settings > Server
+    // Address, on the Hub) that always wins: startup only ever tries this
+    // exact address and never falls back to plex.tv account discovery when
+    // it fails (see main.c's use of plex_api_reconnect_via_account()). Off
+    // by default - a server_url saved via the normal sign-in/server-select
+    // flow (SCREEN_SERVER_SELECT) is just a "last known good" address, not
+    // an override, so a failed connection there still retries every other
+    // address plex.tv knows about for the account. Added because Plex's own
+    // connection ordering (see plex_api.c's build_connection_candidates())
+    // can't always guess right for every network/router combination - this
+    // is the escape hatch for when it doesn't.
+    bool server_url_locked;
     // Whether the top-screen clock displays 24-hour time instead of 12-hour
     // with AM/PM. Not read from the 3DS's own "Display 24-Hour Time" system
     // setting - that isn't exposed through any documented API - so this is

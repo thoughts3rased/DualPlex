@@ -295,6 +295,11 @@ void ui_set_screen(UIScreen screen) {
         s_offline_browse = false;
     } else if (screen == SCREEN_DOWNLOADS) {
         s_list_count = 3;
+    } else if (screen == SCREEN_SETTINGS) {
+        // Otherwise a leftover message from whatever screen was open before
+        // (e.g. Hub's "Deleted 'X' from downloads") would show up under the
+        // new Server Address Override status line for no reason.
+        s_status_msg[0] = '\0';
     } else if (screen == SCREEN_PLAYLISTS) {
         s_playlists_from_cache = false;
         if (s_offline_browse) {
@@ -2036,6 +2041,11 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             strncpy(s_config->server_url, s_servers[s_selected_idx].uri, sizeof(s_config->server_url) - 1);
             strncpy(s_config->auth_token, s_servers[s_selected_idx].access_token, sizeof(s_config->auth_token) - 1);
             strncpy(s_config->server_name, s_servers[s_selected_idx].name, sizeof(s_config->server_name) - 1);
+            // Picking a server from Plex's own discovered list is the
+            // opposite of a manual override - clear any prior lock (Settings
+            // > Server Address) so future launches go back to trusting
+            // plex.tv's connection ordering instead of the old pinned address.
+            s_config->server_url_locked = false;
             config_save(s_config);
             plex_api_init(s_config->server_url, s_config->auth_token);
             // Confirms the connection so plex_api_is_connected() (and the
@@ -2162,12 +2172,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_HUB);
             return;
         }
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
+        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 3;
+        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 3) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx <= 2) {
+            if (idx >= 0 && idx <= 3) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
@@ -2183,6 +2193,39 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 s_status_msg[0] = '\0';
                 nav_push(SCREEN_SETTINGS);
                 ui_set_screen(SCREEN_DOWNLOADS);
+            } else if (s_selected_idx == 3 && s_config) { // Server Address override
+                if (s_config->server_url_locked) {
+                    // Already locked to a manual address - one tap turns
+                    // auto-discovery back on rather than opening the
+                    // keyboard again, so disabling the override doesn't
+                    // require re-typing/clearing the URL by hand.
+                    s_config->server_url_locked = false;
+                    config_save(s_config);
+                    snprintf(s_status_msg, sizeof(s_status_msg), "Auto-discovery re-enabled");
+                    s_status_color = COL_TEXT_DIM;
+                } else if (show_keyboard("Enter Server URL", s_config->server_url, sizeof(s_config->server_url))) {
+                    if (s_config->server_url[0]) {
+                        // A manual override no longer corresponds to
+                        // whatever named resource server_name (if any) was
+                        // last picked from SCREEN_SERVER_SELECT - clear it
+                        // so a stale name can't confuse a later switch back
+                        // to auto-discovery.
+                        s_config->server_name[0] = '\0';
+                        s_config->server_url_locked = true;
+                        config_save(s_config);
+                        // Try it immediately so the status line gives real
+                        // feedback instead of just trusting the typed URL
+                        // until the next launch.
+                        plex_api_init(s_config->server_url, s_config->auth_token);
+                        if (plex_api_test_connection()) {
+                            snprintf(s_status_msg, sizeof(s_status_msg), "Override saved - connected!");
+                            s_status_color = COL_PLAYING;
+                        } else {
+                            snprintf(s_status_msg, sizeof(s_status_msg), "Override saved, but couldn't connect");
+                            s_status_color = COL_ERROR;
+                        }
+                    }
+                }
             }
         }
         return;
@@ -3122,7 +3165,20 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         snprintf(downloads_sub, sizeof(downloads_sub), "%d track(s) - %.1f MB",
                  offline_get_track_count(), offline_get_storage_used_bytes() / (1024.0f * 1024.0f));
         draw_list_item(2, "Downloads", downloads_sub, s_selected_idx == 2, false);
-        draw_text_centered("Tap a row (or D-Pad + A) to open/toggle it", LIST_START_Y + 3 * LIST_ITEM_HEIGHT + 8, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+
+        char override_sub[64];
+        if (s_config->server_url_locked) {
+            snprintf(override_sub, sizeof(override_sub), "On (tap to disable)");
+        } else {
+            snprintf(override_sub, sizeof(override_sub), "Off (tap to set)");
+        }
+        draw_list_item(3, "Server Address Override", override_sub, s_selected_idx == 3, false);
+
+        if (s_status_msg[0]) {
+            draw_text_centered(s_status_msg, LIST_START_Y + 4 * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
+        } else {
+            draw_text_centered("Tap a row (or D-Pad + A) to open/toggle it", LIST_START_Y + 4 * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+        }
 
         bool is_n3ds = false;
         APT_CheckNew3DS(&is_n3ds);
