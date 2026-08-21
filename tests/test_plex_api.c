@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <curl/curl.h>
+#include "cJSON.h"
 
 #include "plex_api.h"
 #include "3ds.h" /* for g_stub_is_new3ds */
@@ -28,6 +29,7 @@ extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out
 extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
 extern bool resolve_host_is_local_via_dns(const char* host);
 extern int parse_tracks_from_json(const char* response, PlexTrack* out, int start, int max, int* out_total);
+extern int build_connection_candidates(cJSON* res_item, char candidates[][PLEX_CANDIDATE_URL_MAX], int max, int* out_custom_count, int* out_local_count);
 
 /* ---------------------------------------------------------------- test framework */
 
@@ -832,6 +834,183 @@ TEST(is_connected_false_until_a_connection_test_actually_runs) {
     CHECK(!plex_api_is_connected());
 }
 
+TEST(connection_candidates_prefers_custom_url_then_local_plex_direct_https_then_bare_ip_then_remote) {
+    /* Shaped like a real plex.tv /api/v2/resources entry: a LAN connection
+     * that offers both a *.plex.direct https uri and its own bare-IP
+     * address, a custom server access URL (Settings > Network > "Custom
+     * server access URLs"), the server's own default WAN plex.direct
+     * address, and a Plex Relay fallback. */
+    const char* json =
+        "{"
+        "  \"name\": \"MyServer\","
+        "  \"provides\": \"server\","
+        "  \"connections\": ["
+        "    {\"address\":\"192.168.1.50\",\"port\":32400,"
+        "     \"uri\":\"https://192-168-1-50.abcdef.plex.direct:32400\",\"local\":true},"
+        "    {\"address\":\"203.0.113.9\",\"port\":32400,"
+        "     \"uri\":\"https://plex.sam-nas.net:32400\",\"local\":false},"
+        "    {\"address\":\"203.0.113.9\",\"port\":32400,"
+        "     \"uri\":\"https://203-0-113-9.abcdef.plex.direct:32400\",\"local\":false},"
+        "    {\"address\":\"\",\"port\":32443,"
+        "     \"uri\":\"https://relay-xyz.plex.direct:32443\",\"local\":false}"
+        "  ]"
+        "}";
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[8][PLEX_CANDIDATE_URL_MAX];
+    int custom_count = 0;
+    int local_count = 0;
+    int n = build_connection_candidates(res, candidates, 8, &custom_count, &local_count);
+
+    CHECK(n == 5);
+    CHECK(custom_count == 1);
+    CHECK(local_count == 2);
+    /* The custom access URL first - the user pointed it somewhere on
+     * purpose (their own reverse proxy, say), so it's trusted ahead of
+     * anything Plex guessed on its own, local addresses included. */
+    CHECK_STR_EQ(candidates[0], "https://plex.sam-nas.net:32400");
+    /* Then the local candidates: the plex.direct https uri (satisfies
+     * "Secure Connections: Required" - PMS's HTTPS listener rejects a bare
+     * IP) ahead of the bare-IP http:// fallback (survives routers that
+     * block resolving *.plex.direct via DNS rebinding protection). */
+    CHECK_STR_EQ(candidates[1], "https://192-168-1-50.abcdef.plex.direct:32400");
+    CHECK_STR_EQ(candidates[2], "http://192.168.1.50:32400");
+    /* Then everything else non-local, in the order Plex listed them. */
+    CHECK_STR_EQ(candidates[3], "https://203-0-113-9.abcdef.plex.direct:32400");
+    CHECK_STR_EQ(candidates[4], "https://relay-xyz.plex.direct:32443");
+
+    cJSON_Delete(res);
+}
+
+TEST(connection_candidates_falls_back_to_bare_ip_when_local_connection_has_no_uri) {
+    /* Older/unusual resource entries with a local address but no uri at
+     * all still need to produce a usable candidate. */
+    const char* json =
+        "{\"connections\": [{\"address\":\"10.0.0.5\",\"port\":32400,\"local\":true}]}";
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[4][PLEX_CANDIDATE_URL_MAX];
+    int custom_count = 0;
+    int local_count = 0;
+    int n = build_connection_candidates(res, candidates, 4, &custom_count, &local_count);
+
+    CHECK(n == 1);
+    CHECK(custom_count == 0);
+    CHECK(local_count == 1);
+    CHECK_STR_EQ(candidates[0], "http://10.0.0.5:32400");
+
+    cJSON_Delete(res);
+}
+
+TEST(connection_candidates_respects_the_max_cap) {
+    /* A custom access URL present alongside a local connection: with only
+     * one slot to give out, the custom URL - top priority tier - wins it. */
+    const char* json =
+        "{\"connections\": ["
+        "  {\"address\":\"192.168.1.50\",\"port\":32400,"
+        "   \"uri\":\"https://192-168-1-50.abcdef.plex.direct:32400\",\"local\":true},"
+        "  {\"address\":\"203.0.113.9\",\"port\":32400,"
+        "   \"uri\":\"https://plex.sam-nas.net:32400\",\"local\":false}"
+        "]}";
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[1][PLEX_CANDIDATE_URL_MAX];
+    int n = build_connection_candidates(res, candidates, 1, NULL, NULL);
+
+    CHECK(n == 1);
+    CHECK_STR_EQ(candidates[0], "https://plex.sam-nas.net:32400");
+
+    cJSON_Delete(res);
+}
+
+TEST(connection_candidates_respects_the_max_cap_with_no_custom_url) {
+    /* Same cap test as above but with nothing in the custom tier, so the
+     * local connection is what should win the single slot instead. */
+    const char* json =
+        "{\"connections\": ["
+        "  {\"address\":\"192.168.1.50\",\"port\":32400,"
+        "   \"uri\":\"https://192-168-1-50.abcdef.plex.direct:32400\",\"local\":true},"
+        "  {\"address\":\"203.0.113.9\",\"port\":32400,"
+        "   \"uri\":\"https://203-0-113-9.abcdef.plex.direct:32400\",\"local\":false}"
+        "]}";
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[1][PLEX_CANDIDATE_URL_MAX];
+    int n = build_connection_candidates(res, candidates, 1, NULL, NULL);
+
+    CHECK(n == 1);
+    CHECK_STR_EQ(candidates[0], "https://192-168-1-50.abcdef.plex.direct:32400");
+
+    cJSON_Delete(res);
+}
+
+/* Regression: a real account's resource list for a Dockerized PMS host
+ * returned 15 separate "local" connections - the real LAN address plus one
+ * spurious entry per docker-compose bridge network's gateway IP - alongside
+ * just 2 non-local ones (a custom server access URL and the default WAN
+ * plex.direct address). With one shared candidate budget, the local pass
+ * alone consumed it before the non-local pass ever ran, silently dropping
+ * the only two addresses that could actually work from outside the LAN. */
+TEST(connection_candidates_does_not_let_many_local_addresses_starve_out_non_local_ones) {
+    char json[8192];
+    int len = snprintf(json, sizeof(json), "{\"connections\": [");
+    for (int i = 0; i < 15; i++) {
+        len += snprintf(json + len, sizeof(json) - (size_t)len,
+            "%s{\"address\":\"172.16.%d.1\",\"port\":32400,"
+            "\"uri\":\"https://172-16-%d-1.abcdef.plex.direct:32400\",\"local\":true}",
+            i == 0 ? "" : ",", i, i);
+    }
+    len += snprintf(json + len, sizeof(json) - (size_t)len,
+        ",{\"address\":\"plex.sam-nas.net\",\"port\":443,"
+        "\"uri\":\"https://plex.sam-nas.net:443\",\"local\":false}"
+        ",{\"address\":\"90.244.182.162\",\"port\":443,"
+        "\"uri\":\"https://90-244-182-162.abcdef.plex.direct:443\",\"local\":false}"
+        "]}");
+    CHECK(len < (int)sizeof(json));
+
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_CANDIDATE_URL_MAX];
+    int custom_count = 0;
+    int local_count = 0;
+    int n = build_connection_candidates(res, candidates, PLEX_RECONNECT_MAX_CANDIDATES, &custom_count, &local_count);
+
+    /* Custom access URL sorts first, ahead of all 15 local addresses. Local
+     * pass is then capped well below all 15 available (8, mirroring
+     * PLEX_LOCAL_CANDIDATE_CAP in plex_api.c) so the trailing non-local pass
+     * always gets to run too. */
+    CHECK(custom_count == 1);
+    CHECK(local_count == 8);
+    CHECK(n == 10);
+    CHECK_STR_EQ(candidates[0], "https://plex.sam-nas.net:443");
+    CHECK_STR_EQ(candidates[1], "https://172-16-0-1.abcdef.plex.direct:32400");
+    CHECK_STR_EQ(candidates[9], "https://90-244-182-162.abcdef.plex.direct:443");
+
+    cJSON_Delete(res);
+}
+
+TEST(connection_candidates_returns_zero_with_no_connections_array) {
+    const char* json = "{\"name\": \"MyServer\", \"provides\": \"server\"}";
+    cJSON* res = cJSON_Parse(json);
+    CHECK(res != NULL);
+
+    char candidates[4][PLEX_CANDIDATE_URL_MAX];
+    int custom_count = 99;
+    int local_count = 99;
+    int n = build_connection_candidates(res, candidates, 4, &custom_count, &local_count);
+
+    CHECK(n == 0);
+    CHECK(custom_count == 0);
+    CHECK(local_count == 0);
+
+    cJSON_Delete(res);
+}
+
 /* ================================================================== */
 
 int main(void) {
@@ -876,6 +1055,12 @@ int main(void) {
     RUN(is_https_downgraded_for_bare_ip_addresses);
     RUN(is_https_false_for_plain_http_input);
     RUN(is_connected_false_until_a_connection_test_actually_runs);
+    RUN(connection_candidates_prefers_custom_url_then_local_plex_direct_https_then_bare_ip_then_remote);
+    RUN(connection_candidates_falls_back_to_bare_ip_when_local_connection_has_no_uri);
+    RUN(connection_candidates_respects_the_max_cap);
+    RUN(connection_candidates_respects_the_max_cap_with_no_custom_url);
+    RUN(connection_candidates_does_not_let_many_local_addresses_starve_out_non_local_ones);
+    RUN(connection_candidates_returns_zero_with_no_connections_array);
 
     printf("\nran %d tests\n", g_tests_run);
     if (g_tests_failed > 0) {
