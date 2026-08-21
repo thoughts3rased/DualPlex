@@ -520,29 +520,33 @@ bool plex_api_is_local_connection(void) {
     return false;
 }
 
+// Resolves and caches local-vs-remote for the CURRENT s_server_url (a plain
+// hostname - the only case that needs a real lookup - costs a blocking DNS
+// round-trip, see resolve_host_is_local_via_dns()). Split out of
+// test_connection_impl() below so a caller that already has independent,
+// fresh proof the server is reachable (probe_candidates_concurrently()'s
+// callers, after picking a winner) can get this classification set without
+// paying for - or risking the failure of - a whole separate confirmation
+// request right after it.
+static void refresh_local_classification(void) {
+    char host[256];
+    extract_host(s_server_url, host, sizeof(host));
+    bool is_local;
+    if (!classify_host_without_dns(host, &is_local)) {
+        is_local = resolve_host_is_local_via_dns(host);
+    }
+    s_local_override_valid = true;
+    s_local_override_value = is_local;
+}
+
 // Does the actual work for plex_api_test_connection() below, which just
 // wraps this to also update s_connected (a single spot handling that
 // regardless of which of this function's several return points is hit,
 // rather than needing every one of them to remember to set it).
 static bool test_connection_impl(void) {
-    // Resolve local-vs-remote once per connection attempt here rather than
-    // from plex_api_is_local_connection() itself - that's called every
-    // frame to draw the top-bar icon, and a plain hostname (the only case
-    // that needs a real lookup) requires a blocking DNS round-trip. This
-    // function already does one blocking network round-trip below, so one
-    // more here doesn't change this call's cost class. Independent of the
-    // HTTP/HTTPS probe that follows - the host doesn't change between
-    // schemes - so it's cached before that can early-return.
-    {
-        char host[256];
-        extract_host(s_server_url, host, sizeof(host));
-        bool is_local;
-        if (!classify_host_without_dns(host, &is_local)) {
-            is_local = resolve_host_is_local_via_dns(host);
-        }
-        s_local_override_valid = true;
-        s_local_override_value = is_local;
-    }
+    // Independent of the HTTP/HTTPS probe that follows - the host doesn't
+    // change between schemes - so it's cached before that can early-return.
+    refresh_local_classification();
 
     bool tried_https = strncmp(s_server_url, "https://", 8) == 0;
 
@@ -704,89 +708,348 @@ int plex_api_login_direct(const char* login, const char* password, const char* c
     return result;
 }
 
+// Every address Plex generates for itself - the LAN connection, the server's
+// default WAN address, a Plex Relay fallback - uses a *.plex.direct hostname
+// (the target IP dash-encoded into a subdomain of a wildcard cert Plex
+// controls, e.g. "192-168-1-50.abcdef.plex.direct"). A connection whose uri
+// *isn't* shaped like that is therefore a user-configured one - a "Custom
+// server access URL" set under the server's Settings > Network - and not
+// something Plex's own connection-testing logic gets any say over: the user
+// deliberately pointed it somewhere (their own reverse proxy, in the case
+// that prompted this), so it deserves top priority over Plex's own guesses,
+// not just a slot among the generic non-local fallbacks. This is a heuristic
+// (a substring check, not real hostname parsing) but a reliable one - nothing
+// Plex generates itself contains this substring.
+static bool uri_is_plex_direct(const char* uri) {
+    return strstr(uri, ".plex.direct") != NULL;
+}
+
+// Populates `candidates` with every URL worth trying to reach `res_item` (one
+// entry from plex.tv's /api/v2/resources response), ordered by preference and
+// capped at `max`, in three tiers:
+//
+//   1. Custom server access URLs (see uri_is_plex_direct() above) - the user
+//      configured these explicitly, so they're tried before anything Plex
+//      guessed on its own, local addresses included.
+//   2. Local connections - LAN is typically fastest when reachable. For each
+//      one, its own https `uri` (e.g. a *.plex.direct hostname) before the
+//      bare-IP http://address:port that same connection also offers. Both
+//      matter and neither alone is reliable: PMS's HTTPS listener rejects a
+//      bare IP as the request's Host/SNI outright (see sanitize_server_url()
+//      above), so "Secure Connections: Required" on the server rules out the
+//      bare-IP one - but plenty of home routers block resolving
+//      *.plex.direct at all (DNS rebinding protection), which rules out the
+//      https one instead. There's no way to tell in advance which applies,
+//      so both get tried and the caller picks whichever actually connects.
+//   3. Everything else non-local (the server's own WAN plex.direct address,
+//      Plex Relay, ...), one per connection, used as-is via its own `uri` -
+//      none of those have the bare-IP problem to begin with.
+//
+// Each tier is capped independently (PLEX_CUSTOM_CANDIDATE_CAP,
+// PLEX_LOCAL_CANDIDATE_CAP, PLEX_NONLOCAL_CANDIDATE_CAP) rather than sharing
+// one budget out of `max`, so a resource with many local addresses can't
+// starve out the custom or WAN/relay tiers - see those macros' comments.
+// Returns the number of candidates written. *out_custom_count of those (a
+// prefix of the array) are custom access URLs; *out_local_count immediately
+// following them (both may be NULL if the caller doesn't need them) came
+// from a "local" connection.
+//
+// Not part of the public API (deliberately not in plex_api.h) - given
+// external linkage here only so tests/test_plex_api.c can exercise its
+// candidate ordering directly against synthetic resource JSON, the same
+// reason resolve_host_is_local_via_dns() above has it.
+int build_connection_candidates(cJSON* res_item, char candidates[][PLEX_CANDIDATE_URL_MAX], int max,
+                                 int* out_custom_count, int* out_local_count) {
+    int n = 0;
+    int custom_n = 0; // tracked locally regardless of out_custom_count so pass 1's
+                       // bookkeeping below always has it, even when the caller passed NULL
+    if (out_custom_count) *out_custom_count = 0;
+    if (out_local_count) *out_local_count = 0;
+
+    cJSON* connections = cJSON_GetObjectItem(res_item, "connections");
+    if (!connections || !cJSON_IsArray(connections)) {
+        LOG_WARN("build_connection_candidates: resource has no \"connections\" array");
+        return 0;
+    }
+
+    int custom_cap = PLEX_CUSTOM_CANDIDATE_CAP < max ? PLEX_CUSTOM_CANDIDATE_CAP : max;
+
+    // Three passes so every candidate sorts custom-then-local-then-everything-
+    // else, without needing to actually sort anything. Passes 0 and 1 each
+    // stop at their own cap rather than `max` - see this function's own
+    // comment above - so later passes always have room left in `candidates`
+    // to run, regardless of how many higher-tier connections this resource
+    // advertised. Each cap is computed from `n` as it stood when that pass
+    // started (not a fixed reservation), so a tier that had fewer entries
+    // than its cap allows doesn't eat into the room left for the tiers after
+    // it.
+    for (int pass = 0; pass < 3 && n < max; pass++) {
+        int room = max - n;
+        int pass_cap = n + ((pass == 0) ? (custom_cap - n < room ? custom_cap - n : room)
+                           : (pass == 1) ? (PLEX_LOCAL_CANDIDATE_CAP < room ? PLEX_LOCAL_CANDIDATE_CAP : room)
+                           : room);
+        cJSON* conn = NULL;
+        cJSON_ArrayForEach(conn, connections) {
+            if (n >= pass_cap) break;
+
+            cJSON* uri = cJSON_GetObjectItem(conn, "uri");
+            cJSON* local = cJSON_GetObjectItem(conn, "local");
+            cJSON* address = cJSON_GetObjectItem(conn, "address");
+            cJSON* port = cJSON_GetObjectItem(conn, "port");
+            bool is_loc = (local && cJSON_IsTrue(local));
+            bool has_uri = (uri && cJSON_IsString(uri) && uri->valuestring[0]);
+            bool is_custom = !is_loc && has_uri && !uri_is_plex_direct(uri->valuestring);
+
+            // Every connection this resource advertised gets visited exactly
+            // once across the three passes - log it here (pass 0 sees all of
+            // them, regardless of which pass will actually use it) so
+            // sdmc:/dualplex.log shows exactly what plex.tv published for
+            // this server, independent of whatever this function decides to
+            // do with it - the only way to tell "Plex didn't publish this
+            // address" apart from "Plex published it but nothing tried it"
+            // apart from "it was tried and failed".
+            if (pass == 0) {
+                LOG_INFO("  connection: local=%d address=%s port=%d uri=%s",
+                         is_loc,
+                         (address && cJSON_IsString(address)) ? address->valuestring : "(none)",
+                         (port && cJSON_IsNumber(port)) ? port->valueint : 0,
+                         has_uri ? uri->valuestring : "(none)");
+            }
+
+            bool wants_this_pass = (pass == 0) ? is_custom : (pass == 1) ? is_loc : (!is_loc && !is_custom);
+            if (!wants_this_pass) continue;
+
+            if (has_uri && n < pass_cap) {
+                sanitize_server_url(uri->valuestring, candidates[n], PLEX_CANDIDATE_URL_MAX);
+                n++;
+            }
+            if (is_loc && address && cJSON_IsString(address) && port && cJSON_IsNumber(port) && n < pass_cap) {
+                char direct_http[PLEX_CANDIDATE_URL_MAX];
+                snprintf(direct_http, sizeof(direct_http), "http://%s:%d", address->valuestring, port->valueint);
+                sanitize_server_url(direct_http, candidates[n], PLEX_CANDIDATE_URL_MAX);
+                n++;
+            }
+        }
+        if (pass == 0) {
+            custom_n = n;
+            if (out_custom_count) *out_custom_count = n;
+        }
+        if (pass == 1 && out_local_count) *out_local_count = n - custom_n;
+    }
+    return n;
+}
+
+// Fires a lightweight GET "/" at every one of `count` entries in
+// `candidates` concurrently, via curl's multi interface (already used
+// elsewhere in this file - see perform_blocking_request() above - and in
+// album_art.c), rather than testing them one at a time: a sequential loop
+// makes total wait time scale with candidate count, so testing from a
+// network where only the last, lowest-priority candidate is reachable meant
+// sitting through every higher-priority candidate's full timeout first (up
+// to PLEX_RECONNECT_MAX_CANDIDATES of them). Firing them all at once bounds
+// the wait by the slowest individual request instead.
+//
+// Returns the index of the highest-priority (lowest-index) candidate that
+// got a 200 back, as soon as that's decidable - i.e. once it and every
+// candidate ranked above it has finished, without necessarily waiting for
+// the remaining, lower-priority ones too - or -1 if every candidate that
+// finishes fails and none are left pending. `candidates` is assumed already
+// ordered custom-URL-then-local-then-remote, each local connection's https
+// uri before its bare-IP fallback (see build_connection_candidates() above),
+// so "lowest index that succeeded" is exactly "best reachable address"
+// already - no extra ranking needed here.
+static int probe_candidates_concurrently(char candidates[][PLEX_CANDIDATE_URL_MAX], int count, const char* token) {
+    if (count <= 0) return -1;
+    if (count > PLEX_RECONNECT_MAX_CANDIDATES) count = PLEX_RECONNECT_MAX_CANDIDATES; // defensive
+
+    CURLM* multi = curl_multi_init();
+    if (!multi) return -1;
+
+    CURL* easy[PLEX_RECONNECT_MAX_CANDIDATES] = {0};
+    struct curl_slist* header_lists[PLEX_RECONNECT_MAX_CANDIDATES] = {0};
+    HttpBuffer bufs[PLEX_RECONNECT_MAX_CANDIDATES];
+    bool done[PLEX_RECONNECT_MAX_CANDIDATES] = {0};
+    bool ok[PLEX_RECONNECT_MAX_CANDIDATES] = {0};
+    memset(bufs, 0, sizeof(bufs));
+
+    int added = 0;
+    for (int i = 0; i < count; i++) {
+        CURL* curl = curl_easy_init();
+        if (!curl) { done[i] = true; continue; } // counts as an immediate failure, doesn't block the scan below
+
+        char url[PLEX_CANDIDATE_URL_MAX + 4];
+        snprintf(url, sizeof(url), "%s/", candidates[i]);
+
+        bufs[i].data = malloc(1);
+        bufs[i].capacity = 1;
+        if (bufs[i].data) bufs[i].data[0] = 0;
+
+        struct curl_slist* headers = NULL;
+        headers = curl_slist_append(headers, "Accept: application/json");
+        if (token && token[0]) {
+            char token_hdr[256];
+            snprintf(token_hdr, sizeof(token_hdr), "X-Plex-Token: %s", token);
+            headers = curl_slist_append(headers, token_hdr);
+        }
+        headers = curl_slist_append(headers, client_id_header());
+        headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
+        headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
+        headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
+        header_lists[i] = headers;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&bufs[i]);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+        easy[i] = curl;
+        curl_multi_add_handle(multi, curl);
+        added++;
+    }
+
+    LOG_INFO("Probing %d candidate address(es) concurrently", added);
+
+    int winner = -1;
+    if (added > 0) {
+        int still_running = added;
+        while (still_running > 0) {
+            CURLMcode mc = curl_multi_perform(multi, &still_running);
+            if (mc != CURLM_OK) break;
+
+            CURLMsg* msg;
+            int msgs_left = 0;
+            while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+                if (msg->msg != CURLMSG_DONE) continue;
+                for (int i = 0; i < count; i++) {
+                    if (easy[i] != msg->easy_handle) continue;
+                    long http_code = 0;
+                    curl_easy_getinfo(easy[i], CURLINFO_RESPONSE_CODE, &http_code);
+                    done[i] = true;
+                    ok[i] = (msg->data.result == CURLE_OK && http_code == 200);
+                    LOG_INFO("  probe: %s -> %s", candidates[i], ok[i] ? "reachable" : "failed");
+                    break;
+                }
+            }
+
+            // Lowest-index candidate that's succeeded, as long as every
+            // higher-priority one before it has already been decided
+            // (succeeded or failed) - see this function's comment above for
+            // why this can return well before still_running hits 0.
+            for (int i = 0; i < count; i++) {
+                if (!done[i]) break;
+                if (ok[i]) { winner = i; break; }
+            }
+            if (winner >= 0) break;
+
+            if (still_running > 0) {
+                audio_player_update(); // same reasoning as perform_blocking_request() above
+                int numfds = 0;
+                curl_multi_wait(multi, NULL, 0, 100, &numfds);
+            }
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (easy[i]) {
+            curl_multi_remove_handle(multi, easy[i]);
+            curl_easy_cleanup(easy[i]);
+        }
+        if (header_lists[i]) curl_slist_free_all(header_lists[i]);
+        free(bufs[i].data);
+    }
+    curl_multi_cleanup(multi);
+
+    return winner;
+}
+
 int plex_api_get_servers(const char* account_token, PlexServerResource* out_servers, int max) {
     if (!account_token || !out_servers) return 0;
-    
+
     char* response = NULL;
     if (!plex_http_get_full_url("https://plex.tv/api/v2/resources?includeHttps=1", account_token, &response)) {
         return 0;
     }
-    
+
+    // This runs before any server connection is established (only called
+    // once, right after login, while s_num_servers is still 0 - see
+    // ui_set_screen()'s SCREEN_SERVER_SELECT case), so it's safe - and, per
+    // build_connection_candidates()'s comment above, necessary - to actually
+    // probe each candidate here rather than just guessing one: that's the
+    // only way to know in advance which of a resource's several connections
+    // this network/server combination can actually reach. Saved/restored
+    // anyway since plex_api_init()/plex_api_test_connection() repoint the
+    // shared connection state (s_server_url et al) to do that probing.
+    char saved_url[PLEX_MAX_URL];
+    char saved_token[128];
+    strncpy(saved_url, s_server_url, sizeof(saved_url) - 1);
+    saved_url[sizeof(saved_url) - 1] = '\0';
+    strncpy(saved_token, s_auth_token, sizeof(saved_token) - 1);
+    saved_token[sizeof(saved_token) - 1] = '\0';
+
     int count = 0;
     cJSON* json = cJSON_Parse(response);
     if (json && cJSON_IsArray(json)) {
         cJSON* res_item = NULL;
         cJSON_ArrayForEach(res_item, json) {
             if (count >= max) break;
-            
+
             cJSON* provides = cJSON_GetObjectItem(res_item, "provides");
-            if (provides && cJSON_IsString(provides) && strstr(provides->valuestring, "server")) {
-                cJSON* name = cJSON_GetObjectItem(res_item, "name");
-                cJSON* token = cJSON_GetObjectItem(res_item, "accessToken");
-                
-                if (name && cJSON_IsString(name)) {
-                    strncpy(out_servers[count].name, name->valuestring, sizeof(out_servers[count].name) - 1);
-                }
-                if (token && cJSON_IsString(token)) {
-                    strncpy(out_servers[count].access_token, token->valuestring, sizeof(out_servers[count].access_token) - 1);
-                } else {
-                    strncpy(out_servers[count].access_token, account_token, sizeof(out_servers[count].access_token) - 1);
-                }
-                
-                // Parse connections: prefer local direct http://IP:port
-                cJSON* connections = cJSON_GetObjectItem(res_item, "connections");
-                if (connections && cJSON_IsArray(connections)) {
-                    cJSON* conn = NULL;
-                    char best_uri[PLEX_MAX_URL] = "";
-                    bool best_is_local = false;
-                    
-                    cJSON_ArrayForEach(conn, connections) {
-                        cJSON* uri = cJSON_GetObjectItem(conn, "uri");
-                        cJSON* local = cJSON_GetObjectItem(conn, "local");
-                        cJSON* address = cJSON_GetObjectItem(conn, "address");
-                        cJSON* port = cJSON_GetObjectItem(conn, "port");
-                        
-                        bool is_loc = (local && cJSON_IsTrue(local));
-                        char direct_http[PLEX_MAX_URL] = "";
-                        if (is_loc && address && cJSON_IsString(address) && port && cJSON_IsNumber(port)) {
-                            snprintf(direct_http, sizeof(direct_http), "http://%s:%d", address->valuestring, port->valueint);
-                        }
-                        
-                        const char* target = direct_http[0] ? direct_http : (uri && cJSON_IsString(uri) ? uri->valuestring : "");
-                        
-                        if (target[0] != '\0') {
-                            if (is_loc && direct_http[0]) {
-                                strncpy(best_uri, target, sizeof(best_uri) - 1);
-                                best_is_local = true;
-                                break; // Best connection found!
-                            } else if (is_loc && !best_is_local) {
-                                strncpy(best_uri, target, sizeof(best_uri) - 1);
-                                best_is_local = true;
-                            } else if (best_uri[0] == '\0') {
-                                strncpy(best_uri, target, sizeof(best_uri) - 1);
-                            }
-                        }
-                    }
-                    if (best_uri[0] != '\0') {
-                        sanitize_server_url(best_uri, out_servers[count].uri, sizeof(out_servers[count].uri));
-                        out_servers[count].is_local = best_is_local;
-                        count++;
-                    }
-                }
+            if (!provides || !cJSON_IsString(provides) || !strstr(provides->valuestring, "server")) continue;
+
+            cJSON* name = cJSON_GetObjectItem(res_item, "name");
+            cJSON* token = cJSON_GetObjectItem(res_item, "accessToken");
+            char resource_token[128];
+            if (token && cJSON_IsString(token)) {
+                strncpy(resource_token, token->valuestring, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
+            } else {
+                strncpy(resource_token, account_token, sizeof(resource_token) - 1);
+                resource_token[sizeof(resource_token) - 1] = '\0';
             }
+
+            char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_CANDIDATE_URL_MAX];
+            int custom_count = 0;
+            int local_count = 0;
+            int candidate_count = build_connection_candidates(res_item, candidates, PLEX_RECONNECT_MAX_CANDIDATES, &custom_count, &local_count);
+            if (candidate_count == 0) continue; // no usable connection advertised at all
+
+            // Probe every candidate at once and keep the highest-priority
+            // one that's actually reachable. If none are (e.g. this screen
+            // is reached with no network at all), fall back to the
+            // top-priority guess so the server still shows up in the list
+            // instead of silently vanishing - the normal connect-failure
+            // handling covers it from there.
+            int chosen = probe_candidates_concurrently(candidates, candidate_count, resource_token);
+            if (chosen < 0) chosen = 0;
+
+            if (name && cJSON_IsString(name)) {
+                strncpy(out_servers[count].name, name->valuestring, sizeof(out_servers[count].name) - 1);
+            }
+            strncpy(out_servers[count].access_token, resource_token, sizeof(out_servers[count].access_token) - 1);
+            strncpy(out_servers[count].uri, candidates[chosen], sizeof(out_servers[count].uri) - 1);
+            // Local block sits right after the custom-URL block now that
+            // custom candidates are tried first - see build_connection_candidates().
+            out_servers[count].is_local = chosen >= custom_count && chosen < custom_count + local_count;
+            count++;
         }
         cJSON_Delete(json);
     }
-    
+
     if (response) free(response);
+
+    // Restore whatever connection was in effect before probing - this
+    // function only reports server addresses, it doesn't establish "the"
+    // connection; the caller does that via plex_api_init() once the user
+    // actually picks one from the list.
+    plex_api_init(saved_url, saved_token);
+
     return count;
 }
-
-// Up to this many connection candidates get tried per resource in
-// plex_api_reconnect_via_account() below - real accounts only ever
-// advertise a handful (LAN address, WAN/relay address, maybe a couple
-// more), so this is generous headroom, not a real limit.
-#define PLEX_RECONNECT_MAX_CANDIDATES 6
 
 // Re-establishes a connection using saved account credentials when the
 // previously working server address can no longer be reached at all -
@@ -796,18 +1059,21 @@ int plex_api_get_servers(const char* account_token, PlexServerResource* out_serv
 // Relay connection, etc.) still is.
 //
 // Re-fetches the account's resource list from plex.tv (same endpoint
-// plex_api_get_servers() uses), then - for the resource named
-// `server_name` (or the account's first server if that name is blank or
-// no longer matches, e.g. a config saved before server_name existed) -
-// tries every connection Plex advertises for it in turn, unlike
-// plex_api_get_servers() above, which settles for a single "best" pick
-// per resource. That pick is guided by Plex's own "local" flag, which
-// just describes the address itself (the server's own LAN IP, say) - it
-// says nothing about whether THIS client can currently reach it, so on a
-// hotspot the server's LAN connection is still reported "local" even
-// though it's unreachable from here and there'd be nothing left to fall
-// back to. Local candidates are still tried first since they're typically
-// faster when they do work.
+// plex_api_get_servers() uses, via the same build_connection_candidates()
+// helper), then - for the resource named `server_name` (or the account's
+// first server if that name is blank or no longer matches, e.g. a config
+// saved before server_name existed) - probes every candidate connection at
+// once (see probe_candidates_concurrently() above) and keeps the
+// highest-priority one that's reachable. Plex's own "local" flag just
+// describes the address itself (the server's own LAN IP, say) - it says
+// nothing about whether THIS client can currently reach it, so on a hotspot
+// the server's LAN connection is still reported "local" even though it's
+// unreachable from here and there'd be nothing left to fall back to if only
+// that one were tried. A user-configured "Custom server access URL" ranks
+// above even local candidates - the user pointed it somewhere on purpose,
+// so it's trusted over Plex's own guesses - and local candidates still rank
+// above everything else Plex guessed since they're typically faster when
+// they do work.
 //
 // On success, plex_api_init() has already been called with whatever
 // candidate worked (readable via plex_api_get_server_url()/
@@ -826,7 +1092,7 @@ bool plex_api_reconnect_via_account(const char* account_token, const char* serve
 
     char* response = NULL;
     if (!plex_http_get_full_url("https://plex.tv/api/v2/resources?includeHttps=1", account_token, &response)) {
-        LOG_WARN("Reconnect: couldn't fetch account server list");
+        LOG_WARN("Reconnect: couldn't fetch account server list (no route to plex.tv, or account_token rejected)");
         return false;
     }
 
@@ -844,6 +1110,8 @@ bool plex_api_reconnect_via_account(const char* account_token, const char* serve
             if (!fallback_res) fallback_res = res_item;
 
             cJSON* name = cJSON_GetObjectItem(res_item, "name");
+            LOG_INFO("Reconnect: account resource list includes server '%s'",
+                     (name && cJSON_IsString(name)) ? name->valuestring : "(unnamed)");
             if (server_name && server_name[0] && name && cJSON_IsString(name) &&
                 strcmp(name->valuestring, server_name) == 0) {
                 target_res = res_item;
@@ -863,52 +1131,39 @@ bool plex_api_reconnect_via_account(const char* account_token, const char* serve
                 resource_token[sizeof(resource_token) - 1] = '\0';
             }
 
-            char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_MAX_URL];
-            int candidate_count = 0;
+            char candidates[PLEX_RECONNECT_MAX_CANDIDATES][PLEX_CANDIDATE_URL_MAX];
+            int candidate_count = build_connection_candidates(target_res, candidates, PLEX_RECONNECT_MAX_CANDIDATES, NULL, NULL);
+            LOG_INFO("Reconnect: %d candidate address(es) built for target server", candidate_count);
 
-            cJSON* connections = cJSON_GetObjectItem(target_res, "connections");
-            if (connections && cJSON_IsArray(connections)) {
-                // Two passes so every "local" candidate sorts before every
-                // non-local one, without needing to actually sort anything.
-                for (int pass = 0; pass < 2 && candidate_count < PLEX_RECONNECT_MAX_CANDIDATES; pass++) {
-                    bool want_local = (pass == 0);
-                    cJSON* conn = NULL;
-                    cJSON_ArrayForEach(conn, connections) {
-                        if (candidate_count >= PLEX_RECONNECT_MAX_CANDIDATES) break;
-
-                        cJSON* uri = cJSON_GetObjectItem(conn, "uri");
-                        cJSON* local = cJSON_GetObjectItem(conn, "local");
-                        cJSON* address = cJSON_GetObjectItem(conn, "address");
-                        cJSON* port = cJSON_GetObjectItem(conn, "port");
-                        bool is_loc = (local && cJSON_IsTrue(local));
-                        if (is_loc != want_local) continue;
-
-                        char target[PLEX_MAX_URL] = "";
-                        if (is_loc && address && cJSON_IsString(address) && port && cJSON_IsNumber(port)) {
-                            snprintf(target, sizeof(target), "http://%s:%d", address->valuestring, port->valueint);
-                        } else if (uri && cJSON_IsString(uri)) {
-                            strncpy(target, uri->valuestring, sizeof(target) - 1);
-                        }
-                        if (target[0]) {
-                            sanitize_server_url(target, candidates[candidate_count], PLEX_MAX_URL);
-                            candidate_count++;
-                        }
-                    }
-                }
-            }
-
-            for (int i = 0; i < candidate_count && !connected; i++) {
-                plex_api_init(candidates[i], resource_token);
-                if (plex_api_test_connection()) {
-                    connected = true;
-                    LOG_INFO("Reconnected via account resource list: %s", candidates[i]);
-                }
+            int winner = probe_candidates_concurrently(candidates, candidate_count, resource_token);
+            if (winner >= 0) {
+                // Trust the probe's own result rather than spending a
+                // separate confirmation request on it: that request would
+                // land immediately after a burst of up to
+                // PLEX_RECONNECT_MAX_CANDIDATES concurrent connections on
+                // hardware with a small, fixed networking memory budget (the
+                // 3DS's SOC service buffer), and a transient failure there
+                // would wrongly discard an address the probe just proved
+                // works, falling back to the stale saved_url below instead
+                // of the one that actually got confirmed. Repoint the shared
+                // connection state at the winner and set s_connected/local
+                // classification directly, the same way test_connection_impl()
+                // would after a request that succeeded.
+                plex_api_init(candidates[winner], resource_token);
+                refresh_local_classification();
+                s_connected = true;
+                connected = true;
+                LOG_INFO("Reconnected via account resource list: %s", candidates[winner]);
             }
             if (!connected) {
                 LOG_WARN("Reconnect: none of %d candidate address(es) for '%s' were reachable",
                          candidate_count, (server_name && server_name[0]) ? server_name : "(unnamed)");
             }
+        } else {
+            LOG_WARN("Reconnect: account resource list has no server-providing entries at all");
         }
+    } else {
+        LOG_WARN("Reconnect: account resource list response wasn't valid JSON / an array");
     }
     if (json) cJSON_Delete(json);
     if (response) free(response);

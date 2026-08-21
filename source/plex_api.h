@@ -13,6 +13,37 @@
 #define PLEX_VERSION "0.1.0"
 #define PLEX_DEVICE "Nintendo 3DS"
 
+// Custom-access-URL, local, and other-non-local connection candidates (see
+// plex_api.c's build_connection_candidates(), used by plex_api_get_servers()
+// and plex_api_reconnect_via_account()) each get their own independent
+// budget out of PLEX_RECONNECT_MAX_CANDIDATES, rather than sharing one pool -
+// confirmed necessary against a real account's resource list (a Dockerized
+// PMS host that published one spurious "local" connection per docker-compose
+// bridge network alongside its real LAN address - 15 "local" entries for one
+// actual server), which would otherwise let the local pass alone fill a
+// shared budget and starve every other candidate (a custom server access
+// URL, the default WAN/plex.direct address, Plex Relay) out of the list
+// entirely. PLEX_LOCAL_CANDIDATE_CAP itself is still generous headroom for a
+// normal handful of local addresses, not a real limit for the common case.
+// PLEX_CUSTOM_CANDIDATE_CAP is deliberately small - a user-configured
+// "Custom server access URLs" list (Settings > Network) is realistically a
+// handful of entries at most. Exposed here (rather than kept local to
+// plex_api.c) so tests/test_plex_api.c can size its own candidate buffers
+// identically when exercising build_connection_candidates() directly.
+#define PLEX_CUSTOM_CANDIDATE_CAP 4
+#define PLEX_LOCAL_CANDIDATE_CAP 8
+#define PLEX_NONLOCAL_CANDIDATE_CAP 8
+#define PLEX_RECONNECT_MAX_CANDIDATES (PLEX_CUSTOM_CANDIDATE_CAP + PLEX_LOCAL_CANDIDATE_CAP + PLEX_NONLOCAL_CANDIDATE_CAP)
+
+// A connection candidate is always just "scheme://host:port" - nowhere near
+// PLEX_MAX_URL (sized for a full API request path, e.g. a transcode URL with
+// an embedded original file path). get_servers()/reconnect_via_account()
+// stack-allocate PLEX_RECONNECT_MAX_CANDIDATES of these each, on a target
+// with a small, fixed stack (no virtual memory to fall back on) - at
+// PLEX_MAX_URL each that's 20 * 2048B = 40KB per call, enough on its own to
+// blow the stack outright; at this size it's 20 * 256B = 5KB.
+#define PLEX_CANDIDATE_URL_MAX 256
+
 typedef struct {
     char key[PLEX_MAX_STR];
     char title[PLEX_MAX_STR];
