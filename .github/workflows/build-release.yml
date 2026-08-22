@@ -56,25 +56,25 @@ jobs:
 
       # devkitARM itself, plus libctru/citro2d/citro3d, already ship in the
       # image. Only the extra portlibs this project links against, and
-      # makerom (not a devkitPro package at all), are missing - cached here
-      # across runs since the image itself is re-pulled fresh every time
-      # regardless (GitHub-hosted runners don't persist Docker layers
-      # between separate job runs).
-      - name: Cache 3DS portlibs + makerom
+      # makerom + bannertool (neither a devkitPro package at all), are
+      # missing - cached here across runs since the image itself is
+      # re-pulled fresh every time regardless (GitHub-hosted runners don't
+      # persist Docker layers between separate job runs).
+      - name: Cache 3DS portlibs + makerom + bannertool
         id: cache-extras
         uses: actions/cache@v4
         with:
           path: |
             /opt/devkitpro/portlibs
             /opt/devkitpro/tools/bin/makerom
-          # v7: dropped the private-glibc/wrapper-script machinery
-          # entirely (downgraded to makerom-v0.18.4, old enough to not
-          # need it) - back to a plain binary directly at tools/bin/makerom
-          # again, so bump the key once more rather than risk restoring a
-          # stale v0.19.0-based layout from an earlier attempt.
-          key: devkitpro-3ds-extras-v7
+            /opt/devkitpro/tools/bin/bannertool
+          # v8: added bannertool alongside makerom - bumped so every runner
+          # actually rebuilds it once, rather than reusing a v7 cache that
+          # has portlibs/makerom but no bannertool in it and skipping the
+          # step that would've built it (see that step's own "if:").
+          key: devkitpro-3ds-extras-v8
 
-      - name: Install missing 3DS portlibs + makerom
+      - name: Install missing 3DS portlibs + makerom + bannertool
         if: steps.cache-extras.outputs.cache-hit != 'true'
         run: |
           SUDO=""
@@ -178,6 +178,28 @@ jobs:
           $SUDO mkdir -p /opt/devkitpro/tools/bin
           $SUDO unzip -o /tmp/makerom.zip -d /opt/devkitpro/tools/bin/
           $SUDO chmod +x /opt/devkitpro/tools/bin/makerom
+
+          # bannertool (github.com/carstene1ns/3ds-bannertool) builds the
+          # HOME Menu banner (Makefile's $(OUTPUT).bnr rule, only reachable
+          # when Banner.png exists at the repo root) - also not a devkitPro
+          # package, and its prebuilt releases need glibc 2.39+ (per its own
+          # README), too new for this image - the exact same class of
+          # problem makerom-v0.19.0 hit above. Built from source instead of
+          # chasing an old-enough prebuilt release (unlike makerom, none
+          # exists - carstene1ns/3ds-bannertool only ever publishes against
+          # current glibc): it's a small, fully self-contained C++ project
+          # (stb_image/stb_vorbis/dr_wav are vendored straight in the repo,
+          # no external image/audio libs to install), and this image already
+          # has everything else a from-source build needs - cmake >=3.28
+          # (via bookworm-backports) and a host C++ compiler
+          # (build-essential) - both baked in already, unlike makerom's own
+          # from-scratch toolchain requirements.
+          BANNERTOOL_VERSION="1.2.3"
+          git clone --branch "$BANNERTOOL_VERSION" --depth 1 https://github.com/carstene1ns/3ds-bannertool.git /tmp/3ds-bannertool
+          cmake -B /tmp/3ds-bannertool/build -S /tmp/3ds-bannertool -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/3ds-bannertool/build --parallel
+          $SUDO cp /tmp/3ds-bannertool/build/bannertool /opt/devkitpro/tools/bin/bannertool
+          $SUDO chmod +x /opt/devkitpro/tools/bin/bannertool
 
       - name: Build (.elf, .3dsx, .cia)
         run: |

@@ -127,6 +127,23 @@ else
   export APP_ICON := $(TOPDIR)/$(ICON)
 endif
 
+#---------------------------------------------------------------------------------
+# HOME Menu banner (the animated image/tune shown for this title on the HOME
+# Menu and in FBI, distinct from APP_ICON above which is the small SMDH icon).
+# bannertool (github.com/carstene1ns/3ds-bannertool) builds the actual .bnr
+# from these - it's not a devkitPro package, so like makerom above it has to
+# be on PATH already (see .github/workflows/build-release.yml for how CI gets
+# it). makerom silently ships every CIA with a stock "no banner" placeholder
+# if -banner is never passed, so this is skipped rather than erroring when
+# Banner.png isn't present (e.g. a fresh checkout that hasn't added one yet).
+#---------------------------------------------------------------------------------
+export APP_BANNER_AUDIO := $(TOPDIR)/banner_silence.wav
+ifneq (,$(wildcard $(TOPDIR)/Banner.png))
+  export APP_BANNER_IMAGE := $(TOPDIR)/Banner.png
+  export _CIABANNERDEPS := $(OUTPUT).bnr
+  export _CIABANNERFLAG := -banner $(OUTPUT).bnr
+endif
+
 ifeq ($(strip $(NO_SMDH)),)
   export _3DSXFLAGS += --smdh=$(CURDIR)/$(TARGET).smdh
 endif
@@ -157,7 +174,7 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(OUTPUT).bnr $(TARGET).elf $(GFXBUILD)
 
 #---------------------------------------------------------------------------------
 ifeq ($(GFXBUILD),$(BUILD))
@@ -181,9 +198,18 @@ else
 #---------------------------------------------------------------------------------
 $(OUTPUT).3dsx : $(OUTPUT).elf $(_3DSXDEPS) $(OUTPUT).cia
 
-$(OUTPUT).cia : $(OUTPUT).elf $(_3DSXDEPS)
+$(OUTPUT).cia : $(OUTPUT).elf $(_3DSXDEPS) $(_CIABANNERDEPS)
 	@echo building cia $(notdir $@)
-	@makerom -f cia -o $@ -elf $< -rsf $(TOPDIR)/$(TARGET).rsf -icon $(OUTPUT).smdh
+	@makerom -f cia -o $@ -elf $< -rsf $(TOPDIR)/$(TARGET).rsf -icon $(OUTPUT).smdh $(_CIABANNERFLAG)
+
+#---------------------------------------------------------------------------------
+# HOME Menu banner - see APP_BANNER_IMAGE/_CIABANNERDEPS above. Only reachable
+# at all when Banner.png exists (that's what set _CIABANNERDEPS to begin
+# with), so no conditional needed here.
+#---------------------------------------------------------------------------------
+$(OUTPUT).bnr : $(APP_BANNER_IMAGE) $(APP_BANNER_AUDIO)
+	@echo building banner $(notdir $@)
+	@bannertool makebanner -i $(APP_BANNER_IMAGE) -a $(APP_BANNER_AUDIO) -o $@
 
 $(OFILES_SOURCES) : $(HFILES)
 
