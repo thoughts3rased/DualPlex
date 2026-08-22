@@ -71,6 +71,12 @@ typedef struct {
     CURL* curl_easy;
     struct curl_slist* headers;
     bool curl_paused;
+    // Set right before a stale-connection retry (see audio_player_update()'s
+    // curl completion handling) and cleared by a fresh, user-driven
+    // deck_start_stream() call - caps that retry to once per track load so a
+    // genuinely dead server/network still surfaces as a real error instead
+    // of silently retrying forever.
+    bool retry_attempted;
     // Local (SD card) playback - see deck_start_stream()'s "file://" handling
     // for offline.c downloaded tracks. When set, the ring buffer is filled by
     // deck_local_pump() reading straight off the filesystem instead of by
@@ -433,7 +439,12 @@ static void deck_teardown(Deck* d) {
     d->active = false;
 }
 
-static bool deck_start_stream(Deck* d, const char* url) {
+// force_fresh_connect: true only for the stale-connection retry (see
+// audio_player_update()) - tells curl to open a brand-new TCP connection for
+// this request instead of possibly pulling another one out of s_curl_multi's
+// shared connection cache, since that cache is exactly what handed back the
+// already-dead connection in the first place.
+static bool deck_start_stream(Deck* d, const char* url, bool force_fresh_connect) {
     if (!url || !url[0]) return false;
 
     deck_teardown(d);
@@ -532,6 +543,7 @@ static bool deck_start_stream(Deck* d, const char* url) {
         curl_easy_setopt(d->curl_easy, CURLOPT_CONNECTTIMEOUT, 10L);
         curl_easy_setopt(d->curl_easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
         curl_easy_setopt(d->curl_easy, CURLOPT_USERAGENT, "DualPlex/1.0 (Nintendo 3DS)");
+        if (force_fresh_connect) curl_easy_setopt(d->curl_easy, CURLOPT_FRESH_CONNECT, 1L);
 
         if (!s_curl_multi) {
             s_curl_multi = curl_multi_init();
@@ -784,7 +796,8 @@ bool audio_player_load_url(const char* url) {
 
     audio_player_cancel_crossfade(); // a manual load hard-cuts, it doesn't blend
 
-    if (!deck_start_stream(&s_decks[s_active_deck], url)) {
+    s_decks[s_active_deck].retry_attempted = false; // fresh user-driven load - allow one stale-connection retry again
+    if (!deck_start_stream(&s_decks[s_active_deck], url, false)) {
         s_state = PLAYER_ERROR;
         return false;
     }
@@ -842,7 +855,8 @@ bool audio_player_start_crossfade(const char* url, float gain_db_to, int duratio
     // session onto it if something unexpected left it active.
     if (in_d->active) deck_teardown(in_d);
 
-    if (!deck_start_stream(in_d, url)) return false;
+    in_d->retry_attempted = false; // fresh user-driven load - allow one stale-connection retry again
+    if (!deck_start_stream(in_d, url, false)) return false;
 
     in_d->duration_ms = duration_ms;
     in_d->gain_linear_target = powf(10.0f, gain_db_to / 20.0f);
@@ -966,6 +980,12 @@ void audio_player_update(void) {
         } else {
             CURLMsg* msg;
             int msgs_left;
+            // Deferred rather than retried in place, below: retrying means
+            // tearing the deck's curl session down and starting a new one on
+            // the same s_curl_multi we're still iterating messages from here
+            // - simpler to just flag it and act once this loop has fully
+            // drained.
+            bool need_retry[2] = { false, false };
             while ((msg = curl_multi_info_read(s_curl_multi, &msgs_left))) {
                 if (msg->msg != CURLMSG_DONE) continue;
                 for (int i = 0; i < 2; i++) {
@@ -975,10 +995,45 @@ void audio_player_update(void) {
                             d->ring.download_finished = true;
                             LOG_INFO("Deck %d stream download finished successfully (%d total bytes)", i, (int)d->ring.total_downloaded);
                         } else if (msg->data.result != CURLE_OK) {
-                            LOG_ERROR("Deck %d curl error: %d", i, (int)msg->data.result);
-                            d->ring.download_error = true;
+                            // A failure while still in the initial-buffering
+                            // wait (d->initial_buffering - checked here
+                            // rather than total_downloaded == 0, since this
+                            // runs before deck_decode_and_feed() has had a
+                            // chance to flip it for this pass, even if this
+                            // update() call downloaded enough bytes to
+                            // satisfy AUDIO_INITIAL_BUFFER_BYTES) means
+                            // nothing from this stream has been decoded or
+                            // played yet - so restarting the request outright
+                            // is completely inaudible, whatever the actual
+                            // cause was (a stale reused connection on
+                            // s_curl_multi, a dropped WiFi packet, a
+                            // reverse-proxy hiccup, ...). Retry once;
+                            // retry_attempted (set below) makes sure a
+                            // second failure - a genuinely unreachable server
+                            // - still falls through to a real error rather
+                            // than retrying forever.
+                            if (d->initial_buffering && !d->retry_attempted) {
+                                LOG_WARN("Deck %d: curl error %d before playback started (%d bytes buffered) - retrying with a fresh connection", i, (int)msg->data.result, (int)d->ring.total_downloaded);
+                                need_retry[i] = true;
+                            } else {
+                                LOG_ERROR("Deck %d curl error: %d", i, (int)msg->data.result);
+                                d->ring.download_error = true;
+                            }
                         }
                     }
+                }
+            }
+
+            for (int i = 0; i < 2; i++) {
+                if (!need_retry[i]) continue;
+                Deck* d = &s_decks[i];
+                char url_copy[PLEX_MAX_URL]; // deck_start_stream() writes into d->current_url itself, so the URL must be copied out before teardown reuses/clears it
+                strncpy(url_copy, d->current_url, sizeof(url_copy) - 1);
+                url_copy[sizeof(url_copy) - 1] = '\0';
+                d->retry_attempted = true;
+                if (!deck_start_stream(d, url_copy, true)) {
+                    LOG_ERROR("Deck %d: retry after stale-connection failure failed to even start - giving up", i);
+                    d->ring.download_error = true;
                 }
             }
         }

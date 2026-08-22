@@ -204,9 +204,19 @@ static char s_login_2fa[16] = "";
 static PlexServerResource s_servers[PLEX_MAX_ITEMS];
 static int s_num_servers = 0;
 
-// Status message
+// Status message - set from dozens of call sites throughout this file (PIN
+// flow, login, download queuing/deletion, track-skip errors, quality
+// changes, ...), none of which stamp a time themselves. Auto-expiry (see
+// ui_update()) instead detects a *content* change against s_status_msg_prev
+// and stamps s_status_set_tick then, so nothing above has to change - a
+// message that's never naturally overwritten (e.g. a stream error, if the
+// next track loads fine and never sets a new one) still clears itself
+// after STATUS_MSG_TIMEOUT_SEC instead of sitting on screen forever.
 static char s_status_msg[256] = "";
 static u32 s_status_color = COL_TEXT_DIM;
+static char s_status_msg_prev[256] = "";
+static u64 s_status_set_tick = 0;
+#define STATUS_MSG_TIMEOUT_SEC 10
 
 #define PLEX_MAX_LYRICS 64
 static PlexLyricLine s_lyrics[PLEX_MAX_LYRICS];
@@ -999,12 +1009,61 @@ static void draw_lyrics_block(int pos_ms, float region_x, float base_y, float wi
     }
 }
 
+// swkbdInputText() below blocks the calling (main) thread until the user
+// dismisses the keyboard applet - which means the main loop's per-frame
+// audio_player_update() call (see main.c) doesn't run for that whole
+// duration either, since it's that same blocked thread. audio_player_update()
+// is what actually decodes queued audio and feeds NDSP; miss it for too long
+// and playback runs dry (NDSP's wave buffers hold under half a second of
+// decoded audio - see audio_player.c's AUDIO_NUM_WAVE_BUFS) and goes silent
+// until the keyboard closes.
+//
+// So: while the keyboard's up and something's actually playing, run
+// audio_player_update() from a second, short-lived thread instead. It's only
+// ever alive for the duration of one swkbdInputText() call and is joined
+// again immediately after, so there's no real concurrency to guard against -
+// the main thread is fully parked inside swkbdInputText() the entire time
+// this thread exists, so the two never touch audio_player state at once.
+static volatile bool s_kbd_pump_run = false;
+
+static void kbd_pump_thread_func(void* arg) {
+    (void)arg;
+    while (s_kbd_pump_run) {
+        audio_player_update();
+        svcSleepThread(10000000LL); // 10ms - frequent enough against NDSP's ~370ms buffer depth
+    }
+}
+
 static bool show_keyboard(const char* hint, char* buf, size_t buf_size) {
     SwkbdState swkbd;
     swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, buf_size - 1);
     swkbdSetHintText(&swkbd, hint);
     swkbdSetInitialText(&swkbd, buf);
+
+    Thread pump_thread = NULL;
+    PlayerState state = audio_player_get_state();
+    if (state == PLAYER_PLAYING || state == PLAYER_LOADING) {
+        s32 prio = 0x30; // libctru's typical main-thread default - used as a fallback if the query itself fails
+        svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        int pump_prio = prio + 1; // never outrank the main thread, on the off chance the two ever do share a scheduling slot
+        if (pump_prio > 0x3F) pump_prio = 0x3F;
+
+        s_kbd_pump_run = true;
+        pump_thread = threadCreate(kbd_pump_thread_func, NULL, 0x4000, pump_prio, -2, false);
+        if (!pump_thread) {
+            s_kbd_pump_run = false; // failed to start - keyboard still works, playback just pauses while it's open, same as before this existed
+            LOG_WARN("show_keyboard: failed to start audio pump thread - playback will pause while the keyboard is open");
+        }
+    }
+
     SwkbdButton button = swkbdInputText(&swkbd, buf, buf_size);
+
+    if (pump_thread) {
+        s_kbd_pump_run = false;
+        threadJoin(pump_thread, U64_MAX);
+        threadFree(pump_thread);
+    }
+
     return (button != SWKBD_BUTTON_NONE && button != SWKBD_BUTTON_LEFT);
 }
 
@@ -1478,6 +1537,17 @@ static UIScreen nav_pop(UIScreen fallback) {
 }
 
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
+    // Auto-expire the status message - see its declaration's comment above.
+    if (strcmp(s_status_msg, s_status_msg_prev) != 0) {
+        strncpy(s_status_msg_prev, s_status_msg, sizeof(s_status_msg_prev) - 1);
+        s_status_msg_prev[sizeof(s_status_msg_prev) - 1] = '\0';
+        s_status_set_tick = svcGetSystemTick();
+    } else if (s_status_msg[0] &&
+               (svcGetSystemTick() - s_status_set_tick) > (u64)(STATUS_MSG_TIMEOUT_SEC * 268123480.0)) {
+        s_status_msg[0] = '\0';
+        s_status_msg_prev[0] = '\0';
+    }
+
     album_art_update();
     plex_api_timeline_async_update();
     plex_api_lyrics_async_update();
@@ -1708,9 +1778,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
     
     if (pstate == PLAYER_ERROR && s_current_track_idx >= 0) {
-        LOG_WARN("Track %d (%s) encountered stream error (HTTP 400). Skipping...",
+        // PLAYER_ERROR covers any stream failure audio_player.c gives up on
+        // (a genuine HTTP error, a curl-level network failure, ...) - the
+        // real cause is in the log line audio_player_update() already wrote
+        // (e.g. "curl error: 56"), not necessarily an HTTP 400, so this
+        // message stays generic rather than guessing at a specific cause.
+        LOG_WARN("Track %d (%s) encountered a stream error. Skipping...",
             s_current_track_idx + 1, s_tracks[s_current_track_idx].title);
-        snprintf(s_status_msg, sizeof(s_status_msg), "Track %d failed (HTTP 400). Skipping...", s_current_track_idx + 1);
+        snprintf(s_status_msg, sizeof(s_status_msg), "Track %d failed to stream. Skipping...", s_current_track_idx + 1);
         s_status_color = COL_ERROR;
 
         if (!s_offline_browse) {
@@ -2961,7 +3036,9 @@ void ui_render_top(C3D_RenderTarget* top) {
     }
 
     PlayerState state = audio_player_get_state();
-    
+    bool is_browse_screen = (s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
+                              s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS);
+
     if (state == PLAYER_PLAYING || state == PLAYER_PAUSED || state == PLAYER_LOADING) {
         if (s_current_track_idx >= 0 && s_current_track_idx < s_num_tracks) {
             PlexTrack* track = &s_tracks[s_current_track_idx];
@@ -2985,18 +3062,25 @@ void ui_render_top(C3D_RenderTarget* top) {
 
         draw_text_centered("NO TRACK PLAYING", 145, TOP_WIDTH, 0.65f, 0.65f, COL_ACCENT);
         draw_text_centered("Select a track to start playback", 170, TOP_WIDTH, 0.45f, 0.45f, COL_TEXT_DIM);
-        
-        if (s_status_msg[0]) {
+
+        // Drawn here unless a browse screen is up, in which case the footer
+        // block right below already shows this same message - see its
+        // comment. Without this check the two stack within 15px of each
+        // other (both fire whenever nothing's playing while browsing
+        // artists/albums/tracks/playlists) and the message visibly doubles.
+        if (s_status_msg[0] && !is_browse_screen) {
             draw_text_centered(s_status_msg, 195, TOP_WIDTH, 0.48f, 0.48f, s_status_color);
         }
     }
-    
+
     // Bottom of Top Screen: the context menu hint and the last queued/
     // deleted item's result (see perform_context_menu_action()) live here
     // rather than on the bottom screen - with 6 visible list rows there's no
     // room left below them there without covering part of the last one.
-    if ((s_screen == SCREEN_ARTISTS || s_screen == SCREEN_ALBUMS ||
-         s_screen == SCREEN_TRACKS || s_screen == SCREEN_PLAYLISTS) && s_status_msg[0]) {
+    // Shown regardless of playback state (unlike the idle panel above) since
+    // browsing and queuing/deleting downloads works whether or not something
+    // is currently playing.
+    if (is_browse_screen && s_status_msg[0]) {
         draw_text_centered(s_status_msg, TOP_HEIGHT - 30, TOP_WIDTH, 0.4f, 0.4f, s_status_color);
     }
     const char* footer = context_menu_available()
