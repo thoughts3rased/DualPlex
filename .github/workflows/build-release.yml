@@ -7,15 +7,24 @@ name: Build and Release
 # updates that same release/tag in place rather than accumulating a new one
 # per commit - see the "Publish" step if you'd rather have one release per
 # build instead.
+#
+# Pushing a "V*" tag (e.g. V1.0) instead builds and publishes a proper,
+# permanent, versioned GitHub Release under that same tag name - separate
+# from and left untouched by every subsequent nightly rebuild - see
+# "Determine release parameters" below for how the two are told apart.
 on:
   push:
     branches: [main]
+    tags: ['V*']
   workflow_dispatch: {}
 
 # A second push landing mid-build would otherwise race the first over the
-# same working tree and the same "nightly" release/tag.
+# same working tree and the same release/tag - scoped per-ref (rather than
+# one group for the whole workflow) so a nightly rebuild on main and a
+# versioned-tag release build never cancel each other, only a genuine rerun
+# of the exact same ref.
 concurrency:
-  group: build-release
+  group: build-release-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -177,8 +186,22 @@ jobs:
           make
           ls -la DualPlex.elf DualPlex.3dsx DualPlex.cia
 
+      # Tells the rest of this job whether it's building the rolling nightly
+      # (a branch push or a manual run) or a permanent versioned release (a
+      # "V*" tag push) - everything below keys off tag_name so the QR code
+      # and the actual release step both point at wherever this run's build
+      # is really going to end up.
+      - name: Determine release parameters
+        id: release_vars
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=nightly" >> "$GITHUB_OUTPUT"
+          fi
+
       # Points at the exact URL this same release publishes DualPlex.cia at
-      # (predictable from the tag name below, independent of upload order -
+      # (predictable from the tag name, independent of upload order -
       # constructing it doesn't require the upload to have happened yet,
       # only for the QR to actually resolve once it has). Uses a public
       # QR-generation API (goqr.me) via plain curl rather than installing a
@@ -188,13 +211,14 @@ jobs:
       # sensitive being sent).
       - name: Generate QR code (CIA remote-install link)
         run: |
-          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/nightly/DualPlex.cia"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_vars.outputs.tag_name }}/DualPlex.cia"
           curl -sf -G "https://api.qrserver.com/v1/create-qr-code/" \
             --data-urlencode "size=300x300" \
             --data-urlencode "data=${DOWNLOAD_URL}" \
             -o DualPlex-qr.png
 
       - name: Publish rolling "nightly" release
+        if: github.ref_type != 'tag'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
@@ -209,6 +233,33 @@ jobs:
             - **DualPlex.3dsx**: copy to `/3ds/` on your SD card to run via the Homebrew Launcher.
 
             ![DualPlex.cia remote-install QR code](https://github.com/${{ github.repository }}/releases/download/nightly/DualPlex-qr.png)
+          files: |
+            DualPlex.cia
+            DualPlex.3dsx
+            DualPlex-qr.png
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushing a "V*" tag (e.g. V1.0) publishes a real, permanent release
+      # under that tag instead - left alone by every later nightly rebuild,
+      # unlike the "nightly" release/tag above which the step above
+      # overwrites in place on every push to main.
+      - name: Publish versioned release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "DualPlex ${{ github.ref_name }}"
+          target_commitish: ${{ github.sha }}
+          prerelease: false
+          make_latest: true
+          body: |
+            DualPlex ${{ github.ref_name }}, built from commit ${{ github.sha }}.
+
+            - **DualPlex.cia**: install with [FBI](https://github.com/Steveice10/FBI) - either sideload the file directly, or open FBI's "Remote Install" QR scanner on your 3DS and scan the code below to fetch and install it directly, no PC transfer needed.
+            - **DualPlex.3dsx**: copy to `/3ds/` on your SD card to run via the Homebrew Launcher.
+
+            ![DualPlex.cia remote-install QR code](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/DualPlex-qr.png)
           files: |
             DualPlex.cia
             DualPlex.3dsx
