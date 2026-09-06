@@ -8,9 +8,36 @@
 #define CONFIG_DIR "/3ds/dualplex"
 #define CONFIG_PATH "/3ds/dualplex/config.txt"
 
+// Settings > Prefer Downloaded Media: whether ui.c's play_track() should use
+// an already-downloaded copy of a track instead of streaming it, while
+// browsing the online library (offline browsing - SCREEN_DOWNLOADS - always
+// plays the downloaded copy regardless of this setting, since there's
+// nothing else to play there). No dependency on plex_api.h/offline.h needed
+// here, unlike download_quality below - this one's a plain app-level choice,
+// not a Plex-specific concept, so it gets a real enum instead of a bare int.
+typedef enum {
+    PREFER_DOWNLOADED_NEVER = 0,       // stream unless actually offline
+    PREFER_DOWNLOADED_ON_POOR_CONNECTIONS,
+    PREFER_DOWNLOADED_ALWAYS,
+} PreferDownloadedMedia;
+
 typedef struct {
     char server_url[PLEX_MAX_URL];  // e.g. "http://192.168.1.100:32400"
     char auth_token[128];            // X-Plex-Token
+    // The plex.tv ACCOUNT-level token - distinct from auth_token above,
+    // which becomes a specific *server's* access token the moment
+    // SCREEN_SERVER_SELECT picks one (a per-resource "accessToken" from
+    // plex.tv/api/v2/resources, not necessarily the same value as the
+    // account's own token - see plex_api_get_servers()). Set once at sign-in
+    // (PIN link or direct login) and kept from then on regardless of which
+    // server gets picked or reconnected to later - needed for Settings >
+    // Switch User (Plex Home), which operates against the plex.tv account
+    // API, not any particular server. Blank for an install set up before
+    // this field existed, or one set up entirely through Settings > Server
+    // Address (Manual Setup) with no plex.tv sign-in at all - Settings >
+    // Switch User just has nothing to offer in that case (see ui.c), same
+    // as an account that isn't in a Plex Home to begin with.
+    char account_token[128];
     // Name of the Plex server resource server_url/auth_token were picked
     // from (SCREEN_SERVER_SELECT), e.g. "Living Room Server" - blank if
     // set up via a manually-typed URL instead. Lets a later launch that
@@ -45,6 +72,23 @@ typedef struct {
     // stable per-console id, two 3DS's signed into the same account would
     // look like a single player to it.
     char client_id[48];
+    // Quality tier background track downloads (Settings > Download Quality)
+    // are saved at - a PlexQualityTier value (see plex_api.h), stored as a
+    // plain int rather than that enum type to avoid config.h depending on
+    // plex_api.h, which already depends on config.h. Wholly separate from
+    // the adaptive tier live streaming uses (plex_api_set_quality_tier()) -
+    // that one reacts to measured network speed each session and is never
+    // persisted, while this is a fixed, explicit user preference. Defaults
+    // to QUALITY_FLAC_DIRECT (0) - "Original" - matching this app's
+    // longstanding behavior of saving a directly-playable source file as-is,
+    // so upgrading to this setting doesn't change anything for an existing
+    // install until the user actually opens Settings and changes it.
+    int download_quality;
+    // Settings > Prefer Downloaded Media (see PreferDownloadedMedia above).
+    // Defaults to PREFER_DOWNLOADED_NEVER (0) so, like download_quality,
+    // upgrading to this setting doesn't change existing playback behavior
+    // (always stream while online) until the user opts in.
+    PreferDownloadedMedia prefer_downloaded_media;
 } AppConfig;
 
 // Load config from SD card. Returns true on success.

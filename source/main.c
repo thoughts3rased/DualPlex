@@ -70,6 +70,7 @@ int main(int argc, char* argv[]) {
     LOG_INFO("DualPlex starting up...");
     audio_player_init();
     offline_init();
+    offline_set_download_quality((PlexQualityTier)app_config.download_quality);
     library_cache_init();
     ui_init();
     ui_set_config(&app_config);

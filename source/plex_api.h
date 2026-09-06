@@ -8,6 +8,8 @@
 
 #define PLEX_MAX_ITEMS 500
 #define PLEX_PAGE_SIZE 30
+// Generous - a real Plex Home tops out around 15 members (Plex's own limit).
+#define PLEX_MAX_HOME_USERS 16
 #define PLEX_CLIENT_ID "dualplex-3ds"
 #define PLEX_PRODUCT "DualPlex"
 #define PLEX_VERSION "0.1.0"
@@ -118,6 +120,16 @@ typedef struct {
     bool is_local;
 } PlexServerResource;
 
+// One member of a Plex Home (plex.tv account-level, not server-level - see
+// plex_api_get_home_users()) - Settings > Switch User's list.
+typedef struct {
+    int id;                    // informational only (shown in logs) - plex_api_switch_home_user() takes `uuid`, not this
+    char uuid[64];             // the actual identifier plex.tv/api/v2/home/users/<uuid>/switch expects - numeric `id` 404s there
+    char title[PLEX_MAX_STR];  // friendlyName, falling back to title/username/"User <id>"
+    bool admin;
+    bool is_protected;         // needs a PIN to switch to - see plex_api_switch_home_user()
+} PlexHomeUser;
+
 // Audio quality tiers for adaptive streaming
 typedef enum {
     QUALITY_FLAC_DIRECT,  // N3DS only: direct FLAC (highest quality, ~1000+ kbps)
@@ -140,6 +152,21 @@ const char* plex_api_get_quality_label(PlexQualityTier tier);
 
 // Suggest the best quality tier for a given measured download speed (bytes/sec).
 PlexQualityTier plex_api_suggest_quality(int download_speed_bps, bool is_n3ds);
+
+// The transcode bitrate (kbps) a tier caps out at, or 0 for QUALITY_FLAC_DIRECT
+// (no cap - direct/original, don't transcode at all). Exposed so offline.c's
+// download engine can decide whether a track's own bitrate already fits under
+// AppConfig.download_quality's cap (in which case it's fetched as-is rather
+// than needlessly re-encoded down to the same or a lower bitrate) without
+// duplicating plex_api.c's tier->bitrate mapping.
+int plex_api_get_quality_bitrate(PlexQualityTier tier);
+
+// Human-readable label for a quality tier as used for Settings > Download
+// Quality specifically - distinct from plex_api_get_quality_label() (which
+// describes the *streaming* tier, e.g. "FLAC Direct") since a download's
+// QUALITY_FLAC_DIRECT just means "keep the source file as-is", not that the
+// result is necessarily FLAC.
+const char* plex_api_get_download_quality_label(PlexQualityTier tier);
 
 // Sets the per-console X-Plex-Client-Identifier sent with every request
 // (overriding the default shared PLEX_CLIENT_ID literal). Call once at
@@ -211,6 +238,31 @@ int plex_api_get_servers(const char* account_token, PlexServerResource* out_serv
 // persist those via config_save().
 bool plex_api_reconnect_via_account(const char* account_token, const char* server_name);
 
+// Lists the Plex Home users under the account identified by `account_token`
+// - AppConfig.account_token (the plex.tv account-level token from sign-in),
+// never a particular server's per-resource access token, which isn't the
+// same thing once SCREEN_SERVER_SELECT has picked a server (see that
+// field's own comment). An account that was never set up as a Plex Home
+// just has one implicit user - returns 0 (not an error) in that case, same
+// as any other "nothing to show" empty result; Settings > Switch User
+// treats that as "nothing else to switch to" rather than a failure.
+int plex_api_get_home_users(const char* account_token, PlexHomeUser* out, int max);
+
+// Switches the active Plex Home identity to `user_uuid` (a PlexHomeUser's
+// `uuid` field, from plex_api_get_home_users() - NOT its `id`, which 404s
+// against this endpoint; confirmed against a real account/Home while
+// building this). `pin` is that user's 4-digit PIN if its is_protected was
+// true (ignored otherwise - NULL/"" is fine when not needed). On success,
+// out_token receives a NEW plex.tv account token scoped to that user,
+// distinct from `account_token` - the caller must persist it as the new
+// AppConfig.account_token *and* re-resolve server access via
+// plex_api_reconnect_via_account() (a switched-to user's access to any given
+// server - and its access token for it - can both differ from the previous
+// identity's, even for the exact same server; see ui.c's Settings > Switch
+// User handling). Returns false on a wrong PIN, an invalid/expired
+// account_token, or any network failure.
+bool plex_api_switch_home_user(const char* account_token, const char* user_uuid, const char* pin, char* out_token, size_t max_token);
+
 // Get music libraries.
 int plex_api_get_music_libraries(PlexLibrary* out, int max);
 
@@ -241,6 +293,17 @@ int plex_api_get_recently_added(PlexTrack* out, int max);
 // Build a direct stream URL for a track into url_out.
 bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_max);
 
+// The bitrate (kbps) plex_api_get_stream_url() would actually deliver this
+// track at right now, without building a URL or touching the network -
+// mirrors that function's own direct-vs-transcode branching exactly (see its
+// comments for why each one applies). Returns 0 for an uncapped/lossless
+// result (an N3DS FLAC Direct stream), or -1 if not initialized/no track (an
+// estimate isn't possible). Used by ui.c's "Prefer Downloaded Media: On poor
+// connections" setting (Settings screen) to compare live streaming quality
+// against an already-downloaded copy of the same track, without actually
+// committing to streaming it first.
+int plex_api_estimate_stream_bitrate(const PlexTrack* track);
+
 // Build a transcode-to-MP3 URL for a track into url_out.
 bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max);
 
@@ -259,14 +322,20 @@ bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, s
 bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url_max);
 
 // Same idea as plex_api_get_download_url(), for a track that isn't already
-// in a format the 3DS can decode (offline.c's downloader falls back to this
-// when the source needs transcoding) - unlike that one, this DOES go through
-// the same universal transcoder as live playback, since forcing MP3 output
-// has no equivalent on the plain file-download path. Uses its own transcode
-// session id (distinct from plex_api_get_transcode_url()'s, even for the
-// exact same track) so downloading a track doesn't collide with - and break
-// - a live-playback transcode session for that same track.
-bool plex_api_get_download_transcode_url(const PlexTrack* track, char* url_out, size_t url_max);
+// in a format the 3DS can decode, or whose bitrate exceeds `tier`'s cap
+// (offline.c's downloader falls back to this in either case) - unlike that
+// one, this DOES go through the same universal transcoder as live playback,
+// since forcing a capped-bitrate MP3 output has no equivalent on the plain
+// file-download path. Uses its own transcode session id (distinct from
+// plex_api_get_transcode_url()'s, even for the exact same track) so
+// downloading a track doesn't collide with - and break - a live-playback
+// transcode session for that same track. Takes `tier` explicitly (rather
+// than reading the shared adaptive streaming tier set via
+// plex_api_set_quality_tier()) since a download's target quality - AppConfig.
+// download_quality, Settings > Download Quality - is a wholly separate,
+// user-set preference from whatever bitrate live playback happens to be
+// streaming at right now.
+bool plex_api_get_download_transcode_url(const PlexTrack* track, PlexQualityTier tier, char* url_out, size_t url_max);
 
 typedef struct {
     int time_ms;

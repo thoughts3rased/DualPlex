@@ -67,6 +67,15 @@ void audio_player_set_duration(int duration_ms);
 // mid-crossfade, or the underlying codec seek failed.
 bool audio_player_seek_local_ms(int target_ms);
 
+// Whether the active deck (whatever's actually loaded and playing right
+// now, not any UI-level "browsing online vs offline" mode) is a local
+// (offline.c downloaded) file rather than a network stream - i.e. whether
+// audio_player_seek_local_ms() above is the right way to seek it. ui.c's
+// seek_to() uses this instead of its own s_offline_browse flag, since
+// Settings > Prefer Downloaded Media can have loaded a downloaded copy of
+// the current track while still "browsing online" (s_offline_browse false).
+bool audio_player_current_deck_is_local(void);
+
 // Offsets the value audio_player_get_position_ms() reports for the active
 // deck, without touching decoded-sample tracking. Used after a seek: the
 // reloaded stream always starts decoding from sample 0, so this is how the

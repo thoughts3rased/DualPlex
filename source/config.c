@@ -71,6 +71,8 @@ static void parse_config_file(FILE* f, AppConfig* config) {
                     strncpy(config->server_url, val, sizeof(config->server_url) - 1);
                 } else if (strcmp(key, "auth_token") == 0) {
                     strncpy(config->auth_token, val, sizeof(config->auth_token) - 1);
+                } else if (strcmp(key, "account_token") == 0) {
+                    strncpy(config->account_token, val, sizeof(config->account_token) - 1);
                 } else if (strcmp(key, "server_name") == 0) {
                     strncpy(config->server_name, val, sizeof(config->server_name) - 1);
                 } else if (strcmp(key, "clock_24h") == 0) {
@@ -79,6 +81,20 @@ static void parse_config_file(FILE* f, AppConfig* config) {
                     config->server_url_locked = (strcmp(val, "1") == 0);
                 } else if (strcmp(key, "client_id") == 0) {
                     strncpy(config->client_id, val, sizeof(config->client_id) - 1);
+                } else if (strcmp(key, "download_quality") == 0) {
+                    // Clamped to plex_api.h's PlexQualityTier range (0..4,
+                    // QUALITY_FLAC_DIRECT..QUALITY_MP3_64) rather than
+                    // trusting the file - falls back to the "Original"
+                    // default (0) for a hand-edited or corrupted value
+                    // instead of an out-of-range tier reaching plex_api.c.
+                    int v = atoi(val);
+                    config->download_quality = (v >= 0 && v <= 4) ? v : 0;
+                } else if (strcmp(key, "prefer_downloaded_media") == 0) {
+                    // Clamped to PreferDownloadedMedia's range (0..2) for the
+                    // same reason as download_quality above.
+                    int v = atoi(val);
+                    config->prefer_downloaded_media =
+                        (PreferDownloadedMedia)((v >= 0 && v <= 2) ? v : 0);
                 }
                 // "volume" is intentionally no longer read: the app has no volume
                 // setting of its own anymore (see config_save() below) - kept
@@ -125,10 +141,13 @@ bool config_save(const AppConfig* config) {
     
     fprintf(f, "server_url=%s\n", config->server_url);
     fprintf(f, "auth_token=%s\n", config->auth_token);
+    fprintf(f, "account_token=%s\n", config->account_token);
     fprintf(f, "server_name=%s\n", config->server_name);
     fprintf(f, "clock_24h=%d\n", config->clock_24h ? 1 : 0);
     fprintf(f, "server_url_locked=%d\n", config->server_url_locked ? 1 : 0);
     fprintf(f, "client_id=%s\n", config->client_id);
+    fprintf(f, "download_quality=%d\n", config->download_quality);
+    fprintf(f, "prefer_downloaded_media=%d\n", (int)config->prefer_downloaded_media);
 
     fclose(f);
     return true;

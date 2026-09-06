@@ -6,15 +6,17 @@
 #include "plex_api.h"
 
 // Everything offline.c stores on the SD card lives under here: downloaded
-// audio in tracks/, one cached thumbnail per album in thumbs/, a JSON
-// manifest recording what's been downloaded (and each track's reference
-// count - see offline_queue_tracks()) so it survives a relaunch, and (not
-// exposed here - purely an implementation detail) a small resume record for
-// whichever download was in progress, so an app close or network drop
-// mid-download picks back up instead of starting over.
+// audio in tracks/, one cached thumbnail per album in thumbs/, one cached
+// time-synced lyrics file per track (best-effort - see maybe_cache_lyrics())
+// in lyrics/, a JSON manifest recording what's been downloaded (and each
+// track's reference count - see offline_queue_tracks()) so it survives a
+// relaunch, and (not exposed here - purely an implementation detail) a small
+// resume record for whichever download was in progress, so an app close or
+// network drop mid-download picks back up instead of starting over.
 #define OFFLINE_DIR          "/3ds/dualplex/offline"
 #define OFFLINE_TRACKS_DIR   "/3ds/dualplex/offline/tracks"
 #define OFFLINE_THUMBS_DIR   "/3ds/dualplex/offline/thumbs"
+#define OFFLINE_LYRICS_DIR   "/3ds/dualplex/offline/lyrics"
 #define OFFLINE_MANIFEST_PATH "/3ds/dualplex/offline/library.json"
 
 // Must be called once at startup (after logger_init(), before any other
@@ -34,6 +36,15 @@ void offline_init(void);
 // rather than having the download thread call into audio_player.c directly,
 // since audio_player.c's own state is main-thread-only otherwise.
 void offline_set_network_streaming_hint(bool is_streaming);
+
+// Publishes the quality tier (AppConfig.download_quality, Settings > Download
+// Quality) new downloads should be fetched at - call once at startup right
+// after offline_init() with the loaded config value, and again any time the
+// user changes the setting. Same plain-published-flag approach as
+// offline_set_network_streaming_hint() above, for the same reason (read by
+// the background download thread, written from the main thread). Doesn't
+// affect a download already in flight - only ones started after the call.
+void offline_set_download_quality(PlexQualityTier tier);
 
 // Stops the background download thread and waits for it to actually exit -
 // call once at shutdown, on the main thread, before curl_global_cleanup().
@@ -75,6 +86,17 @@ void offline_get_download_status(OfflineDownloadStatus* out);
 // --- Querying what's on disk -------------------------------------------------
 bool offline_track_is_downloaded(const char* rating_key);
 
+// The bitrate (kbps) this track's downloaded copy was actually saved at (see
+// the download engine / Settings > Download Quality) - -1 if it isn't
+// downloaded. For a directly-saved lossless source (Download Quality:
+// Original, a FLAC file) this is whatever real bitrate Plex reports for it,
+// not a tier cap - typically well above anything plex_api_estimate_stream_
+// bitrate() could return, so it compares favorably without needing special-
+// casing. Used by ui.c's "Prefer Downloaded Media: On poor connections"
+// setting to compare against that live streaming estimate for the same
+// track.
+int offline_get_track_bitrate(const char* rating_key);
+
 // Whether ANY track under this artist/playlist has been downloaded - used
 // to grey out an otherwise-unavailable-offline entry in a cached library
 // listing (see library_cache.h) rather than requiring it to be *fully*
@@ -92,6 +114,16 @@ bool offline_get_track_playback_url(const char* rating_key, char* url_out, size_
 // track in the same album - see the download engine's thumbnail handling),
 // for album_art_load_local(). Returns false if none was cached.
 bool offline_get_thumb_path(const char* rating_key, char* path_out, size_t path_max);
+
+// This track's cached time-synced lyrics (see maybe_cache_lyrics(), fetched
+// best-effort alongside the track itself when it was downloaded) - same
+// signature/convention as plex_api_get_lyrics(): always returns at least 1
+// line, a placeholder "No time-synced lyrics available" one if nothing was
+// cached (never downloaded, or the server genuinely had none for this track
+// at download time), so a caller never needs to special-case "0 lines" for
+// offline playback the way it would for a still-in-flight online fetch. 0
+// only for a bad rating_key/out/max.
+int offline_get_lyrics(const char* rating_key, PlexLyricLine* out, int max);
 
 size_t offline_get_storage_used_bytes(void);
 int offline_get_track_count(void);

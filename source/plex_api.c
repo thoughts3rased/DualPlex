@@ -102,6 +102,19 @@ const char* plex_api_get_quality_label(PlexQualityTier tier) {
     }
 }
 
+int plex_api_get_quality_bitrate(PlexQualityTier tier) { return quality_tier_to_bitrate(tier); }
+
+const char* plex_api_get_download_quality_label(PlexQualityTier tier) {
+    switch (tier) {
+        case QUALITY_FLAC_DIRECT: return "Original";
+        case QUALITY_MP3_320:     return "Very High";
+        case QUALITY_MP3_192:     return "High";
+        case QUALITY_MP3_128:     return "Medium";
+        case QUALITY_MP3_64:      return "Low";
+        default:                  return "Unknown";
+    }
+}
+
 PlexQualityTier plex_api_suggest_quality(int download_speed_bps, bool is_n3ds) {
     // Convert bytes/sec to kbits/sec with safety margin (need ~1.5x headroom)
     int available_kbps = (download_speed_bps * 8) / 1000;
@@ -1174,6 +1187,135 @@ bool plex_api_reconnect_via_account(const char* account_token, const char* serve
     return connected;
 }
 
+// Parses the body of a GET to plex.tv's /api/v2/home/users into PlexHomeUser
+// entries. Not declared in plex_api.h - internal implementation detail of
+// plex_api_get_home_users(), split out (same as parse_tracks_from_json()
+// elsewhere in this file) and given external linkage only so tests/
+// test_plex_api.c can exercise it directly without a live plex.tv account.
+int parse_home_users_response(const char* response, PlexHomeUser* out, int max) {
+    if (!response || !out || max <= 0) return 0;
+
+    int count = 0;
+    cJSON* json = cJSON_Parse(response);
+    if (json) {
+        // Documented shape is a bare {"users":[...]} object - tolerate a
+        // bare top-level array too, same defensive spirit as this file's
+        // other plex.tv/PMS response parsing.
+        cJSON* users = cJSON_IsArray(json) ? json : cJSON_GetObjectItem(json, "users");
+        if (users && cJSON_IsArray(users)) {
+            cJSON* u = NULL;
+            cJSON_ArrayForEach(u, users) {
+                if (count >= max) break;
+
+                // uuid, not the numeric id, is what plex_api_switch_home_user()
+                // actually needs (the id-keyed switch endpoint 404s - see its
+                // own comment) - an entry with no usable uuid can't be
+                // switched to at all, so skip it rather than show a dead one.
+                cJSON* uuid = cJSON_GetObjectItem(u, "uuid");
+                if (!uuid || !cJSON_IsString(uuid) || uuid->valuestring[0] == '\0') continue;
+
+                PlexHomeUser* out_u = &out[count];
+                memset(out_u, 0, sizeof(*out_u));
+                strncpy(out_u->uuid, uuid->valuestring, sizeof(out_u->uuid) - 1);
+
+                cJSON* id = cJSON_GetObjectItem(u, "id");
+                if (id && cJSON_IsNumber(id)) out_u->id = id->valueint;
+
+                // Prefer the Home-specific display name, falling back
+                // through the same account fields plex_api_login_direct()'s
+                // response would carry it under.
+                cJSON* name = cJSON_GetObjectItem(u, "friendlyName");
+                if (!name || !cJSON_IsString(name) || name->valuestring[0] == '\0') {
+                    name = cJSON_GetObjectItem(u, "title");
+                }
+                if (!name || !cJSON_IsString(name) || name->valuestring[0] == '\0') {
+                    name = cJSON_GetObjectItem(u, "username");
+                }
+                if (name && cJSON_IsString(name) && name->valuestring[0] != '\0') {
+                    strncpy(out_u->title, name->valuestring, sizeof(out_u->title) - 1);
+                } else {
+                    snprintf(out_u->title, sizeof(out_u->title), "User %d", out_u->id);
+                }
+
+                cJSON* admin = cJSON_GetObjectItem(u, "admin");
+                out_u->admin = admin && cJSON_IsTrue(admin);
+
+                cJSON* is_protected = cJSON_GetObjectItem(u, "protected");
+                out_u->is_protected = is_protected && cJSON_IsTrue(is_protected);
+
+                count++;
+            }
+        } else {
+            LOG_WARN("parse_home_users_response: response wasn't the expected {\"users\":[...]} shape");
+        }
+        cJSON_Delete(json);
+    }
+    return count;
+}
+
+int plex_api_get_home_users(const char* account_token, PlexHomeUser* out, int max) {
+    if (!account_token || !account_token[0] || !out || max <= 0) return 0;
+
+    char* response = NULL;
+    if (!plex_http_get_full_url("https://plex.tv/api/v2/home/users", account_token, &response)) {
+        return 0;
+    }
+
+    int count = parse_home_users_response(response, out, max);
+    free(response);
+
+    LOG_INFO("Loaded %d Plex Home user(s)", count);
+    return count;
+}
+
+bool plex_api_switch_home_user(const char* account_token, const char* user_uuid, const char* pin, char* out_token, size_t max_token) {
+    if (!account_token || !account_token[0] || !user_uuid || !user_uuid[0] || !out_token || max_token == 0) return false;
+    out_token[0] = '\0';
+
+    char uuid_encoded[128] = "";
+    url_encode_cat(uuid_encoded, sizeof(uuid_encoded), user_uuid);
+
+    char url[384];
+    if (pin && pin[0]) {
+        char pin_encoded[64] = "";
+        url_encode_cat(pin_encoded, sizeof(pin_encoded), pin);
+        snprintf(url, sizeof(url), "https://plex.tv/api/v2/home/users/%s/switch?pin=%s", uuid_encoded, pin_encoded);
+    } else {
+        snprintf(url, sizeof(url), "https://plex.tv/api/v2/home/users/%s/switch", uuid_encoded);
+    }
+
+    char* response = NULL;
+    long status = 0;
+    bool req_ok = plex_http_post_full_url(url, "", account_token, &response, &status);
+
+    bool ok = false;
+    if (req_ok && response) {
+        cJSON* json = cJSON_Parse(response);
+        if (json) {
+            // Same "top-level or nested under user" tolerance as
+            // plex_api_login_direct() above - both endpoints hand back a
+            // freshly-scoped account token the same way.
+            cJSON* token = cJSON_GetObjectItem(json, "authToken");
+            if (!token) {
+                cJSON* user = cJSON_GetObjectItem(json, "user");
+                if (user) token = cJSON_GetObjectItem(user, "authToken");
+            }
+            if (token && cJSON_IsString(token) && token->valuestring[0] != '\0') {
+                strncpy(out_token, token->valuestring, max_token - 1);
+                out_token[max_token - 1] = '\0';
+                ok = true;
+            }
+            cJSON_Delete(json);
+        }
+        free(response);
+    }
+
+    if (!ok) {
+        LOG_WARN("Plex Home user switch failed (user_uuid=%s, http=%ld)", user_uuid, status);
+    }
+    return ok;
+}
+
 int plex_api_get_music_libraries(PlexLibrary* out, int max) {
     char* response = NULL;
     if (!plex_http_get("/library/sections", &response)) {
@@ -1635,10 +1777,16 @@ static bool plex_http_get_binary(const char* url, const char* token, u8** respon
 // seek is just a fresh transcode reload starting from a different point in
 // the track, using Plex's own "offset" param so the server does the real
 // seeking (accurate regardless of codec/bitrate, unlike guessing a byte
-// offset). `session_suffix` distinguishes a background download's transcode
-// session from a concurrent live-playback one for the *same* track (see the
-// session id comment below) - pass "" for the two playback callers.
-static bool build_transcode_url_ex(const PlexTrack* track, int offset_sec, const char* session_suffix, char* url_out, size_t url_max) {
+// offset). `tier` is the quality tier whose bitrate this particular transcode
+// should cap out at - the two playback callers below pass the shared adaptive
+// streaming tier (s_quality_tier), while offline.c's download engine passes
+// its own separately user-configured AppConfig.download_quality instead, so
+// downloading a track can never be silently upgraded/downgraded just because
+// live playback happens to be adapting to network conditions right now (or
+// vice versa). `session_suffix` distinguishes a background download's
+// transcode session from a concurrent live-playback one for the *same* track
+// (see the session id comment below) - pass "" for the two playback callers.
+static bool build_transcode_url_ex(const PlexTrack* track, int offset_sec, PlexQualityTier tier, const char* session_suffix, char* url_out, size_t url_max) {
     if (!s_initialized || !track) return false;
 
     char raw_path[512];
@@ -1670,7 +1818,7 @@ static bool build_transcode_url_ex(const PlexTrack* track, int offset_sec, const
         return false;
     }
     
-    int bitrate = quality_tier_to_bitrate(s_quality_tier);
+    int bitrate = quality_tier_to_bitrate(tier);
     if (bitrate <= 0) {
         // QUALITY_FLAC_DIRECT has no bitrate cap (it means "don't transcode at all"),
         // but we only get here when a transcode is actually unavoidable (e.g. non-N3DS
@@ -1719,11 +1867,11 @@ static bool build_transcode_url_ex(const PlexTrack* track, int offset_sec, const
 }
 
 bool plex_api_get_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
-    return build_transcode_url_ex(track, 0, "", url_out, url_max);
+    return build_transcode_url_ex(track, 0, s_quality_tier, "", url_out, url_max);
 }
 
 bool plex_api_get_seek_url(const PlexTrack* track, int seek_ms, char* url_out, size_t url_max) {
-    return build_transcode_url_ex(track, seek_ms / 1000, "", url_out, url_max);
+    return build_transcode_url_ex(track, seek_ms / 1000, s_quality_tier, "", url_out, url_max);
 }
 
 bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_max) {
@@ -1779,6 +1927,36 @@ bool plex_api_get_stream_url(const PlexTrack* track, char* url_out, size_t url_m
     return true;
 }
 
+int plex_api_estimate_stream_bitrate(const PlexTrack* track) {
+    if (!s_initialized || !track) return -1;
+
+    bool is_n3ds = false;
+    APT_CheckNew3DS(&is_n3ds);
+
+    int tier_bitrate = quality_tier_to_bitrate(s_quality_tier);
+
+    // N3DS FLAC direct streaming - see plex_api_get_stream_url()'s comment
+    // on the same condition. Uncapped/lossless.
+    if (s_quality_tier == QUALITY_FLAC_DIRECT && is_n3ds &&
+        track->part_key[0] != '\0' &&
+        (strstr(track->part_key, ".flac") || strstr(track->part_key, ".FLAC")) &&
+        (track->sampling_rate <= 0 || track->sampling_rate <= 48000)) {
+        return 0;
+    }
+
+    // Direct MP3 stream, file bitrate already within tier - delivered at the
+    // file's own bitrate, not the (higher) tier cap.
+    if (track->part_key[0] != '\0' &&
+        (strstr(track->part_key, ".mp3") || strstr(track->part_key, ".MP3")) &&
+        (track->bitrate <= 0 || track->bitrate <= tier_bitrate)) {
+        return track->bitrate > 0 ? track->bitrate : tier_bitrate;
+    }
+
+    // Everything else transcodes at the tier's bitrate - falling back to 320
+    // for QUALITY_FLAC_DIRECT the same way build_transcode_url_ex() does.
+    return tier_bitrate > 0 ? tier_bitrate : 320;
+}
+
 bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url_max) {
     if (!s_initialized || !track || track->part_key[0] == '\0') return false;
     snprintf(url_out, url_max, "%s%s", s_server_url, track->part_key);
@@ -1789,8 +1967,8 @@ bool plex_api_get_download_url(const PlexTrack* track, char* url_out, size_t url
 // engine specifically - see build_transcode_url_ex()'s session_suffix
 // comment for why this can't just be plex_api_get_transcode_url() itself
 // whenever the track being downloaded is also the one currently playing.
-bool plex_api_get_download_transcode_url(const PlexTrack* track, char* url_out, size_t url_max) {
-    return build_transcode_url_ex(track, 0, "-dl", url_out, url_max);
+bool plex_api_get_download_transcode_url(const PlexTrack* track, PlexQualityTier tier, char* url_out, size_t url_max) {
+    return build_transcode_url_ex(track, 0, tier, "-dl", url_out, url_max);
 }
 
 void plex_api_report_timeline(const char* rating_key, const char* state, int time_ms, int duration_ms) {
@@ -1819,8 +1997,9 @@ void plex_api_report_timeline(const char* rating_key, const char* state, int tim
 // right when a track begins playing without freezing the frame.
 
 // Defined later in this file (next to plex_api_get_lyrics(), which shares
-// it); forward-declared here since this section runs before that point.
+// them); forward-declared here since this section runs before that point.
 int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+void find_lyric_stream_key(const char* metadata_json, char* out_key, size_t out_max);
 
 typedef enum {
     LYR_ASYNC_IDLE,
@@ -1930,44 +2109,11 @@ void plex_api_lyrics_async_update(void) {
     bool ok = (mres == CURLM_OK && http_code == 200 && s_lyr_buf.data && s_lyr_buf.size > 0);
 
     if (s_lyr_state == LYR_ASYNC_FETCHING_METADATA) {
-        char fallback_key[512] = "";
         if (ok) {
-            cJSON* json = cJSON_Parse(s_lyr_buf.data);
-            if (json) {
-                cJSON* container = cJSON_GetObjectItem(json, "MediaContainer");
-                cJSON* metadata = container ? cJSON_GetObjectItem(container, "Metadata") : NULL;
-                cJSON* item = (metadata && cJSON_IsArray(metadata)) ? cJSON_GetArrayItem(metadata, 0) : NULL;
-                cJSON* media = item ? cJSON_GetObjectItem(item, "Media") : NULL;
-                cJSON* media_item = (media && cJSON_IsArray(media)) ? cJSON_GetArrayItem(media, 0) : NULL;
-                cJSON* part = media_item ? cJSON_GetObjectItem(media_item, "Part") : NULL;
-                cJSON* part_item = (part && cJSON_IsArray(part)) ? cJSON_GetArrayItem(part, 0) : NULL;
-                cJSON* stream = part_item ? cJSON_GetObjectItem(part_item, "Stream") : NULL;
-                if (stream && cJSON_IsArray(stream)) {
-                    cJSON* s_item = NULL;
-                    cJSON_ArrayForEach(s_item, stream) {
-                        cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
-                        cJSON* key = cJSON_GetObjectItem(s_item, "key");
-                        if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4 &&
-                            key && cJSON_IsString(key)) {
-                            if (fallback_key[0] == '\0') {
-                                strncpy(fallback_key, key->valuestring, sizeof(fallback_key) - 1);
-                            }
-                            cJSON* format = cJSON_GetObjectItem(s_item, "format");
-                            if (format && cJSON_IsString(format) && strcmp(format->valuestring, "lrc") == 0) {
-                                strncpy(s_lyr_stream_key, key->valuestring, sizeof(s_lyr_stream_key) - 1);
-                                break;
-                            }
-                        }
-                    }
-                }
-                cJSON_Delete(json);
-            }
+            find_lyric_stream_key(s_lyr_buf.data, s_lyr_stream_key, sizeof(s_lyr_stream_key));
         }
         lyr_async_cleanup_request();
 
-        if (s_lyr_stream_key[0] == '\0' && fallback_key[0] != '\0') {
-            strncpy(s_lyr_stream_key, fallback_key, sizeof(s_lyr_stream_key) - 1);
-        }
         if (s_lyr_stream_key[0] == '\0') {
             snprintf(s_lyr_stream_key, sizeof(s_lyr_stream_key), "/library/metadata/%s/subtitles", s_lyr_rating_key);
         }
@@ -2403,6 +2549,62 @@ static int parse_lrc_lyrics(const char* lrc_text, PlexLyricLine* out, int max) {
 }
 
 // Parses the body of a GET to a lyric stream's key (e.g. "/library/streams/<id>").
+// Finds the "key" of a track's lyric ("streamType"==4) Stream in the JSON
+// body of a GET to /library/metadata/<ratingKey> - preferring an "lrc"
+// (time-synced) formatted one over any other lyric stream present, since a
+// track can carry more than one at once (e.g. an "lrc" one alongside a plain
+// "txt" one). Writes "" into out_key if the track has no lyric stream at
+// all - every caller has its own fallback for that (either a non-"lrc" one
+// seen along the way, or the literal /subtitles endpoint). Shared by
+// plex_api_get_lyrics() and plex_api_lyrics_async_update() below (this used
+// to be duplicated between the two) and by offline.c's download-time lyrics
+// caching, which can't call either of those directly - both go through this
+// file's main-thread-only blocking-request helper (perform_blocking_request()
+// pumps audio_player_update() while it waits) and offline.c's download
+// thread isn't the main thread. Not declared in plex_api.h - given external
+// linkage only for that and so tests/test_plex_api.c can exercise it
+// directly against real captured server responses.
+void find_lyric_stream_key(const char* metadata_json, char* out_key, size_t out_max) {
+    out_key[0] = '\0';
+    if (!metadata_json || out_max == 0) return;
+
+    char fallback_key[512] = "";
+    cJSON* json = cJSON_Parse(metadata_json);
+    if (json) {
+        cJSON* container = cJSON_GetObjectItem(json, "MediaContainer");
+        cJSON* metadata = container ? cJSON_GetObjectItem(container, "Metadata") : NULL;
+        cJSON* item = (metadata && cJSON_IsArray(metadata)) ? cJSON_GetArrayItem(metadata, 0) : NULL;
+        cJSON* media = item ? cJSON_GetObjectItem(item, "Media") : NULL;
+        cJSON* media_item = (media && cJSON_IsArray(media)) ? cJSON_GetArrayItem(media, 0) : NULL;
+        cJSON* part = media_item ? cJSON_GetObjectItem(media_item, "Part") : NULL;
+        cJSON* part_item = (part && cJSON_IsArray(part)) ? cJSON_GetArrayItem(part, 0) : NULL;
+        cJSON* stream = part_item ? cJSON_GetObjectItem(part_item, "Stream") : NULL;
+        if (stream && cJSON_IsArray(stream)) {
+            cJSON* s_item = NULL;
+            cJSON_ArrayForEach(s_item, stream) {
+                cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
+                cJSON* key = cJSON_GetObjectItem(s_item, "key");
+                if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4 &&
+                    key && cJSON_IsString(key)) {
+                    if (fallback_key[0] == '\0') {
+                        strncpy(fallback_key, key->valuestring, sizeof(fallback_key) - 1);
+                    }
+                    cJSON* format = cJSON_GetObjectItem(s_item, "format");
+                    if (format && cJSON_IsString(format) && strcmp(format->valuestring, "lrc") == 0) {
+                        strncpy(out_key, key->valuestring, out_max - 1);
+                        out_key[out_max - 1] = '\0';
+                        cJSON_Delete(json);
+                        return;
+                    }
+                }
+            }
+        }
+        cJSON_Delete(json);
+    }
+    strncpy(out_key, fallback_key, out_max - 1);
+    out_key[out_max - 1] = '\0';
+}
+
 // Not declared in plex_api.h - it's an internal implementation detail of
 // plex_api_get_lyrics(), given external linkage only so tests/test_plex_api.c
 // can exercise it directly against real captured server responses.
@@ -2495,68 +2697,17 @@ int plex_api_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
     snprintf(endpoint, sizeof(endpoint), "/library/metadata/%s", rating_key);
     
     char lyric_stream_key[512] = "";
-    char lyric_stream_key_fallback[512] = "";
     char* response = NULL;
-    
+
     if (plex_http_get(endpoint, &response)) {
-        cJSON* json = cJSON_Parse(response);
-        if (json) {
-            cJSON* container = cJSON_GetObjectItem(json, "MediaContainer");
-            if (container) {
-                cJSON* metadata = cJSON_GetObjectItem(container, "Metadata");
-                if (metadata && cJSON_IsArray(metadata)) {
-                    cJSON* item = cJSON_GetArrayItem(metadata, 0);
-                    if (item) {
-                        cJSON* media = cJSON_GetObjectItem(item, "Media");
-                        if (media && cJSON_IsArray(media)) {
-                            cJSON* media_item = cJSON_GetArrayItem(media, 0);
-                            if (media_item) {
-                                cJSON* part = cJSON_GetObjectItem(media_item, "Part");
-                                if (part && cJSON_IsArray(part)) {
-                                    cJSON* part_item = cJSON_GetArrayItem(part, 0);
-                                    if (part_item) {
-                                        cJSON* stream = cJSON_GetObjectItem(part_item, "Stream");
-                                        if (stream && cJSON_IsArray(stream)) {
-                                            // A track can carry more than one streamType==4 (lyric)
-                                            // stream at once - e.g. an "lrc" (time-synced) one and a
-                                            // plain "txt" one. Prefer "lrc" explicitly rather than
-                                            // whichever happens to come first in the array.
-                                            cJSON* s_item = NULL;
-                                            cJSON_ArrayForEach(s_item, stream) {
-                                                cJSON* streamType = cJSON_GetObjectItem(s_item, "streamType");
-                                                cJSON* key = cJSON_GetObjectItem(s_item, "key");
-                                                if (streamType && cJSON_IsNumber(streamType) && streamType->valueint == 4 &&
-                                                    key && cJSON_IsString(key)) {
-                                                    if (lyric_stream_key_fallback[0] == '\0') {
-                                                        strncpy(lyric_stream_key_fallback, key->valuestring, sizeof(lyric_stream_key_fallback) - 1);
-                                                    }
-                                                    cJSON* format = cJSON_GetObjectItem(s_item, "format");
-                                                    if (format && cJSON_IsString(format) && strcmp(format->valuestring, "lrc") == 0) {
-                                                        strncpy(lyric_stream_key, key->valuestring, sizeof(lyric_stream_key) - 1);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            cJSON_Delete(json);
-        }
+        find_lyric_stream_key(response, lyric_stream_key, sizeof(lyric_stream_key));
         free(response);
     }
-    
-    if (lyric_stream_key[0] == '\0') {
-        strncpy(lyric_stream_key, lyric_stream_key_fallback, sizeof(lyric_stream_key) - 1);
-    }
+
     if (lyric_stream_key[0] == '\0') {
         snprintf(lyric_stream_key, sizeof(lyric_stream_key), "/library/metadata/%s/subtitles", rating_key);
     }
-    
+
     char* lrc_response = NULL;
     int count = 0;
     if (plex_http_get(lyric_stream_key, &lrc_response)) {

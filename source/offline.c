@@ -140,6 +140,21 @@ typedef struct {
     bool valid;
     OfflineQueueItem item;
     char item_ext[8];
+    // Whether this download is a server-side transcode rather than a direct
+    // fetch of the source file. Recorded explicitly (rather than inferred
+    // from item_ext, e.g. via is_ext_playable()) because item_ext alone
+    // can't tell the two apart: a transcode's output extension is always
+    // forced to "mp3" (see start_next_download()), indistinguishable from a
+    // direct download that was *already* an mp3. Drives resumability
+    // (finish_active_download(), cancel_active_download()) and which
+    // codec/bitrate get recorded in the manifest.
+    bool item_transcoded;
+    // The bitrate (kbps) actually requested for a transcoded download -
+    // meaningless when !item_transcoded. Recorded up front rather than
+    // re-derived from s_download_quality when the transfer finishes, since
+    // the user could change Settings > Download Quality while this transfer
+    // is still in flight.
+    int transcode_bitrate;
     CURL* easy;
     struct curl_slist* headers;
     FILE* fp;
@@ -202,6 +217,16 @@ static volatile bool s_cancel_active_requested = false;
 // regardless, so the download thread has no other way to ask it directly.
 static volatile bool s_network_streaming_hint = false;
 
+// Main thread -> download thread: quality tier new downloads should be
+// fetched at (AppConfig.download_quality, Settings > Download Quality). See
+// offline_set_download_quality() - same plain-flag reasoning as
+// s_network_streaming_hint above. Defaults to QUALITY_FLAC_DIRECT ("Original")
+// so a download queued before offline_set_download_quality()'s first call
+// (shouldn't happen - main.c calls it right after offline_init(), before
+// anything can queue a download - but just in case) matches this app's
+// longstanding behavior rather than silently downsampling.
+static volatile PlexQualityTier s_download_quality = QUALITY_FLAC_DIRECT;
+
 static Thread s_dl_thread = NULL;
 static volatile bool s_dl_thread_should_run = false;
 
@@ -225,6 +250,7 @@ static void mkdir_recursive(const char* dir) {
 static void ensure_dirs(void) {
     mkdir_recursive(OFFLINE_TRACKS_DIR);
     mkdir_recursive(OFFLINE_THUMBS_DIR);
+    mkdir_recursive(OFFLINE_LYRICS_DIR);
 }
 
 // Replaces anything that isn't alnum/'-'/'_'/'.' with '_' - ratingKeys and
@@ -259,6 +285,12 @@ static void album_thumb_path(const char* album_id, char* out, size_t max) {
     char comp[64];
     sanitize_component(album_id, comp, sizeof(comp));
     snprintf(out, max, "%s/%s.img", OFFLINE_THUMBS_DIR, comp);
+}
+
+static void lyrics_file_path(const char* rating_key, char* out, size_t max) {
+    char comp[64];
+    sanitize_component(rating_key, comp, sizeof(comp));
+    snprintf(out, max, "%s/%s.lyr", OFFLINE_LYRICS_DIR, comp);
 }
 
 static void remove_all_files_in_dir(const char* dir) {
@@ -1068,6 +1100,187 @@ static void maybe_cache_album_thumb(const OfflineQueueItem* item) {
     if (data) free(data);
 }
 
+// --- Lyrics caching ------------------------------------------------------
+// find_lyric_stream_key()/parse_lyrics_stream_response() are defined in
+// plex_api.c (not declared in plex_api.h - internal implementation details
+// of plex_api_get_lyrics()/the async lyrics path, given external linkage
+// only for this and tests/test_plex_api.c). Both are pure parsing - safe to
+// call from this file's download thread even though they live in plex_api.c.
+extern void find_lyric_stream_key(const char* metadata_json, char* out_key, size_t out_max);
+extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+
+// Plain blocking GET against a server-relative `endpoint` (e.g.
+// "/library/metadata/123"), same header set plex_api.c's own plex_http_get()
+// sends - reimplemented here rather than reused for the same reason
+// fetch_album_art_bytes() above is: every blocking call in plex_api.c pumps
+// audio_player_update() while it waits (main-thread-only), and this runs on
+// the download thread instead.
+static bool download_thread_http_get(const char* endpoint, HttpBuf* out) {
+    memset(out, 0, sizeof(*out));
+    const char* server_url = plex_api_get_server_url();
+    if (!endpoint || !endpoint[0] || !server_url || !server_url[0]) return false;
+
+    char url[PLEX_MAX_URL];
+    snprintf(url, sizeof(url), "%s%s", server_url, endpoint);
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    const char* token = plex_api_get_token();
+    if (token && token[0]) {
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr), "X-Plex-Token: %s", token);
+        headers = curl_slist_append(headers, hdr);
+    }
+    char id_hdr[96];
+    snprintf(id_hdr, sizeof(id_hdr), "X-Plex-Client-Identifier: %s", plex_api_get_client_id());
+    headers = curl_slist_append(headers, id_hdr);
+    headers = curl_slist_append(headers, "X-Plex-Product: " PLEX_PRODUCT);
+    headers = curl_slist_append(headers, "X-Plex-Version: " PLEX_VERSION);
+    headers = curl_slist_append(headers, "X-Plex-Device: " PLEX_DEVICE);
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_buf_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)out);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return res == CURLE_OK && http_code == 200 && out->data && out->size > 0;
+}
+
+// Matches plex_api.c's own PLEX_LYRICS_ASYNC_MAX (and ui.c's PLEX_MAX_LYRICS,
+// which is all it ever actually displays) - a downloaded track's lyrics get
+// the same fidelity as a live-streamed one, no more, no less. Kept small
+// deliberately: this is a stack array on the download thread's comparatively
+// tight OFFLINE_DL_THREAD_STACK_SIZE, not just an arbitrary-feeling cap. Only
+// bounds what gets fetched and saved at download time - not what
+// offline_get_lyrics() can return later (that's the caller's own `max`).
+#define OFFLINE_LYRICS_FETCH_MAX 64
+
+// Writes `lines` to `path` in a simple line-oriented format - "<time_ms>\t
+// <text>\n" per entry - rather than real LRC (which rounds timestamps to
+// centiseconds; this keeps plex_api.c's exact millisecond values and is
+// trivial to parse back without a real LRC parser). Any stray tab/newline
+// inside `text` itself (shouldn't happen - Plex's own lyric lines are single
+// display lines - but nothing stops a control character coming back from
+// the server) is replaced with a space first, so a corrupt line can never
+// desync read_lyrics_file() from every line after it.
+static bool write_lyrics_file(const char* path, const PlexLyricLine* lines, int count) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    for (int i = 0; i < count; i++) {
+        char clean[sizeof(lines[i].text)];
+        size_t n = 0;
+        for (const char* p = lines[i].text; *p && n < sizeof(clean) - 1; p++) {
+            clean[n++] = (*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p;
+        }
+        clean[n] = '\0';
+        fprintf(f, "%d\t%s\n", lines[i].time_ms, clean);
+    }
+    fclose(f);
+    return true;
+}
+
+// Reads back a file written by write_lyrics_file(). A line with no tab (or
+// any other line that doesn't parse) is just skipped rather than aborting
+// the whole read - one damaged line shouldn't lose every line after it.
+static int read_lyrics_file(const char* path, PlexLyricLine* out, int max) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+
+    char line[160];
+    int count = 0;
+    while (count < max && fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
+        if (len > 0 && line[len - 1] == '\r') line[--len] = '\0';
+
+        char* tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+
+        out[count].time_ms = atoi(line);
+        strncpy(out[count].text, tab + 1, sizeof(out[count].text) - 1);
+        out[count].text[sizeof(out[count].text) - 1] = '\0';
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+// Fetches this track's time-synced lyrics from PMS and saves them under
+// OFFLINE_LYRICS_DIR - same two-request flow as plex_api_get_lyrics() (find
+// the lyric stream's key off the track's metadata, then fetch that stream's
+// body), reimplemented with plain blocking curl rather than calling that
+// function directly - see download_thread_http_get()'s comment for why.
+// Best-effort only, same as maybe_cache_album_thumb(): a track downloads
+// successfully even if this fails, times out, or the server genuinely has
+// no lyrics for it - Settings > Downloads never blocked on lyrics before and
+// shouldn't start now. Skips the fetch entirely if this track already has a
+// cached lyrics file (same dedup as maybe_cache_album_thumb()'s existing-
+// file check) - called from the download thread with the lock held, so (like
+// that function) drops it around the actual network round-trips.
+static void maybe_cache_lyrics(const char* rating_key) {
+    if (!rating_key || !rating_key[0]) return;
+
+    char path[512];
+    lyrics_file_path(rating_key, path, sizeof(path));
+    FILE* existing = fopen(path, "rb");
+    if (existing) {
+        fclose(existing);
+        return;
+    }
+
+    char rkey_copy[PLEX_MAX_STR];
+    strncpy(rkey_copy, rating_key, sizeof(rkey_copy) - 1);
+    rkey_copy[sizeof(rkey_copy) - 1] = '\0';
+
+    LightLock_Unlock(&s_lock);
+
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/library/metadata/%s", rkey_copy);
+
+    HttpBuf meta = {0};
+    char stream_key[512] = "";
+    if (download_thread_http_get(endpoint, &meta)) {
+        find_lyric_stream_key(meta.data, stream_key, sizeof(stream_key));
+    }
+    if (meta.data) free(meta.data);
+
+    if (stream_key[0] == '\0') {
+        snprintf(stream_key, sizeof(stream_key), "/library/metadata/%s/subtitles", rkey_copy);
+    }
+
+    HttpBuf lrc = {0};
+    PlexLyricLine lines[OFFLINE_LYRICS_FETCH_MAX];
+    int count = 0;
+    if (download_thread_http_get(stream_key, &lrc)) {
+        count = parse_lyrics_stream_response(lrc.data, lines, OFFLINE_LYRICS_FETCH_MAX);
+    }
+    if (lrc.data) free(lrc.data);
+
+    LightLock_Lock(&s_lock);
+
+    // Nothing written for a track with genuinely no lyrics - offline_get_
+    // lyrics() below reports that the same way plex_api_get_lyrics() does
+    // online (a single placeholder line), no need to persist an empty file
+    // to tell the two cases apart.
+    if (count > 0) {
+        write_lyrics_file(path, lines, count);
+    }
+}
+
 // --- Download Queue API -------------------------------------------------------
 // PMS's dedicated download mechanism (https://developer.plex.tv/pms/#tag/
 // Download-Queue) - a small queue system distinct from live playback's
@@ -1419,7 +1632,19 @@ static void start_next_download(void) {
 
     char ext[8];
     derive_ext(item.part_key, ext, sizeof(ext));
-    bool direct = is_ext_playable(ext);
+    // download_quality's own bitrate cap (0 for QUALITY_FLAC_DIRECT/
+    // "Original" - no cap at all, i.e. keep the source as-is). At "Original"
+    // this reduces to exactly the prior behavior: fetch a playable source
+    // (mp3/flac) as-is, transcode anything else. At any other tier, a
+    // playable source still skips the transcode when its own bitrate
+    // already fits under the cap - re-encoding it would only add a lossy
+    // second generation for no size or quality benefit - but otherwise
+    // (unplayable format, or bitrate over the cap) goes through the
+    // transcoder to actually bring it down to the requested quality.
+    PlexQualityTier dq = s_download_quality;
+    int dq_bitrate = plex_api_get_quality_bitrate(dq);
+    bool direct = is_ext_playable(ext) &&
+                  (dq_bitrate <= 0 || item.bitrate <= 0 || item.bitrate <= dq_bitrate);
 
     PlexTrack stub;
     memset(&stub, 0, sizeof(stub));
@@ -1472,7 +1697,7 @@ static void start_next_download(void) {
             return;
         }
     } else {
-        got_url = plex_api_get_download_transcode_url(&stub, url, sizeof(url));
+        got_url = plex_api_get_download_transcode_url(&stub, dq, url, sizeof(url));
     }
 
     if (!got_url) {
@@ -1562,6 +1787,12 @@ static void start_next_download(void) {
 
     s_active.item = item;
     strncpy(s_active.item_ext, ext, sizeof(s_active.item_ext) - 1);
+    s_active.item_transcoded = !direct;
+    // Matches build_transcode_url_ex()'s own bitrate<=0 fallback in
+    // plex_api.c (QUALITY_FLAC_DIRECT's transcode branch - unplayable
+    // source, "Original" quality - has no cap, so it goes out at the same
+    // highest MP3 bitrate a transcode would use elsewhere in the app).
+    s_active.transcode_bitrate = dq_bitrate > 0 ? dq_bitrate : 320;
     s_active.bytes_done = (size_t)existing_size;
     s_active.bytes_total = 0;
     s_active.resume_offset = (size_t)existing_size;
@@ -1619,7 +1850,7 @@ static void finish_active_download(void) {
         // queue instead of losing the progress already made - a dropped
         // WiFi connection or a momentary server hiccup shouldn't mean
         // starting a multi-minute FLAC download over from scratch.
-        bool resumable = is_ext_playable(s_active.item_ext) && s_active.bytes_done > 0;
+        bool resumable = !s_active.item_transcoded && s_active.bytes_done > 0;
         if (resumable && s_active.item.retry_count < OFFLINE_MAX_RETRIES) {
             OfflineQueueItem retry_item = s_active.item;
             retry_item.retry_count++;
@@ -1637,12 +1868,13 @@ static void finish_active_download(void) {
     }
 
     if (ok) {
-        bool was_direct = is_ext_playable(s_active.item_ext);
+        bool was_direct = !s_active.item_transcoded;
         const char* stored_codec = was_direct ? s_active.item.audio_codec : "mp3";
-        int stored_bitrate = was_direct ? s_active.item.bitrate : 320;
+        int stored_bitrate = was_direct ? s_active.item.bitrate : s_active.transcode_bitrate;
         add_track_manifest_entry(&s_active.item, s_active.item_ext, stored_codec, stored_bitrate,
                                   (long)s_active.bytes_done);
         maybe_cache_album_thumb(&s_active.item);
+        maybe_cache_lyrics(s_active.item.rating_key);
         clear_resume_record();
         save_manifest();
         LOG_INFO("offline: finished '%s' (%d bytes)", s_active.item.title, (int)s_active.bytes_done);
@@ -1769,7 +2001,7 @@ static void dl_thread_func(void* arg) {
     // download survives to the next launch instead of restarting.
     LightLock_Lock(&s_lock);
     if (s_active.valid) {
-        bool keep_partial = is_ext_playable(s_active.item_ext);
+        bool keep_partial = !s_active.item_transcoded;
         cancel_active_download(!keep_partial);
     }
     if (s_dl_multi) {
@@ -1849,6 +2081,12 @@ void offline_set_network_streaming_hint(bool is_streaming) {
     s_network_streaming_hint = is_streaming;
 }
 
+void offline_set_download_quality(PlexQualityTier tier) {
+    if (tier >= 0 && tier < QUALITY_TIER_COUNT) {
+        s_download_quality = tier;
+    }
+}
+
 void offline_cleanup(void) {
     LightLock_Lock(&s_lock);
     s_dl_thread_should_run = false;
@@ -1889,6 +2127,14 @@ bool offline_track_is_downloaded(const char* rating_key) {
     bool result = find_track_index(rating_key) >= 0;
     LightLock_Unlock(&s_lock);
     return result;
+}
+
+int offline_get_track_bitrate(const char* rating_key) {
+    LightLock_Lock(&s_lock);
+    int ti = find_track_index(rating_key);
+    int bitrate = (ti >= 0) ? s_tracks[ti].bitrate : -1;
+    LightLock_Unlock(&s_lock);
+    return bitrate;
 }
 
 bool offline_artist_has_any_downloaded(const char* artist_rating_key) {
@@ -1949,6 +2195,31 @@ bool offline_get_thumb_path(const char* rating_key, char* path_out, size_t path_
     }
     LightLock_Unlock(&s_lock);
     return ok;
+}
+
+int offline_get_lyrics(const char* rating_key, PlexLyricLine* out, int max) {
+    if (!rating_key || !rating_key[0] || !out || max <= 0) return 0;
+
+    char path[512];
+    lyrics_file_path(rating_key, path, sizeof(path));
+
+    // Under s_lock so this can never race maybe_cache_lyrics()'s own write
+    // of the same file (see its comment - the actual fwrite() happens with
+    // the lock held too) into a torn read.
+    LightLock_Lock(&s_lock);
+    int count = read_lyrics_file(path, out, max);
+    LightLock_Unlock(&s_lock);
+
+    if (count == 0) {
+        // Same placeholder plex_api_get_lyrics() falls back to online, so
+        // callers never need to special-case "0 lines" for offline playback
+        // the way they would for a still-in-flight async fetch.
+        out[0].time_ms = 0;
+        strncpy(out[0].text, "No time-synced lyrics available", sizeof(out[0].text) - 1);
+        out[0].text[sizeof(out[0].text) - 1] = '\0';
+        count = 1;
+    }
+    return count;
 }
 
 size_t offline_get_storage_used_bytes(void) {
@@ -2162,6 +2433,15 @@ static bool release_track_ref(const char* rating_key) {
     track_file_path(e->rating_key, e->ext, path, sizeof(path));
     remove(path);
 
+    // Lyrics are per-track (not shared/ref-counted the way an album thumb
+    // is), so they always come out with the track itself. remove() on a
+    // path with nothing there (never cached, or a server with no lyrics for
+    // this track - see maybe_cache_lyrics()) is a silent no-op, same as
+    // every other best-effort cleanup in this file.
+    char lyrics_path[512];
+    lyrics_file_path(e->rating_key, lyrics_path, sizeof(lyrics_path));
+    remove(lyrics_path);
+
     char album_id[PLEX_MAX_STR];
     strncpy(album_id, album_identity(e), sizeof(album_id) - 1);
     album_id[sizeof(album_id) - 1] = '\0';
@@ -2325,6 +2605,7 @@ void offline_delete_all(void) {
     LightLock_Lock(&s_lock);
     remove_all_files_in_dir(OFFLINE_TRACKS_DIR);
     remove_all_files_in_dir(OFFLINE_THUMBS_DIR);
+    remove_all_files_in_dir(OFFLINE_LYRICS_DIR);
     clear_resume_record();
     save_queue(); // s_queue_count was already zeroed above - persist the now-empty queue
     s_num_tracks = 0;

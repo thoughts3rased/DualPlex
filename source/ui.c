@@ -38,6 +38,15 @@
 #define LIST_VISIBLE_ITEMS 6  // items visible on bottom screen
 #define LIST_START_Y 44       // below the header
 
+// Settings screen only: one fewer than LIST_VISIBLE_ITEMS, since (unlike
+// every other list screen) it always reserves the strip below its rows for
+// a status/hint line plus (on New3DS) the speedup banner - scrolling for its
+// row count (SCREEN_SETTINGS's own row count, currently 7) rather than
+// growing LIST_START_Y + row_count * LIST_ITEM_HEIGHT to cover them, which
+// would eventually push that text off the bottom of the screen.
+#define SETTINGS_VISIBLE_ITEMS 5
+#define SETTINGS_ROW_COUNT 7
+
 // Context menu overlay geometry (see s_show_context_menu) - shared between
 // its input hit-testing and its rendering so the two can't drift apart.
 #define CTX_MENU_X 20
@@ -203,6 +212,8 @@ static char s_login_pass[128] = "";
 static char s_login_2fa[16] = "";
 static PlexServerResource s_servers[PLEX_MAX_ITEMS];
 static int s_num_servers = 0;
+static PlexHomeUser s_home_users[PLEX_MAX_HOME_USERS];
+static int s_num_home_users = 0;
 
 // Status message - set from dozens of call sites throughout this file (PIN
 // flow, login, download queuing/deletion, track-skip errors, quality
@@ -290,10 +301,21 @@ void ui_set_screen(UIScreen screen) {
         snprintf(s_status_msg, sizeof(s_status_msg), "Enter your Plex account details.");
         s_status_color = COL_TEXT_DIM;
     } else if (screen == SCREEN_SERVER_SELECT) {
-        if (s_num_servers == 0 && s_config->auth_token[0]) {
-            s_num_servers = plex_api_get_servers(s_config->auth_token, s_servers, PLEX_MAX_ITEMS);
+        // account_token (not auth_token - see its own comment) so this
+        // still works correctly if this screen is re-entered well after
+        // sign-in, once auth_token has become a specific server's own access
+        // token instead - e.g. Settings > Switch User's reconnect-failed
+        // fallback (a switched-to Home user with no access to the
+        // previously-connected server) below.
+        if (s_num_servers == 0 && s_config->account_token[0]) {
+            s_num_servers = plex_api_get_servers(s_config->account_token, s_servers, PLEX_MAX_ITEMS);
         }
         s_list_count = s_num_servers;
+    } else if (screen == SCREEN_HOME_USERS) {
+        s_num_home_users = s_config->account_token[0]
+            ? plex_api_get_home_users(s_config->account_token, s_home_users, PLEX_MAX_HOME_USERS)
+            : 0;
+        s_list_count = s_num_home_users;
     } else if (screen == SCREEN_SETUP) {
         s_setup_field = 0;
         s_list_count = 3;
@@ -1308,11 +1330,12 @@ static void perform_context_menu_action(void) {
 // current track (index into s_tracks) - shared by play_track() (an
 // immediate hard-cut) and ui_update()'s crossfade-completion handling (which
 // never calls play_track() itself, since the audio's already transitioned by
-// the time that fires - see its comment). Branches on s_offline_browse:
-// none of the network-only pieces (timeline reporting, lyrics, Sonic
-// Analysis) make sense - or are even reachable - with no server connection,
-// and album art comes from offline.c's on-SD-card thumbnail cache instead of
-// a fresh network fetch.
+// the time that fires - see its comment). Branches on s_offline_browse: the
+// network-only pieces (timeline reporting, Sonic Analysis) make sense - or
+// are even reachable - only with a server connection; album art and lyrics
+// both have an offline.c on-SD-card cache instead (see offline.c's download
+// engine) that this reads from directly rather than going out to the
+// network again.
 static void activate_track_metadata(int idx) {
     if (!s_offline_browse) {
         plex_api_report_timeline_async(s_tracks[idx].rating_key, "playing", 0, s_tracks[idx].duration);
@@ -1336,6 +1359,13 @@ static void activate_track_metadata(int idx) {
     s_next_analysis_track_idx = -1;
     memset(&s_next_analysis, 0, sizeof(s_next_analysis));
     if (s_offline_browse) {
+        // A local file read, not a network fetch, so unlike the online path
+        // below this can just happen inline rather than through the async
+        // plex_api_lyrics_async_* pump - always returns at least the
+        // "No time-synced lyrics available" placeholder line (see its own
+        // comment), so s_num_lyrics is never left at 0 for offline playback
+        // the way it would for a still-in-flight online fetch.
+        s_num_lyrics = offline_get_lyrics(s_tracks[idx].rating_key, s_lyrics, PLEX_MAX_LYRICS);
         // No Sonic Analysis data available offline - compute_crossfade_plan()
         // already falls back to a plain fixed-duration crossfade whenever
         // s_current_analysis.valid is false, which it stays here since it's
@@ -1348,6 +1378,42 @@ static void activate_track_metadata(int idx) {
     }
 }
 
+// Settings-facing label for PreferDownloadedMedia (see config.h) - kept here
+// rather than alongside PlexQualityTier's plex_api_get_download_quality_
+// label() since this setting is a plain app-level choice, not a Plex API
+// concept.
+static const char* prefer_downloaded_media_label(PreferDownloadedMedia v) {
+    switch (v) {
+        case PREFER_DOWNLOADED_NEVER:               return "Never";
+        case PREFER_DOWNLOADED_ON_POOR_CONNECTIONS:  return "On Poor Connections";
+        case PREFER_DOWNLOADED_ALWAYS:               return "Always";
+        default:                                      return "Unknown";
+    }
+}
+
+// Whether play_track()/the crossfade prefetch below should play the
+// already-downloaded copy of s_tracks[idx] instead of streaming it, per
+// Settings > Prefer Downloaded Media. Only meaningful while actually
+// browsing the online library - s_offline_browse already forces local
+// playback unconditionally regardless of this setting - and only for a
+// track that has in fact been downloaded.
+static bool should_use_downloaded_copy(int idx) {
+    if (!s_config || s_config->prefer_downloaded_media == PREFER_DOWNLOADED_NEVER) return false;
+    if (idx < 0 || idx >= s_num_tracks) return false;
+    if (!offline_track_is_downloaded(s_tracks[idx].rating_key)) return false;
+    if (s_config->prefer_downloaded_media == PREFER_DOWNLOADED_ALWAYS) return true;
+
+    // PREFER_DOWNLOADED_ON_POOR_CONNECTIONS: only when streaming this track
+    // live right now would actually come in at a lower bitrate than what's
+    // already on the SD card. Either side coming back <= 0 means "uncapped/
+    // lossless" or "unknown" - never treated as "poorer than the download",
+    // so on any doubt this just falls through to streaming as normal rather
+    // than substituting a local copy on a guess.
+    int downloaded_bitrate = offline_get_track_bitrate(s_tracks[idx].rating_key);
+    int stream_bitrate = plex_api_estimate_stream_bitrate(&s_tracks[idx]);
+    return downloaded_bitrate > 0 && stream_bitrate > 0 && stream_bitrate < downloaded_bitrate;
+}
+
 // Hard-cuts to track idx: hard as in immediate, not a crossfade - use this
 // for manual track changes (skip/seek/quality-restart) where an instant
 // response matters more than a smooth transition. Advancing to the next
@@ -1358,7 +1424,7 @@ static void play_track(int idx) {
     if (idx < 0 || idx >= s_num_tracks) return;
     char url[PLEX_MAX_URL];
 
-    if (s_offline_browse) {
+    if (s_offline_browse || should_use_downloaded_copy(idx)) {
         if (!offline_get_track_playback_url(s_tracks[idx].rating_key, url, sizeof(url))) return;
     } else {
         // Adaptive quality: suggest tier based on measured download speed
@@ -1486,7 +1552,12 @@ static void seek_to(int target_ms) {
     if (target_ms < 0) target_ms = 0;
     if (track->duration > 0 && target_ms > track->duration) target_ms = track->duration;
 
-    if (s_offline_browse) {
+    // Branches on the deck that's actually loaded right now, not
+    // s_offline_browse - Settings > Prefer Downloaded Media can have loaded
+    // a downloaded copy of the current track while still browsing the
+    // online library (s_offline_browse false), and that still needs the
+    // in-place local seek below, not a reload-from-URL against the server.
+    if (audio_player_current_deck_is_local()) {
         // A downloaded track is already fully on the SD card, so this seeks
         // audio_player.c's already-open local deck directly in place -
         // unlike the online path below, there's no stream to reload from a
@@ -1494,7 +1565,7 @@ static void seek_to(int target_ms) {
         // rather than an error if the deck genuinely can't seek for some
         // reason (see audio_player_seek_local_ms()'s doc comment).
         if (audio_player_seek_local_ms(target_ms)) {
-            LOG_INFO("Seeked offline track %d to %dms", s_current_track_idx, target_ms);
+            LOG_INFO("Seeked local track %d to %dms", s_current_track_idx, target_ms);
         }
         return;
     }
@@ -1534,6 +1605,33 @@ static UIScreen nav_pop(UIScreen fallback) {
         return s_nav_stack[--s_nav_stack_len];
     }
     return fallback;
+}
+
+// Turns a held direction key into a repeating "move" trigger instead of just
+// the one-shot press kDown alone would give: the initial press fires
+// immediately, then holding the key auto-repeats it after a short delay -
+// the same feel every native 3DS list has. Was hand-rolled just for the log
+// viewer overlay before this generalized it to every list/menu in the app
+// (see ui_update()'s many call sites below) - same delay/repeat-rate
+// constants that one already used. `repeat` is the caller's own counter (a
+// static local, one per direction per distinct list - see call sites) so
+// switching screens, or between up and down, never carries over stale
+// timing from an unrelated list.
+static bool nav_repeat(u32 kDown, u32 kHeld, u32 key, int* repeat) {
+    if (kDown & key) {
+        *repeat = 0;
+        return true;
+    }
+    if (kHeld & key) {
+        (*repeat)++;
+        if (*repeat > 8) {
+            *repeat = 6;
+            return true;
+        }
+        return false;
+    }
+    *repeat = 0;
+    return false;
 }
 
 void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
@@ -1581,35 +1679,13 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             return;
         }
         int total_logs = logger_get_log_count();
-        static int s_scroll_repeat = 0;
-        
-        bool press_up = (kDown & KEY_UP) || (kDown & KEY_CSTICK_UP);
-        bool press_dn = (kDown & KEY_DOWN) || (kDown & KEY_CSTICK_DOWN);
-        bool hold_up = (kHeld & KEY_UP) || (kHeld & KEY_CSTICK_UP);
-        bool hold_dn = (kHeld & KEY_DOWN) || (kHeld & KEY_CSTICK_DOWN);
-        
-        if (press_up) {
+        static int s_up_repeat = 0, s_dn_repeat = 0;
+
+        if (nav_repeat(kDown, kHeld, KEY_UP | KEY_CSTICK_UP, &s_up_repeat)) {
             if (s_log_scroll_offset > 0) s_log_scroll_offset--;
-        } else if (hold_up) {
-            s_scroll_repeat++;
-            if (s_scroll_repeat > 8) {
-                if (s_log_scroll_offset > 0) s_log_scroll_offset--;
-                s_scroll_repeat = 6;
-            }
         }
-        
-        if (press_dn) {
+        if (nav_repeat(kDown, kHeld, KEY_DOWN | KEY_CSTICK_DOWN, &s_dn_repeat)) {
             if (s_log_scroll_offset + 1 < total_logs) s_log_scroll_offset++;
-        } else if (hold_dn) {
-            s_scroll_repeat++;
-            if (s_scroll_repeat > 8) {
-                if (s_log_scroll_offset + 1 < total_logs) s_log_scroll_offset++;
-                s_scroll_repeat = 6;
-            }
-        }
-        
-        if (!hold_up && !hold_dn) {
-            s_scroll_repeat = 0;
         }
         return;
     }
@@ -1729,7 +1805,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             int remaining_ms = cur->duration - audio_player_get_position_ms();
             if (remaining_ms <= lead_ms) {
                 char next_url[PLEX_MAX_URL];
-                bool got_next_url = s_offline_browse
+                bool got_next_url = (s_offline_browse || should_use_downloaded_copy(next_idx))
                     ? offline_get_track_playback_url(s_tracks[next_idx].rating_key, next_url, sizeof(next_url))
                     : plex_api_get_stream_url(&s_tracks[next_idx], next_url, sizeof(next_url));
                 if (got_next_url) {
@@ -1752,11 +1828,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
 
     // Adaptive quality: handle quality downgrade requests. Not meaningful
-    // offline - a local file has no quality tier to step down, and
-    // audio_player.c's underrun detection already skips local decks (see
-    // its comment on why a local "download speed" would be nonsense) - this
-    // guard is just cheap extra insurance against a stray flag.
-    if (!s_offline_browse && pstate == PLAYER_PLAYING && audio_player_needs_quality_downgrade()) {
+    // for a local deck - it has no quality tier to step down, and
+    // audio_player.c's underrun detection isn't expected to flag one (SD
+    // card reads vastly outrun realtime playback) - but checking the actual
+    // deck rather than s_offline_browse here (a stray flag would otherwise
+    // restart the track pointlessly) matters now that Settings > Prefer
+    // Downloaded Media can have loaded a downloaded copy while still
+    // browsing online (s_offline_browse false).
+    if (!audio_player_current_deck_is_local() && pstate == PLAYER_PLAYING && audio_player_needs_quality_downgrade()) {
         audio_player_clear_downgrade_flag();
         
         if (plex_api_quality_step_down()) {
@@ -1849,13 +1928,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
     }
 
     // New 3DS C-Stick Navigation
-    if (kDown & KEY_CSTICK_UP) {
+    static int s_cstick_up_repeat = 0, s_cstick_dn_repeat = 0;
+    if (nav_repeat(kDown, kHeld, KEY_CSTICK_UP, &s_cstick_up_repeat)) {
         if (s_selected_idx > 0) {
             s_selected_idx--;
             if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
         }
     }
-    if (kDown & KEY_CSTICK_DOWN) {
+    if (nav_repeat(kDown, kHeld, KEY_CSTICK_DOWN, &s_cstick_dn_repeat)) {
         if (s_selected_idx < s_list_count - 1) {
             s_selected_idx++;
             if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
@@ -1956,13 +2036,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_NOW_PLAYING);
             return;
         }
-        if (kDown & KEY_UP) {
+        static int s_queue_up_repeat = 0, s_queue_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_queue_up_repeat)) {
             if (s_selected_idx > 0) {
                 s_selected_idx--;
                 if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
             }
         }
-        if (kDown & KEY_DOWN) {
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_queue_dn_repeat)) {
             if (s_selected_idx < s_list_count - 1) {
                 s_selected_idx++;
                 if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
@@ -2000,6 +2081,12 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         if (s_pin_timer % 90 == 0 && s_pin.code[0] != '\0') {
             if (plex_api_check_pin(&s_pin)) {
                 strncpy(s_config->auth_token, s_pin.auth_token, sizeof(s_config->auth_token) - 1);
+                // The true plex.tv account token - kept from here on
+                // regardless of which server SCREEN_SERVER_SELECT picks next
+                // (auth_token above becomes that server's own access token
+                // instead - see AppConfig.account_token's comment). Needed
+                // for Settings > Switch User.
+                strncpy(s_config->account_token, s_pin.auth_token, sizeof(s_config->account_token) - 1);
                 config_save(s_config);
                 s_num_servers = 0; // force refresh
                 ui_set_screen(SCREEN_SERVER_SELECT);
@@ -2017,8 +2104,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // 2. Auth Choice Screen
     if (s_screen == SCREEN_AUTH_CHOICE) {
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 3;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 3) ? s_selected_idx + 1 : 0;
+        static int s_auth_up_repeat = 0, s_auth_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_auth_up_repeat)) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 3;
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_auth_dn_repeat)) s_selected_idx = (s_selected_idx < 3) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
@@ -2048,9 +2136,10 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_AUTH_CHOICE);
             return;
         }
-        if (kDown & KEY_UP) s_setup_field = (s_setup_field > 0) ? s_setup_field - 1 : 3;
-        if (kDown & KEY_DOWN) s_setup_field = (s_setup_field < 3) ? s_setup_field + 1 : 0;
-        
+        static int s_login_up_repeat = 0, s_login_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_login_up_repeat)) s_setup_field = (s_setup_field > 0) ? s_setup_field - 1 : 3;
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_login_dn_repeat)) s_setup_field = (s_setup_field < 3) ? s_setup_field + 1 : 0;
+
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > 0) {
             if (touch.py >= 45 && touch.py < 45 + LIST_ITEM_HEIGHT) s_setup_field = 0;
             else if (touch.py >= 45 + LIST_ITEM_HEIGHT && touch.py < 45 + 2*LIST_ITEM_HEIGHT) s_setup_field = 1;
@@ -2072,6 +2161,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 int res = plex_api_login_direct(s_login_user, s_login_pass, s_login_2fa, token, sizeof(token));
                 if (res == 1) {
                     strncpy(s_config->auth_token, token, sizeof(s_config->auth_token) - 1);
+                    strncpy(s_config->account_token, token, sizeof(s_config->account_token) - 1); // see PIN flow's identical comment above
                     config_save(s_config);
                     s_num_servers = 0;
                     ui_set_screen(SCREEN_SERVER_SELECT);
@@ -2093,13 +2183,14 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_AUTH_CHOICE);
             return;
         }
-        if (kDown & KEY_UP) {
+        static int s_srv_up_repeat = 0, s_srv_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_srv_up_repeat)) {
             if (s_selected_idx > 0) {
                 s_selected_idx--;
                 if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
             }
         }
-        if (kDown & KEY_DOWN) {
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_srv_dn_repeat)) {
             if (s_selected_idx < s_list_count - 1) {
                 s_selected_idx++;
                 if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
@@ -2138,8 +2229,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
     // 5. Main Hub Screen
     if (s_screen == SCREEN_HUB) {
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 5;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 5) ? s_selected_idx + 1 : 0;
+        static int s_hub_up_repeat = 0, s_hub_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_hub_up_repeat)) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 5;
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_hub_dn_repeat)) s_selected_idx = (s_selected_idx < 5) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
@@ -2208,8 +2300,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(nav_pop(SCREEN_HUB));
             return;
         }
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
+        static int s_dl_up_repeat = 0, s_dl_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_dl_up_repeat)) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 2;
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_dl_dn_repeat)) s_selected_idx = (s_selected_idx < 2) ? s_selected_idx + 1 : 0;
 
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y) {
             int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
@@ -2241,18 +2334,35 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         return;
     }
 
-    // Settings Screen (3 rows: Clock Format, Crossfade, Downloads)
+    // Settings Screen (SETTINGS_ROW_COUNT rows: Clock Format, Crossfade,
+    // Downloads, Download Quality, Prefer Downloaded Media, Server Address
+    // Override, Switch User) - only SETTINGS_VISIBLE_ITEMS show at once,
+    // scrolling via s_list_offset like every other multi-item list screen
+    // (see SETTINGS_VISIBLE_ITEMS's comment for why it's one fewer than
+    // those).
     if (s_screen == SCREEN_SETTINGS) {
         if (kDown & KEY_B) {
             ui_set_screen(SCREEN_HUB);
             return;
         }
-        if (kDown & KEY_UP) s_selected_idx = (s_selected_idx > 0) ? s_selected_idx - 1 : 3;
-        if (kDown & KEY_DOWN) s_selected_idx = (s_selected_idx < 3) ? s_selected_idx + 1 : 0;
+        static int s_settings_up_repeat = 0, s_settings_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_settings_up_repeat)) {
+            if (s_selected_idx > 0) {
+                s_selected_idx--;
+                if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
+            }
+        }
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_settings_dn_repeat)) {
+            if (s_selected_idx < SETTINGS_ROW_COUNT - 1) {
+                s_selected_idx++;
+                if (s_selected_idx >= s_list_offset + SETTINGS_VISIBLE_ITEMS) s_list_offset = s_selected_idx - SETTINGS_VISIBLE_ITEMS + 1;
+            }
+        }
 
-        if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y) {
-            int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT;
-            if (idx >= 0 && idx <= 3) {
+        if (kDown & KEY_TOUCH && touch.px > 0 && touch.py >= LIST_START_Y &&
+            touch.py < LIST_START_Y + SETTINGS_VISIBLE_ITEMS * LIST_ITEM_HEIGHT) {
+            int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT + s_list_offset;
+            if (idx >= 0 && idx < SETTINGS_ROW_COUNT) {
                 s_selected_idx = idx;
                 kDown |= KEY_A;
             }
@@ -2268,7 +2378,31 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                 s_status_msg[0] = '\0';
                 nav_push(SCREEN_SETTINGS);
                 ui_set_screen(SCREEN_DOWNLOADS);
-            } else if (s_selected_idx == 3 && s_config) { // Server Address override
+            } else if (s_selected_idx == 3 && s_config) { // Download Quality -
+                // cycle worst to best: Low -> Medium -> High -> Very High ->
+                // Original -> Low... (PlexQualityTier's declaration order,
+                // QUALITY_MP3_64 down to QUALITY_FLAC_DIRECT, is best-to-
+                // worst - walking it backwards with wraparound gives this).
+                PlexQualityTier next = (s_config->download_quality > 0)
+                    ? (PlexQualityTier)(s_config->download_quality - 1)
+                    : QUALITY_MP3_64;
+                s_config->download_quality = next;
+                config_save(s_config);
+                offline_set_download_quality(next);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Download Quality: %s",
+                         plex_api_get_download_quality_label(next));
+                s_status_color = COL_TEXT_DIM;
+            } else if (s_selected_idx == 4 && s_config) { // Prefer Downloaded Media -
+                // cycle Never -> On Poor Connections -> Always -> Never...
+                PreferDownloadedMedia next = (s_config->prefer_downloaded_media == PREFER_DOWNLOADED_ALWAYS)
+                    ? PREFER_DOWNLOADED_NEVER
+                    : (PreferDownloadedMedia)(s_config->prefer_downloaded_media + 1);
+                s_config->prefer_downloaded_media = next;
+                config_save(s_config);
+                snprintf(s_status_msg, sizeof(s_status_msg), "Prefer Downloaded Media: %s",
+                         prefer_downloaded_media_label(next));
+                s_status_color = COL_TEXT_DIM;
+            } else if (s_selected_idx == 5 && s_config) { // Server Address override
                 if (s_config->server_url_locked) {
                     // Already locked to a manual address - one tap turns
                     // auto-discovery back on rather than opening the
@@ -2301,6 +2435,113 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
                         }
                     }
                 }
+            } else if (s_selected_idx == 6 && s_config) { // Switch User (Plex Home)
+                if (!s_config->account_token[0]) {
+                    // Manual Setup (Settings > Server Address) or an install
+                    // signed in before this field existed - nothing to
+                    // switch between without a plex.tv account token. See
+                    // AppConfig.account_token's comment.
+                    snprintf(s_status_msg, sizeof(s_status_msg),
+                             "Sign in with a Plex account (not a manual server) to switch users");
+                    s_status_color = COL_WARN;
+                } else {
+                    s_status_msg[0] = '\0';
+                    nav_push(SCREEN_SETTINGS);
+                    ui_set_screen(SCREEN_HOME_USERS);
+                }
+            }
+        }
+        return;
+    }
+
+    // Plex Home user switcher (Settings > Switch User)
+    if (s_screen == SCREEN_HOME_USERS) {
+        if (kDown & KEY_B) {
+            ui_set_screen(nav_pop(SCREEN_SETTINGS));
+            return;
+        }
+
+        static int s_home_up_repeat = 0, s_home_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_home_up_repeat)) {
+            if (s_selected_idx > 0) {
+                s_selected_idx--;
+                if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
+            }
+        }
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_home_dn_repeat)) {
+            if (s_selected_idx < s_num_home_users - 1) {
+                s_selected_idx++;
+                if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
+            }
+        }
+        if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > LIST_START_Y) {
+            int idx = (touch.py - LIST_START_Y) / LIST_ITEM_HEIGHT + s_list_offset;
+            if (idx >= 0 && idx < s_num_home_users) {
+                s_selected_idx = idx;
+                kDown |= KEY_A;
+            }
+        }
+
+        if ((kDown & KEY_A) && s_num_home_users > 0 && s_selected_idx >= 0 && s_selected_idx < s_num_home_users) {
+            PlexHomeUser* target = &s_home_users[s_selected_idx];
+
+            char pin[16] = "";
+            bool have_pin = true;
+            if (target->is_protected) {
+                char hint[PLEX_MAX_STR + 16];
+                snprintf(hint, sizeof(hint), "Enter PIN for %s", target->title);
+                have_pin = show_keyboard(hint, pin, sizeof(pin));
+            }
+
+            if (have_pin) {
+                snprintf(s_status_msg, sizeof(s_status_msg), "Switching to %s...", target->title);
+                s_status_color = COL_TEXT;
+
+                char new_token[128] = "";
+                if (plex_api_switch_home_user(s_config->account_token, target->uuid, pin, new_token, sizeof(new_token))) {
+                    strncpy(s_config->account_token, new_token, sizeof(s_config->account_token) - 1);
+                    config_save(s_config);
+
+                    // Re-resolve server access under the new identity - its
+                    // access to (and access token for) the previously-
+                    // connected server can both differ from the identity
+                    // that was active before the switch, even for the exact
+                    // same server (see plex_api_switch_home_user()'s
+                    // comment).
+                    if (plex_api_reconnect_via_account(s_config->account_token, s_config->server_name)) {
+                        strncpy(s_config->server_url, plex_api_get_server_url(), sizeof(s_config->server_url) - 1);
+                        strncpy(s_config->auth_token, plex_api_get_token(), sizeof(s_config->auth_token) - 1);
+                        config_save(s_config);
+                        snprintf(s_status_msg, sizeof(s_status_msg), "Switched to %s", target->title);
+                        s_status_color = COL_PLAYING;
+                        ui_set_screen(SCREEN_HUB);
+                    } else {
+                        // The identity switch itself succeeded - only
+                        // re-resolving the same server didn't. Send them to
+                        // pick a server this identity actually has access to
+                        // rather than getting stuck with an account_token
+                        // that's now valid but no working server_url/
+                        // auth_token to go with it. Deliberately not
+                        // nav_push()ing SCREEN_SETTINGS first - unlike every
+                        // other screen this app navigates to via nav_push(),
+                        // SCREEN_SERVER_SELECT's own B handler doesn't
+                        // nav_pop() (it's normally only ever reached during
+                        // initial sign-in, straight from SCREEN_LINK_PIN/
+                        // SCREEN_LOGIN_DIRECT, and always backs out to
+                        // SCREEN_AUTH_CHOICE) - pushing here would leave a
+                        // stale entry on the shared nav stack for some
+                        // unrelated later screen to pop by mistake.
+                        snprintf(s_status_msg, sizeof(s_status_msg),
+                                 "Switched to %s, but couldn't reach the same server - pick another", target->title);
+                        s_status_color = COL_WARN;
+                        s_num_servers = 0;
+                        ui_set_screen(SCREEN_SERVER_SELECT);
+                    }
+                } else {
+                    snprintf(s_status_msg, sizeof(s_status_msg),
+                             target->is_protected ? "Wrong PIN or connection error" : "Couldn't switch user - connection error");
+                    s_status_color = COL_ERROR;
+                }
             }
         }
         return;
@@ -2312,8 +2553,9 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
             ui_set_screen(SCREEN_AUTH_CHOICE);
             return;
         }
-        if (kDown & KEY_UP) s_setup_field = (s_setup_field > 0) ? s_setup_field - 1 : 2;
-        if (kDown & KEY_DOWN) s_setup_field = (s_setup_field < 2) ? s_setup_field + 1 : 0;
+        static int s_setup_up_repeat = 0, s_setup_dn_repeat = 0;
+        if (nav_repeat(kDown, kHeld, KEY_UP, &s_setup_up_repeat)) s_setup_field = (s_setup_field > 0) ? s_setup_field - 1 : 2;
+        if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_setup_dn_repeat)) s_setup_field = (s_setup_field < 2) ? s_setup_field + 1 : 0;
         
         if (kDown & KEY_TOUCH && touch.px > 0 && touch.py > 0) {
             if (touch.py >= 50 && touch.py < 50 + LIST_ITEM_HEIGHT) s_setup_field = 0;
@@ -2351,13 +2593,18 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
         return;
     }
 
-    if (kDown & KEY_UP) {
+    // Generic list navigation shared by every browse screen that falls
+    // through to here (Libraries/Artists/Albums/Tracks/Playlists/Search) -
+    // only one is ever active at a time, so one shared repeat counter pair
+    // is enough (same reasoning as the C-Stick block above).
+    static int s_list_up_repeat = 0, s_list_dn_repeat = 0;
+    if (nav_repeat(kDown, kHeld, KEY_UP, &s_list_up_repeat)) {
         if (s_selected_idx > 0) {
             s_selected_idx--;
             if (s_selected_idx < s_list_offset) s_list_offset = s_selected_idx;
         }
     }
-    if (kDown & KEY_DOWN) {
+    if (nav_repeat(kDown, kHeld, KEY_DOWN, &s_list_dn_repeat)) {
         if (s_selected_idx < s_list_count - 1) {
             s_selected_idx++;
             if (s_selected_idx >= s_list_offset + LIST_VISIBLE_ITEMS) s_list_offset = s_selected_idx - LIST_VISIBLE_ITEMS + 1;
@@ -3196,6 +3443,24 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
                 draw_list_item(i, s_servers[idx].name, sub, idx == s_selected_idx, false);
             }
         }
+    } else if (s_screen == SCREEN_HOME_USERS) {
+        draw_header("Switch User");
+        if (!s_config->account_token[0]) {
+            draw_text_centered("No Plex account signed in", 100, BTM_WIDTH, 0.48f, 0.48f, COL_TEXT_DIM);
+            draw_text_centered("(Settings > Server Address is a manual", 130, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DARK);
+            draw_text_centered("override, not a sign-in)", 148, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DARK);
+        } else if (s_num_home_users == 0) {
+            draw_text_centered("No other users on this Plex Home", 100, BTM_WIDTH, 0.48f, 0.48f, COL_TEXT_DIM);
+        } else {
+            for (int i = 0; i < LIST_VISIBLE_ITEMS; i++) {
+                int idx = s_list_offset + i;
+                if (idx >= s_num_home_users) break;
+                const char* sub = s_home_users[idx].admin
+                    ? (s_home_users[idx].is_protected ? "Admin - PIN protected" : "Admin")
+                    : (s_home_users[idx].is_protected ? "PIN protected" : NULL);
+                draw_list_item(i, s_home_users[idx].title, sub, idx == s_selected_idx, false);
+            }
+        }
     } else if (s_screen == SCREEN_HUB) {
         draw_header("DualPlex Music Hub");
         draw_list_item(0, "Artists", "Browse all artists", s_selected_idx == 0, false);
@@ -3243,25 +3508,51 @@ void ui_render_bottom(C3D_RenderTarget* bottom) {
         }
     } else if (s_screen == SCREEN_SETTINGS) {
         draw_header("Settings");
-        draw_list_item(0, "Clock Format", s_config->clock_24h ? "24-hour" : "12-hour (AM/PM)", s_selected_idx == 0, false);
-        draw_list_item(1, "Smart Crossfade", s_crossfade_enabled ? "On" : "Off", s_selected_idx == 1, false);
-        char downloads_sub[64];
+
+        char downloads_sub[64], override_sub[64];
         snprintf(downloads_sub, sizeof(downloads_sub), "%d track(s) - %.1f MB",
                  offline_get_track_count(), offline_get_storage_used_bytes() / (1024.0f * 1024.0f));
-        draw_list_item(2, "Downloads", downloads_sub, s_selected_idx == 2, false);
-
-        char override_sub[64];
         if (s_config->server_url_locked) {
             snprintf(override_sub, sizeof(override_sub), "On (tap to disable)");
         } else {
             snprintf(override_sub, sizeof(override_sub), "Off (tap to set)");
         }
-        draw_list_item(3, "Server Address Override", override_sub, s_selected_idx == 3, false);
+
+        // Only SETTINGS_VISIBLE_ITEMS of SETTINGS_ROW_COUNT logical rows are
+        // ever drawn at once - visual row i is logical row (s_list_offset+i),
+        // same windowed-list idiom every other multi-item screen uses (see
+        // e.g. SCREEN_SERVER_SELECT above).
+        for (int i = 0; i < SETTINGS_VISIBLE_ITEMS; i++) {
+            int idx = s_list_offset + i;
+            if (idx >= SETTINGS_ROW_COUNT) break;
+            bool sel = s_selected_idx == idx;
+            if (idx == 0) {
+                draw_list_item(i, "Clock Format", s_config->clock_24h ? "24-hour" : "12-hour (AM/PM)", sel, false);
+            } else if (idx == 1) {
+                draw_list_item(i, "Smart Crossfade", s_crossfade_enabled ? "On" : "Off", sel, false);
+            } else if (idx == 2) {
+                draw_list_item(i, "Downloads", downloads_sub, sel, false);
+            } else if (idx == 3) {
+                draw_list_item(i, "Download Quality",
+                                plex_api_get_download_quality_label((PlexQualityTier)s_config->download_quality),
+                                sel, false);
+            } else if (idx == 4) {
+                draw_list_item(i, "Prefer Downloaded Media",
+                                prefer_downloaded_media_label(s_config->prefer_downloaded_media),
+                                sel, false);
+            } else if (idx == 5) {
+                draw_list_item(i, "Server Address Override", override_sub, sel, false);
+            } else if (idx == 6) {
+                draw_list_item(i, "Switch User",
+                                s_config->account_token[0] ? "Plex Home" : "Sign in with a Plex account to enable",
+                                sel, false);
+            }
+        }
 
         if (s_status_msg[0]) {
-            draw_text_centered(s_status_msg, LIST_START_Y + 4 * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
+            draw_text_centered(s_status_msg, LIST_START_Y + SETTINGS_VISIBLE_ITEMS * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.4f, 0.4f, s_status_color);
         } else {
-            draw_text_centered("Tap a row (or D-Pad + A) to open/toggle it", LIST_START_Y + 4 * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
+            draw_text_centered("Tap a row (or D-Pad + A) to open/toggle it", LIST_START_Y + SETTINGS_VISIBLE_ITEMS * LIST_ITEM_HEIGHT + 10, BTM_WIDTH, 0.38f, 0.38f, COL_TEXT_DIM);
         }
 
         bool is_n3ds = false;

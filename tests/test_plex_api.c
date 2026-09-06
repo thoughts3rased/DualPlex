@@ -26,6 +26,8 @@ extern bool g_stub_is_new3ds;
  * linkage in plex_api.c only so it can be exercised directly here. See its
  * definition for why. */
 extern int parse_lyrics_stream_response(const char* response, PlexLyricLine* out, int max);
+extern void find_lyric_stream_key(const char* metadata_json, char* out_key, size_t out_max);
+extern int parse_home_users_response(const char* response, PlexHomeUser* out, int max);
 extern int parse_loudness_curve_response(const char* text, float* out, int max, bool want_tail);
 extern bool resolve_host_is_local_via_dns(const char* host);
 extern int parse_tracks_from_json(const char* response, PlexTrack* out, int start, int max, int* out_total);
@@ -448,6 +450,61 @@ TEST(stream_url_flac_direct_tier_on_old3ds_falls_back_to_transcode_with_valid_bi
 }
 
 /* ================================================================== */
+/* plex_api_estimate_stream_bitrate(): must mirror plex_api_get_stream_url()'s
+ * own branching exactly (offline.c's download engine doesn't use this - it's
+ * ui.c's "Prefer Downloaded Media: On poor connections" setting, comparing
+ * live streaming quality against an already-downloaded copy without actually
+ * committing to streaming it first). */
+
+TEST(estimate_stream_bitrate_matches_direct_mp3_streams_own_bitrate) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_MP3_320);
+
+    PlexTrack track;
+    make_track(&track, "1", "/library/parts/1/1/song.mp3", "mp3", 192);
+
+    CHECK(plex_api_estimate_stream_bitrate(&track) == 192);
+}
+
+TEST(estimate_stream_bitrate_caps_at_tier_when_file_bitrate_exceeds_it) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_MP3_128);
+
+    PlexTrack track;
+    make_track(&track, "2", "/library/parts/2/1/song.mp3", "mp3", 320);
+
+    CHECK(plex_api_estimate_stream_bitrate(&track) == 128);
+}
+
+TEST(estimate_stream_bitrate_is_zero_for_new3ds_flac_direct) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_FLAC_DIRECT);
+    g_stub_is_new3ds = true;
+
+    PlexTrack track;
+    make_track(&track, "6", "/library/parts/6/1/song.flac", "flac", 1000);
+    track.sampling_rate = 48000;
+
+    CHECK(plex_api_estimate_stream_bitrate(&track) == 0);
+}
+
+TEST(estimate_stream_bitrate_falls_back_to_320_for_flac_direct_tier_when_direct_not_possible) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_FLAC_DIRECT);
+    g_stub_is_new3ds = false; /* not New3DS - can't FLAC Direct stream */
+
+    PlexTrack track;
+    make_track(&track, "4", "/library/parts/4/1/song.flac", "flac", 1044);
+
+    CHECK(plex_api_estimate_stream_bitrate(&track) == 320);
+}
+
+TEST(estimate_stream_bitrate_returns_negative_one_for_no_track) {
+    init_plex_api();
+    CHECK(plex_api_estimate_stream_bitrate(NULL) == -1);
+}
+
+/* ================================================================== */
 /* plex_api_get_download_url() (offline.c's download engine): must always
  * point at the track's original file via its part_key, with no transcode
  * params at all - unlike plex_api_get_stream_url()/get_transcode_url(),
@@ -474,6 +531,85 @@ TEST(download_url_fails_gracefully_with_no_part_key) {
 
     char url[2048];
     CHECK(!plex_api_get_download_url(&track, url, sizeof(url)));
+}
+
+/* ================================================================== */
+/* plex_api_get_download_transcode_url() (offline.c's download engine, for a
+ * track that needs transcoding): must use the explicit `tier` argument, not
+ * whatever the shared adaptive streaming tier (plex_api_set_quality_tier())
+ * happens to be set to right now - Settings > Download Quality is a wholly
+ * separate, user-set preference from live playback's adaptive bitrate. */
+
+TEST(download_transcode_url_uses_the_passed_tier_not_the_streaming_tier) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_MP3_64); // must not affect the download transcode URL
+
+    PlexTrack track;
+    make_track(&track, "42", NULL, NULL, 0);
+
+    char url[2048];
+    CHECK(plex_api_get_download_transcode_url(&track, QUALITY_MP3_192, url, sizeof(url)));
+
+    char* audio_bitrate = query_param_raw(url, "audioBitrate");
+    CHECK_STR_EQ(audio_bitrate, "192");
+    free(audio_bitrate);
+}
+
+TEST(download_transcode_url_falls_back_to_320_for_flac_direct_tier) {
+    init_plex_api();
+
+    PlexTrack track;
+    make_track(&track, "42", NULL, NULL, 0);
+
+    char url[2048];
+    CHECK(plex_api_get_download_transcode_url(&track, QUALITY_FLAC_DIRECT, url, sizeof(url)));
+
+    char* audio_bitrate = query_param_raw(url, "audioBitrate");
+    CHECK_STR_EQ(audio_bitrate, "320");
+    free(audio_bitrate);
+}
+
+TEST(download_transcode_url_session_id_does_not_collide_with_a_live_playback_transcode) {
+    init_plex_api();
+    plex_api_set_quality_tier(QUALITY_MP3_320);
+
+    PlexTrack track;
+    make_track(&track, "16324", NULL, NULL, 0);
+
+    char playback_url[2048], download_url[2048];
+    CHECK(plex_api_get_transcode_url(&track, playback_url, sizeof(playback_url)));
+    CHECK(plex_api_get_download_transcode_url(&track, QUALITY_MP3_128, download_url, sizeof(download_url)));
+
+    char* playback_session = query_param_raw(playback_url, "session");
+    char* download_session = query_param_raw(download_url, "session");
+    CHECK(playback_session != NULL && download_session != NULL);
+    if (playback_session && download_session) {
+        CHECK(strcmp(playback_session, download_session) != 0);
+    }
+    free(playback_session);
+    free(download_session);
+}
+
+/* ================================================================== */
+/* plex_api_get_quality_bitrate() / plex_api_get_download_quality_label():
+ * the tier->bitrate mapping and Settings-facing labels offline.c's download
+ * engine uses to decide direct-vs-transcode and to render Settings > Download
+ * Quality. */
+
+TEST(quality_bitrate_matches_each_tier) {
+    CHECK(plex_api_get_quality_bitrate(QUALITY_FLAC_DIRECT) <= 0);
+    CHECK(plex_api_get_quality_bitrate(QUALITY_MP3_320) == 320);
+    CHECK(plex_api_get_quality_bitrate(QUALITY_MP3_192) == 192);
+    CHECK(plex_api_get_quality_bitrate(QUALITY_MP3_128) == 128);
+    CHECK(plex_api_get_quality_bitrate(QUALITY_MP3_64) == 64);
+}
+
+TEST(download_quality_label_is_settings_facing_not_the_streaming_label) {
+    CHECK_STR_EQ(plex_api_get_download_quality_label(QUALITY_FLAC_DIRECT), "Original");
+    CHECK_STR_EQ(plex_api_get_download_quality_label(QUALITY_MP3_320), "Very High");
+    CHECK_STR_EQ(plex_api_get_download_quality_label(QUALITY_MP3_192), "High");
+    CHECK_STR_EQ(plex_api_get_download_quality_label(QUALITY_MP3_128), "Medium");
+    CHECK_STR_EQ(plex_api_get_download_quality_label(QUALITY_MP3_64), "Low");
 }
 
 /* ================================================================== */
@@ -656,6 +792,67 @@ TEST(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers) {
 }
 
 /* ================================================================== */
+/* find_lyric_stream_key(): extracts a track's lyric ("streamType"==4) Stream
+ * key out of a /library/metadata/<ratingKey> response - shared by
+ * plex_api_get_lyrics(), the async lyrics path, and offline.c's download-
+ * time lyrics caching (see its own comment for why offline.c can't just
+ * call plex_api_get_lyrics() directly). */
+
+TEST(find_lyric_stream_key_prefers_lrc_format_over_a_later_non_lrc_stream) {
+    const char* json =
+        "{\"MediaContainer\":{\"Metadata\":[{\"Media\":[{\"Part\":[{\"Stream\":["
+        "{\"streamType\":4,\"format\":\"txt\",\"key\":\"/library/streams/1\"},"
+        "{\"streamType\":4,\"format\":\"lrc\",\"key\":\"/library/streams/2\"}"
+        "]}]}]}]}}";
+    char key[512];
+    find_lyric_stream_key(json, key, sizeof(key));
+    CHECK_STR_EQ(key, "/library/streams/2");
+}
+
+TEST(find_lyric_stream_key_prefers_lrc_format_even_when_it_comes_first) {
+    const char* json =
+        "{\"MediaContainer\":{\"Metadata\":[{\"Media\":[{\"Part\":[{\"Stream\":["
+        "{\"streamType\":4,\"format\":\"lrc\",\"key\":\"/library/streams/1\"},"
+        "{\"streamType\":4,\"format\":\"txt\",\"key\":\"/library/streams/2\"}"
+        "]}]}]}]}}";
+    char key[512];
+    find_lyric_stream_key(json, key, sizeof(key));
+    CHECK_STR_EQ(key, "/library/streams/1");
+}
+
+TEST(find_lyric_stream_key_falls_back_to_first_lyric_stream_when_none_is_lrc) {
+    const char* json =
+        "{\"MediaContainer\":{\"Metadata\":[{\"Media\":[{\"Part\":[{\"Stream\":["
+        "{\"streamType\":2,\"format\":\"lrc\",\"key\":\"/library/streams/wrong-type\"},"
+        "{\"streamType\":4,\"format\":\"txt\",\"key\":\"/library/streams/first-lyric\"},"
+        "{\"streamType\":4,\"format\":\"txt\",\"key\":\"/library/streams/second-lyric\"}"
+        "]}]}]}]}}";
+    char key[512];
+    find_lyric_stream_key(json, key, sizeof(key));
+    CHECK_STR_EQ(key, "/library/streams/first-lyric");
+}
+
+TEST(find_lyric_stream_key_empty_when_no_lyric_stream_present) {
+    const char* json =
+        "{\"MediaContainer\":{\"Metadata\":[{\"Media\":[{\"Part\":[{\"Stream\":["
+        "{\"streamType\":1,\"key\":\"/library/streams/audio\"}"
+        "]}]}]}]}}";
+    char key[512] = "unset";
+    find_lyric_stream_key(json, key, sizeof(key));
+    CHECK_STR_EQ(key, "");
+}
+
+TEST(find_lyric_stream_key_empty_for_malformed_or_missing_json) {
+    char key[512] = "unset";
+    find_lyric_stream_key("not json", key, sizeof(key));
+    CHECK_STR_EQ(key, "");
+
+    strcpy(key, "unset");
+    find_lyric_stream_key(NULL, key, sizeof(key));
+    CHECK_STR_EQ(key, "");
+}
+
+/* ================================================================== */
 /* parse_loudness_curve_response() - real captured /library/streams/{id}/
  * loudness response (plain text, one dB value per line) for $ilkMoney -
  * "Detour", 1484 lines/samples (148.4s @ 100ms/sample, matches the track's
@@ -819,6 +1016,101 @@ TEST(is_https_false_for_plain_http_input) {
 
     plex_api_init("http://myserver.example.com:32400", "TOK");
     CHECK(!plex_api_is_https());
+}
+
+/* ================================================================== */
+/* parse_home_users_response(): plex.tv's /api/v2/home/users, used by
+ * Settings > Switch User (Plex Home). */
+
+TEST(parse_home_users_response_real_shape) {
+    /* Field names/shape (including the outer {"id","name",...,"users":[...]}
+     * envelope, and that every entry always carries a "uuid") confirmed live
+     * against a real plex.tv account/Home (GET /api/v2/home/users) while
+     * building this - id/uuid/title/username below are fictitious. */
+    const char* json =
+        "{\"id\":3482811,\"name\":\"Test Home\",\"guestEnabled\":false,\"subscription\":true,\"users\":["
+        "{\"id\":1001,\"uuid\":\"aaaa1111bbbb2222\",\"title\":\"Dad\",\"username\":\"dadaccount\","
+        "\"friendlyName\":\"Dad\",\"admin\":true,\"guest\":false,\"protected\":true},"
+        "{\"id\":1002,\"uuid\":\"cccc3333dddd4444\",\"title\":\"Kid\",\"username\":null,"
+        "\"friendlyName\":\"Kid\",\"admin\":false,\"guest\":false,\"protected\":false}"
+        "]}";
+    PlexHomeUser users[8];
+    int count = parse_home_users_response(json, users, 8);
+
+    CHECK(count == 2);
+    if (count == 2) {
+        CHECK(users[0].id == 1001);
+        CHECK_STR_EQ(users[0].uuid, "aaaa1111bbbb2222");
+        CHECK_STR_EQ(users[0].title, "Dad");
+        CHECK(users[0].admin);
+        CHECK(users[0].is_protected);
+
+        CHECK(users[1].id == 1002);
+        CHECK_STR_EQ(users[1].uuid, "cccc3333dddd4444");
+        CHECK_STR_EQ(users[1].title, "Kid");
+        CHECK(!users[1].admin);
+        CHECK(!users[1].is_protected);
+    }
+}
+
+TEST(parse_home_users_response_falls_back_through_title_then_username) {
+    const char* json =
+        "{\"users\":["
+        "{\"id\":1,\"uuid\":\"aaaa\",\"title\":\"Fallback Title\"},"
+        "{\"id\":2,\"uuid\":\"bbbb\",\"username\":\"fallback_username\"},"
+        "{\"id\":3,\"uuid\":\"cccc\"}"
+        "]}";
+    PlexHomeUser users[8];
+    int count = parse_home_users_response(json, users, 8);
+
+    CHECK(count == 3);
+    if (count == 3) {
+        CHECK_STR_EQ(users[0].title, "Fallback Title");
+        CHECK_STR_EQ(users[1].title, "fallback_username");
+        CHECK_STR_EQ(users[2].title, "User 3"); /* no name field at all */
+    }
+}
+
+TEST(parse_home_users_response_respects_max_cap) {
+    const char* json =
+        "{\"users\":[{\"id\":1,\"uuid\":\"a\"},{\"id\":2,\"uuid\":\"b\"},"
+        "{\"id\":3,\"uuid\":\"c\"},{\"id\":4,\"uuid\":\"d\"}]}";
+    PlexHomeUser users[2];
+    int count = parse_home_users_response(json, users, 2);
+    CHECK(count == 2);
+}
+
+/* The switch endpoint is keyed by uuid, not id (the id-keyed URL 404s - see
+ * plex_api_switch_home_user()'s comment) - an entry with no uuid can't ever
+ * be switched to, so it's skipped entirely rather than shown as a dead row. */
+TEST(parse_home_users_response_skips_entries_with_no_uuid) {
+    const char* json =
+        "{\"users\":[{\"id\":1,\"friendlyName\":\"No UUID\"},"
+        "{\"id\":42,\"uuid\":\"deadbeef\",\"friendlyName\":\"Has UUID\"}]}";
+    PlexHomeUser users[8];
+    int count = parse_home_users_response(json, users, 8);
+
+    CHECK(count == 1);
+    if (count == 1) {
+        CHECK(users[0].id == 42);
+        CHECK_STR_EQ(users[0].uuid, "deadbeef");
+        CHECK_STR_EQ(users[0].title, "Has UUID");
+    }
+}
+
+TEST(parse_home_users_response_tolerates_a_bare_top_level_array) {
+    const char* json = "[{\"id\":7,\"uuid\":\"cafef00d\",\"friendlyName\":\"Solo\"}]";
+    PlexHomeUser users[8];
+    int count = parse_home_users_response(json, users, 8);
+    CHECK(count == 1);
+    if (count == 1) CHECK_STR_EQ(users[0].title, "Solo");
+}
+
+TEST(parse_home_users_response_empty_for_malformed_or_missing_json) {
+    PlexHomeUser users[8];
+    CHECK(parse_home_users_response("not json", users, 8) == 0);
+    CHECK(parse_home_users_response(NULL, users, 8) == 0);
+    CHECK(parse_home_users_response("{}", users, 8) == 0);
 }
 
 TEST(is_connected_false_until_a_connection_test_actually_runs) {
@@ -1031,8 +1323,18 @@ int main(void) {
     RUN(stream_url_flac_direct_declines_hi_res_source_even_on_new3ds);
     RUN(stream_url_flac_direct_allows_48khz_on_new3ds);
     RUN(stream_url_flac_direct_tier_on_old3ds_falls_back_to_transcode_with_valid_bitrate);
+    RUN(estimate_stream_bitrate_matches_direct_mp3_streams_own_bitrate);
+    RUN(estimate_stream_bitrate_caps_at_tier_when_file_bitrate_exceeds_it);
+    RUN(estimate_stream_bitrate_is_zero_for_new3ds_flac_direct);
+    RUN(estimate_stream_bitrate_falls_back_to_320_for_flac_direct_tier_when_direct_not_possible);
+    RUN(estimate_stream_bitrate_returns_negative_one_for_no_track);
     RUN(download_url_uses_part_key_with_no_transcode_params);
     RUN(download_url_fails_gracefully_with_no_part_key);
+    RUN(download_transcode_url_uses_the_passed_tier_not_the_streaming_tier);
+    RUN(download_transcode_url_falls_back_to_320_for_flac_direct_tier);
+    RUN(download_transcode_url_session_id_does_not_collide_with_a_live_playback_transcode);
+    RUN(quality_bitrate_matches_each_tier);
+    RUN(download_quality_label_is_settings_facing_not_the_streaming_label);
     RUN(parse_tracks_extracts_album_and_artist_rating_keys_from_numbers);
     RUN(parse_tracks_extracts_album_and_artist_rating_keys_from_strings);
     RUN(parse_lyrics_stream_response_real_plex_json_shape);
@@ -1041,6 +1343,11 @@ int main(void) {
     RUN(parse_lyrics_stream_response_raw_lrc_text_fallback_shape);
     RUN(parse_lyrics_stream_response_no_lyrics_present_returns_zero);
     RUN(parse_lyrics_stream_response_keeps_explicit_instrumental_break_markers);
+    RUN(find_lyric_stream_key_prefers_lrc_format_over_a_later_non_lrc_stream);
+    RUN(find_lyric_stream_key_prefers_lrc_format_even_when_it_comes_first);
+    RUN(find_lyric_stream_key_falls_back_to_first_lyric_stream_when_none_is_lrc);
+    RUN(find_lyric_stream_key_empty_when_no_lyric_stream_present);
+    RUN(find_lyric_stream_key_empty_for_malformed_or_missing_json);
     RUN(parse_loudness_curve_response_head_mode_returns_first_samples);
     RUN(parse_loudness_curve_response_tail_mode_returns_last_samples);
     RUN(parse_loudness_curve_response_respects_max_cap);
@@ -1054,6 +1361,12 @@ int main(void) {
     RUN(is_https_preserved_for_hostnames);
     RUN(is_https_downgraded_for_bare_ip_addresses);
     RUN(is_https_false_for_plain_http_input);
+    RUN(parse_home_users_response_real_shape);
+    RUN(parse_home_users_response_falls_back_through_title_then_username);
+    RUN(parse_home_users_response_respects_max_cap);
+    RUN(parse_home_users_response_skips_entries_with_no_uuid);
+    RUN(parse_home_users_response_tolerates_a_bare_top_level_array);
+    RUN(parse_home_users_response_empty_for_malformed_or_missing_json);
     RUN(is_connected_false_until_a_connection_test_actually_runs);
     RUN(connection_candidates_prefers_custom_url_then_local_plex_direct_https_then_bare_ip_then_remote);
     RUN(connection_candidates_falls_back_to_bare_ip_when_local_connection_has_no_uri);

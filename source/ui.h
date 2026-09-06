@@ -24,6 +24,7 @@ typedef enum {
     SCREEN_QUEUE,         // Play Queue / Up Next screen
     SCREEN_LYRICS,        // Time-Synced Lyrics screen
     SCREEN_SETTINGS,      // App-level settings (clock format, etc.)
+    SCREEN_HOME_USERS,    // Plex Home user switcher (Settings > Switch User)
 } UIScreen;
 
 // Initialize UI resources (text buffers, colors, etc.).
