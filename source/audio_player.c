@@ -126,7 +126,15 @@ static int s_crossfade_duration_ms = 0;
 // param), even mid-crossfade - the visualizer should track whatever the user
 // currently perceives as "the" track, not whichever deck happens to decode
 // last in a given frame.
-#define VIS_SNAPSHOT_SAMPLES 256
+//
+// 1024 (not 256) so the FFT-based spectrum visualizer has usable
+// low-frequency resolution: at 44.1 kHz, 1024 samples => ~43 Hz per bin,
+// versus ~172 Hz per bin at 256 (which would leave the bass end of a
+// log-frequency plot empty). The time-domain visualizers just read a
+// longer, denser slice - harmless. Each decode chunk is
+// AUDIO_SAMPLES_PER_BUF (4096) frames, so a full 1024-sample tail is
+// almost always available.
+#define VIS_SNAPSHOT_SAMPLES 1024
 static s16 s_vis_snapshot[VIS_SNAPSHOT_SAMPLES];
 static int s_vis_snapshot_count = 0;
 

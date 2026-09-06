@@ -4,7 +4,7 @@
 #include "album_art.h"
 #include "offline.h"
 #include "library_cache.h"
-#include "orb3d.h"
+#include "fft.h"
 #include "logger.h"
 #include "iconfont_bin.h" // bundled Font Awesome Free icon font (SIL OFL 1.1, see licenses/fontawesome-LICENSE.txt), embedded via bin2s from data/iconfont.bin
 
@@ -194,8 +194,10 @@ static TopView s_top_view = TOPVIEW_NOW_PLAYING;
 // Visualizer style, cycled with X while TOPVIEW_VISUALIZER is active.
 typedef enum {
     VIS_STYLE_BARS,
+    VIS_STYLE_SPECTRUM,      // true FFT spectrum analyzer (log-frequency + peak caps)
     VIS_STYLE_OSCILLOSCOPE,
-    VIS_STYLE_ORB,
+    VIS_STYLE_RADIAL,        // oscilloscope wrapped around a slowly-turning ring
+    VIS_STYLE_TRAILS,        // stacked recent waveforms fading into the distance
     VIS_STYLE_COUNT
 } VisStyle;
 static VisStyle s_vis_style = VIS_STYLE_BARS;
@@ -2741,7 +2743,7 @@ void ui_update(u32 kDown, u32 kHeld, touchPosition touch) {
 
 // --- Visualizers: driven by audio_player_get_visualizer_samples() ------
 
-#define VIS_MAX_SAMPLES 256
+#define VIS_MAX_SAMPLES 1024
 
 // VU-style bars: splits the latest decoded samples into buckets, plots each
 // bucket's RMS amplitude as a bar. Bars rise instantly to a loud moment and
@@ -2795,7 +2797,12 @@ static void draw_visualizer_bars(float x, float y, float w, float h) {
 // Oscilloscope: plots the latest decoded samples as a connected waveform.
 static void draw_visualizer_oscilloscope(float x, float y, float w, float h) {
     s16 samples[VIS_MAX_SAMPLES];
-    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+    // Cap the request: the box is only ~370 px wide, so asking for the full
+    // 1024-sample snapshot would draw ~3 thick line segments per pixel -
+    // wasted work that just smears into a solid band. ~256 points is one
+    // per pixel-and-a-half, which still reads as a crisp trace.
+    int want = VIS_MAX_SAMPLES < 256 ? VIS_MAX_SAMPLES : 256;
+    int n = audio_player_get_visualizer_samples(samples, want);
     if (n < 2) return;
 
     float mid_y = y + h / 2.0f;
@@ -2813,160 +2820,298 @@ static void draw_visualizer_oscilloscope(float x, float y, float w, float h) {
     }
 }
 
-// Orb: a lit, beat-reactive 3D sphere whose surface bulges with the live
-// audio spectrum, and whose rotation speed, bulge strength and color all
-// periodically reroll on their own so it keeps reinventing its look instead
-// of settling into one repeating pattern. The actual 3D rendering (real
-// PICA200 lighting, not a 2D approximation) lives in orb3d.c; this section
-// is the audio analysis / beat detection / phase randomization state
-// machine that feeds it.
-static float s_orb_time = 0.0f;
-static float s_orb_energy_avg = 0.0f;
-static float s_orb_beat_cooldown = 0.0f;
-static float s_orb_beat_pulse = 0.0f;
-static float s_orb_phase_timer = 0.0f;
-static float s_orb_phase_duration = 6.0f;
-static float s_orb_rot_phase = 0.0f;
-static float s_orb_rot_speed = 1.2f;     // radians/sec; sign sets direction
-static float s_orb_bump_amount = 0.7f;   // 0..1, how strongly the spectrum deforms the sphere
-static int s_orb_palette_idx = 0;
-static float s_orb_band_level[ORB3D_BANDS] = {0};
+#define VIS_TWO_PI 6.28318531f
+// Nominal PCM rate for mapping FFT bins to Hz. Tracks can be 48 kHz, but a
+// ~9% frequency error is invisible on a 28-bar log plot, so this stays a
+// constant rather than being threaded through from the decoder.
+#define VIS_SAMPLE_RATE 44100.0f
 
-// 4 fixed palettes below (each { rim, core, unused }), plus a 5th "rainbow"
-// palette handled specially in orb_pick_core_rim() (hue-cycled rather than
-// read from a fixed array).
-#define ORB_PALETTE_COUNT 5
-static const u32 s_orb_palettes[4][3] = {
-    { RGBA8(0xE5, 0xA0, 0x0D, 0xFF), RGBA8(0xFF, 0xD5, 0x4F, 0xFF), RGBA8(0xB3, 0x4A, 0x0A, 0xFF) }, // gold
-    { RGBA8(0x4F, 0x7C, 0xFF, 0xFF), RGBA8(0xB0, 0x6A, 0xFF, 0xFF), RGBA8(0x2A, 0x2F, 0xB8, 0xFF) }, // blue/violet
-    { RGBA8(0x35, 0xE0, 0x9A, 0xFF), RGBA8(0x1A, 0xB3, 0xC9, 0xFF), RGBA8(0x0A, 0x7A, 0x55, 0xFF) }, // green/teal
-    { RGBA8(0xFF, 0x4F, 0xA0, 0xFF), RGBA8(0xFF, 0x9A, 0xD5, 0xFF), RGBA8(0xB8, 0x1A, 0x6A, 0xFF) }, // magenta/pink
-};
-
-static float orb_randf(void) { return (float)rand() / (float)RAND_MAX; }
-
-static u32 orb_hsv(float h, float s, float v) {
-    h -= floorf(h);
-    float i = floorf(h * 6.0f);
-    float f = h * 6.0f - i;
-    float p = v * (1.0f - s);
-    float q = v * (1.0f - f * s);
-    float t = v * (1.0f - (1.0f - f) * s);
-    float r, g, b;
-    switch ((int)i % 6) {
-        case 0:  r = v; g = t; b = p; break;
-        case 1:  r = q; g = v; b = p; break;
-        case 2:  r = p; g = v; b = t; break;
-        case 3:  r = p; g = q; b = v; break;
-        case 4:  r = t; g = p; b = v; break;
-        default: r = v; g = p; b = q; break;
-    }
-    return RGBA8((u8)(r * 255), (u8)(g * 255), (u8)(b * 255), 0xFF);
-}
-
-static void orb_pick_core_rim(u32* core, u32* rim) {
-    if (s_orb_palette_idx == 4) {
-        float hue = fmodf(s_orb_time * 0.05f, 1.0f);
-        *core = orb_hsv(hue, 0.35f, 1.0f);
-        *rim  = orb_hsv(hue, 0.85f, 1.0f);
-        return;
-    }
-    *rim  = s_orb_palettes[s_orb_palette_idx][0];
-    *core = s_orb_palettes[s_orb_palette_idx][1];
-}
-
-// Rerolls the rotation speed, bulge strength and palette - called on a
-// timer, and occasionally early on a strong beat, so the sphere keeps
-// reinventing its look instead of settling into one repeating pattern.
-static void orb_randomize_phase(void) {
-    // Rotation was previously 0.2-1.0 rad/s, which at the low end took half
-    // a minute for one revolution - visually static. 0.7-2.3 rad/s instead
-    // (a full spin every ~2.7-9s), so there's always visible motion.
-    s_orb_rot_speed = (0.7f + orb_randf() * 1.6f) * (rand() % 2 ? 1.0f : -1.0f);
-    s_orb_bump_amount = 0.5f + orb_randf() * 0.9f;
-    s_orb_palette_idx = rand() % ORB_PALETTE_COUNT;
-    s_orb_phase_duration = 5.0f + orb_randf() * 6.0f;
-}
-
-static void draw_visualizer_orb(C3D_RenderTarget* top, float x, float y, float w, float h) {
+// Spectrum analyzer: a real FFT of the latest audio, plotted as
+// log-frequency bars with falling peak-hold caps. Unlike draw_visualizer_
+// bars() (which is RMS of consecutive *time* slices and only ever looks
+// like a lumpy hill), this separates bass / mid / treble for an actual
+// "graphic EQ" readout. A slow AGC keeps it legible from quiet to loud
+// tracks without the whole display pumping frame to frame.
+static void draw_visualizer_spectrum(float x, float y, float w, float h) {
     s16 samples[VIS_MAX_SAMPLES];
     int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
 
-    // Overall loudness (feeds the beat detector and the sphere's slow
-    // "breathing") plus a coarse per-band split (the bulges over its
-    // surface) - the same grouped-RMS technique as draw_visualizer_bars(),
-    // just resampled onto ORB3D_BANDS buckets instead of VIS_NUM_BARS.
-    // Raw RMS/32768 undersells how loud typical program material reads
-    // perceptually (music rarely sits near full-scale even at "loud") - gain
-    // it up so the sphere's bulging is actually visible rather than a tiny
-    // few-percent radius wobble.
-    #define ORB_AUDIO_GAIN 3.5f
+    // FFT size: largest power of two that fits what we got (>= 128 or we
+    // bail - too little to resolve anything). Zero-padded above n.
+    int fftn = 1;
+    while (fftn * 2 <= n && fftn * 2 <= FFT_MAX_N) fftn <<= 1;
+    if (fftn < 128) return;
 
-    float energy = 0.0f;
-    if (n > 1) {
-        double sum_sq_total = 0.0;
-        for (int i = 0; i < n; i++) { double v = samples[i]; sum_sq_total += v * v; }
-        energy = (float)(sqrt(sum_sq_total / n) / 32768.0) * ORB_AUDIO_GAIN;
-        if (energy > 1.0f) energy = 1.0f;
+    #define SPEC_BARS 28
+    static float raw[SPEC_BARS] = {0};   // per-band magnitudes, kept between the frames where the FFT is skipped
+    static float frame_max = 0.0f;
+    static float s_spec_level[SPEC_BARS] = {0};
+    static float s_spec_peak[SPEC_BARS] = {0};
+    static float s_spec_agc = 0.03f;     // auto-gain reference, in the normalized (~amplitude) units computed below
+    static s16 s_spec_sig0 = 1, s_spec_sig1 = 1; // last analysed buffer's fingerprint
+    static int s_hann_n = 0;
+    static float s_hann[FFT_MAX_N];       // Hann window, rebuilt only when fftn changes
 
-        for (int b = 0; b < ORB3D_BANDS; b++) {
-            int start = (b * n) / ORB3D_BANDS;
-            int end = ((b + 1) * n) / ORB3D_BANDS;
-            if (end <= start) end = start + 1;
-            if (end > n) end = n;
-            double sum_sq = 0.0;
-            int count = 0;
-            for (int i = start; i < end; i++) { double v = samples[i]; sum_sq += v * v; count++; }
-            float target = count > 0 ? (float)(sqrt(sum_sq / count) / 32768.0) * ORB_AUDIO_GAIN : 0.0f;
-            if (target > 1.0f) target = 1.0f;
-            if (target > s_orb_band_level[b]) s_orb_band_level[b] = target; // rise instantly
-            else s_orb_band_level[b] *= 0.85f;                              // decay each frame
+    // The sample buffer refreshes at ~11 Hz but this runs at 60 fps, so ~5
+    // of every 6 frames would re-window and re-transform an identical
+    // buffer. Do the expensive analysis only when the input actually
+    // changed; the AGC, bar smoothing, peak caps and drawing below still
+    // run every frame off the cached raw[]/frame_max, so the plot stays
+    // smooth.
+    if (samples[0] != s_spec_sig0 || samples[n / 2] != s_spec_sig1) {
+        s_spec_sig0 = samples[0];
+        s_spec_sig1 = samples[n / 2];
+
+        // Hann window - kills the spectral smear a rectangular window puts
+        // on every bin, which otherwise drowns quiet bars next to loud
+        // ones. Tabulated: recomputing 0.5-0.5*cos(...) for every sample
+        // every analysis was ~1024 cosf() calls for a curve that never
+        // varies unless fftn does.
+        if (s_hann_n != fftn) {
+            for (int i = 0; i < fftn; i++)
+                s_hann[i] = 0.5f - 0.5f * cosf(VIS_TWO_PI * (float)i / (float)(fftn - 1));
+            s_hann_n = fftn;
+        }
+
+        static float re[FFT_MAX_N];
+        static float im[FFT_MAX_N];
+        for (int i = 0; i < fftn; i++) {
+            float s = (i < n) ? (float)samples[i] / 32768.0f : 0.0f;
+            re[i] = s * s_hann[i];
+            im[i] = 0.0f;
+        }
+        fft_forward(re, im, fftn);
+
+        int half = fftn / 2;
+        float bin_hz = VIS_SAMPLE_RATE / (float)fftn;
+        float f_hi = 18000.0f;
+        if (f_hi > VIS_SAMPLE_RATE * 0.5f) f_hi = VIS_SAMPLE_RATE * 0.5f;
+        float log_lo = logf(40.0f);
+        float log_span = logf(f_hi) - log_lo;
+        float mag_scale = 2.0f / (float)fftn;
+
+        // Per-band magnitude + this frame's loudest band (for the AGC).
+        // Two corrections keep the plot lively:
+        //  - normalize by the transform size (2/fftn), so magnitudes land
+        //    in rough "amplitude" units (~0..0.3 loud) instead of the raw
+        //    sums, which run into the hundreds/thousands and make every
+        //    fixed threshold below pure guesswork;
+        //  - a rising per-band tilt (~+12 dB bass->treble): high
+        //    frequencies always carry far less energy, and the AGC tracks
+        //    the loudest = lowest band, so without this the top half of
+        //    the display just sits near zero.
+        frame_max = 0.0f;
+        for (int b = 0; b < SPEC_BARS; b++) {
+            float lo = expf(log_lo + log_span * ((float)b / SPEC_BARS));
+            float hi = expf(log_lo + log_span * ((float)(b + 1) / SPEC_BARS));
+            int k0 = (int)(lo / bin_hz);
+            int k1 = (int)(hi / bin_hz);
+            if (k0 < 1) k0 = 1;
+            if (k1 <= k0) k1 = k0 + 1;
+            if (k1 > half) k1 = half;
+            float m = 0.0f;
+            for (int k = k0; k < k1; k++) {
+                float mag = sqrtf(re[k] * re[k] + im[k] * im[k]);
+                if (mag > m) m = mag; // band peak reads punchier than its mean
+            }
+            float tilt = 0.6f + 1.9f * ((float)b / (float)(SPEC_BARS - 1));
+            raw[b] = m * mag_scale * tilt;
+            if (raw[b] > frame_max) frame_max = raw[b];
         }
     }
 
-    const float dt = 0.016f; // matches the fixed-step convention used elsewhere in this file
-    s_orb_time += dt;
+    // AGC: follows the loudest band up quickly, drifts down slowly, floored
+    // just above the broadband noise level so a silent passage settles flat
+    // instead of amplifying hiss.
+    float rate = (frame_max > s_spec_agc) ? 0.25f : 0.06f;
+    s_spec_agc += (frame_max - s_spec_agc) * rate;
+    if (s_spec_agc < 0.004f) s_spec_agc = 0.004f;
+    float ref = s_spec_agc * 1.1f;
 
-    // Beat detection: a spike well above the recent running-average energy,
-    // rate-limited so one loud passage doesn't register as many beats.
-    s_orb_beat_cooldown -= dt;
-    bool beat = false;
-    if (energy > s_orb_energy_avg * 1.5f + 0.03f && s_orb_beat_cooldown <= 0.0f) {
-        beat = true;
-        s_orb_beat_cooldown = 0.15f;
-        s_orb_beat_pulse = 1.0f; // brief extra "kick", decays below
+    float bar_w = w / SPEC_BARS;
+    float baseline = y + h;
+    for (int b = 0; b < SPEC_BARS; b++) {
+        float norm = raw[b] / ref;
+        // Soft noise floor: subtract a small pedestal and renormalize, so
+        // quiet-but-real bands still register instead of a hard gate
+        // flattening the bottom of the plot.
+        norm = (norm - 0.04f) * (1.0f / 0.96f);
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+        float target = sqrtf(norm);           // perceptual-ish curve
+
+        if (target > s_spec_level[b]) s_spec_level[b] = target;   // snap up
+        else                         s_spec_level[b] *= 0.80f;    // ease down
+
+        if (s_spec_level[b] > s_spec_peak[b]) s_spec_peak[b] = s_spec_level[b];
+        else                                  s_spec_peak[b] -= 0.012f; // gravity
+        if (s_spec_peak[b] < 0.0f) s_spec_peak[b] = 0.0f;
+
+        float bx = x + b * bar_w;
+        float bh = s_spec_level[b] * h;
+        if (bh < 2.0f) bh = 2.0f;
+        C2D_DrawRectSolid(bx + 1, baseline - bh, 0.5f, bar_w - 2, bh, COL_ACCENT);
+
+        float cap_y = baseline - s_spec_peak[b] * h;
+        if (s_spec_peak[b] > 0.02f)
+            C2D_DrawRectSolid(bx + 1, cap_y - 1, 0.5f, bar_w - 2, 2.0f, COL_TEXT);
     }
-    s_orb_energy_avg = s_orb_energy_avg * 0.93f + energy * 0.07f;
-    s_orb_beat_pulse *= 0.90f;
-
-    // Reroll the look on a timer, or occasionally early on a beat, so it
-    // keeps mutating instead of settling into one repeating pattern.
-    s_orb_phase_timer += dt;
-    if (s_orb_phase_timer > s_orb_phase_duration || (beat && (rand() % 100) < 15)) {
-        orb_randomize_phase();
-        s_orb_phase_timer = 0.0f;
-    }
-    s_orb_rot_phase += s_orb_rot_speed * dt;
-
-    u32 core_col, rim_col;
-    orb_pick_core_rim(&core_col, &rim_col);
-
-    C2D_DrawRectSolid(x, y, 0.4f, w, h, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
-
-    float light_angle = s_orb_time * 0.5f; // key light sweeps slowly around the sphere
-    float bump_amount = s_orb_bump_amount + s_orb_beat_pulse * 0.4f; // beats briefly emphasize the bulges
-    orb3d_draw(top, x, y, w, h, s_orb_energy_avg, s_orb_band_level,
-               s_orb_rot_phase, bump_amount, light_angle, core_col, rim_col);
+    #undef SPEC_BARS
 }
 
-static void draw_visualizer(C3D_RenderTarget* top, VisStyle style, float x, float y, float w, float h) {
-    if (style == VIS_STYLE_ORB) {
-        draw_visualizer_orb(top, x, y, w, h); // draws its own background
-        return;
+// Radial wave: the oscilloscope wrapped around a ring. The sample index is
+// mirrored across the ring (0..1..0) so the trace always closes cleanly
+// instead of showing a jittering seam where the unaligned buffer's ends
+// fail to meet, and the whole ring turns slowly on its own so it still
+// reads as alive during the ~5 frames each sample buffer is reused for.
+static void draw_visualizer_radial(float x, float y, float w, float h) {
+    s16 samples[VIS_MAX_SAMPLES];
+    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+    if (n < 2) return;
+
+    static float s_radial_phase = 0.0f;
+    s_radial_phase += 0.012f;
+    if (s_radial_phase > VIS_TWO_PI) s_radial_phase -= VIS_TWO_PI;
+
+    float cx = x + w / 2.0f;
+    float cy = y + h / 2.0f;
+    float span = (h < w ? h : w);
+    float base_r = span * 0.30f;
+    float amp_r = span * 0.17f;
+
+    // Unit circle for each step, tabulated once. The ring's own rotation is
+    // then a single 2D rotation of these fixed points by s_radial_phase -
+    // two trig calls per frame instead of a cosf()+sinf() per step (~260).
+    #define RADIAL_STEPS 128
+    static float s_ucos[RADIAL_STEPS + 1];
+    static float s_usin[RADIAL_STEPS + 1];
+    static bool s_radial_tab = false;
+    if (!s_radial_tab) {
+        for (int i = 0; i <= RADIAL_STEPS; i++) {
+            float a = VIS_TWO_PI * (float)i / (float)RADIAL_STEPS;
+            s_ucos[i] = cosf(a);
+            s_usin[i] = sinf(a);
+        }
+        s_radial_tab = true;
     }
+
+    float cp = cosf(s_radial_phase);
+    float sp = sinf(s_radial_phase);
+
+    float prev_px = 0.0f, prev_py = 0.0f;
+    for (int i = 0; i <= RADIAL_STEPS; i++) {
+        float t = (float)i / (float)RADIAL_STEPS;      // 0..1 around the ring
+        float m = (t < 0.5f) ? (t * 2.0f) : ((1.0f - t) * 2.0f); // 0..1..0, mirrored
+        int si = (int)(m * (n - 1));
+        if (si >= n) si = n - 1;
+        float a = (float)samples[si] / 32768.0f;
+        float r = base_r + a * amp_r;
+        // rotate the tabulated unit vector by the ring phase
+        float dirx = cp * s_ucos[i] - sp * s_usin[i];
+        float diry = sp * s_ucos[i] + cp * s_usin[i];
+        float px = cx + dirx * r;
+        float py = cy + diry * r;
+        if (i > 0)
+            C2D_DrawLine(prev_px, prev_py, COL_ACCENT, px, py, COL_ACCENT, 2.0f, 0.5f);
+        prev_px = px;
+        prev_py = py;
+    }
+    #undef RADIAL_STEPS
+}
+
+// Wave trails: a short history of recent waveforms, drawn back-to-front,
+// each older one dimmer, flatter and nudged upward so it recedes into the
+// distance - the "infinite feedback" look done as a CPU ring buffer rather
+// than render-to-texture (no extra GPU targets, no offscreen state to
+// juggle). Newest trace is drawn last, bright, on top.
+static void draw_visualizer_trails(float x, float y, float w, float h) {
+    s16 samples[VIS_MAX_SAMPLES];
+    int n = audio_player_get_visualizer_samples(samples, VIS_MAX_SAMPLES);
+
+    #define TRAIL_FRAMES 12
+    #define TRAIL_POINTS 72
+    static float s_trail[TRAIL_FRAMES][TRAIL_POINTS];
+    static int s_trail_head = 0;   // next slot to overwrite
+    static int s_trail_count = 0;
+    static s16 s_trail_sig0 = 1, s_trail_sig1 = 1; // last buffer's fingerprint
+
+    // Only push a new trace when the sample buffer actually changed. It
+    // refreshes every ~90 ms but we're called at 60 fps, so advancing the
+    // ring every frame would fill it with 5-6 identical copies of each
+    // waveform and the 16-slot history would only span ~3 distinct traces.
+    // Gating on the buffer's contents makes the 16 slots ~1.4 s of real
+    // history - actual receding traces rather than a few fanned-out smears.
+    if (n >= 2 && (samples[0] != s_trail_sig0 || samples[n / 2] != s_trail_sig1)) {
+        s_trail_sig0 = samples[0];
+        s_trail_sig1 = samples[n / 2];
+        float* dst = s_trail[s_trail_head];
+        for (int p = 0; p < TRAIL_POINTS; p++) {
+            int i0 = (p * n) / TRAIL_POINTS;
+            int i1 = ((p + 1) * n) / TRAIL_POINTS;
+            if (i1 <= i0) i1 = i0 + 1;
+            if (i1 > n) i1 = n;
+            float acc = 0.0f;
+            int c = 0;
+            for (int i = i0; i < i1; i++) { acc += samples[i]; c++; }
+            dst[p] = (c ? acc / c : 0.0f) / 32768.0f;
+        }
+        s_trail_head = (s_trail_head + 1) % TRAIL_FRAMES;
+        if (s_trail_count < TRAIL_FRAMES) s_trail_count++;
+    }
+    if (s_trail_count == 0) return;
+
+    float mid_y = y + h * 0.5f;
+    for (int f = s_trail_count - 1; f >= 0; f--) {
+        // f == 0 is the newest trace, f == count-1 the oldest.
+        int slot = (s_trail_head - 1 - f + TRAIL_FRAMES * 2) % TRAIL_FRAMES;
+        float age = (s_trail_count > 1) ? (float)f / (float)(s_trail_count - 1) : 0.0f;
+        float bright = 1.0f - age;
+        float* wv = s_trail[slot];
+
+        u32 col;
+        float thick;
+        if (f == 0) {
+            col = C2D_Color32(0xFF, 0xE0, 0x90, 0xFF); // newest: warm and bright
+            thick = 2.0f;
+        } else {
+            u8 alpha = (u8)(30.0f + bright * bright * 210.0f);
+            col = C2D_Color32(0xE5, 0xA0, 0x0D, alpha);
+            thick = 1.5f;
+        }
+
+        float vscale = (0.35f + 0.65f * bright) * (h * 0.5f);
+        float yoff = -age * h * 0.18f; // older traces drift up and away
+
+        // Level of detail: distant traces are dim, squashed to a third of
+        // their height and drifting away - their fine structure is
+        // invisible, so draw them with a fraction of the segments. Newest
+        // stays full-res. Roughly two-thirds fewer C2D_DrawLine calls
+        // across the whole stack.
+        int draw_pts = (f == 0) ? TRAIL_POINTS : (14 + (int)(bright * (TRAIL_POINTS - 14)));
+        if (draw_pts < 2) draw_pts = 2;
+
+        float prev_px = x;
+        float prev_py = mid_y + yoff - wv[0] * vscale;
+        for (int p = 1; p < draw_pts; p++) {
+            int si = (p * (TRAIL_POINTS - 1)) / (draw_pts - 1);
+            float px = x + ((float)p / (float)(draw_pts - 1)) * w;
+            float py = mid_y + yoff - wv[si] * vscale;
+            C2D_DrawLine(prev_px, prev_py, col, px, py, col, thick, 0.5f);
+            prev_px = px;
+            prev_py = py;
+        }
+    }
+    #undef TRAIL_FRAMES
+    #undef TRAIL_POINTS
+}
+
+static void draw_visualizer(VisStyle style, float x, float y, float w, float h) {
     C2D_DrawRectSolid(x, y, 0.4f, w, h, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
     switch (style) {
+        case VIS_STYLE_SPECTRUM:     draw_visualizer_spectrum(x, y, w, h); break;
         case VIS_STYLE_OSCILLOSCOPE: draw_visualizer_oscilloscope(x, y, w, h); break;
+        case VIS_STYLE_RADIAL:       draw_visualizer_radial(x, y, w, h); break;
+        case VIS_STYLE_TRAILS:       draw_visualizer_trails(x, y, w, h); break;
         case VIS_STYLE_BARS:
         default:                     draw_visualizer_bars(x, y, w, h); break;
     }
@@ -3107,15 +3252,18 @@ static void draw_top_lyrics(PlexTrack* track, PlayerState state) {
 }
 
 // Track details in small text at top, visualizer filling the rest.
-static void draw_top_visualizer(C3D_RenderTarget* top, PlexTrack* track, PlayerState state) {
+static void draw_top_visualizer(PlexTrack* track, PlayerState state) {
     char info_line[128];
     const char* state_str = (state == PLAYER_PLAYING) ? "Playing" : (state == PLAYER_PAUSED ? "Paused" : "Buffering...");
     snprintf(info_line, sizeof(info_line), "%s - %s  |  %s",
              track->title, track->grandparent_title[0] ? track->grandparent_title : "Unknown Artist", state_str);
     draw_text_centered(info_line, 40, TOP_WIDTH, 0.45f, 0.45f, state == PLAYER_LOADING ? COL_WARN : COL_TEXT);
 
-    const char* style_name = (s_vis_style == VIS_STYLE_OSCILLOSCOPE) ? "Oscilloscope" :
-                              (s_vis_style == VIS_STYLE_ORB) ? "Orb" : "VU Bars";
+    const char* style_name =
+        (s_vis_style == VIS_STYLE_SPECTRUM)     ? "Spectrum" :
+        (s_vis_style == VIS_STYLE_OSCILLOSCOPE) ? "Oscilloscope" :
+        (s_vis_style == VIS_STYLE_RADIAL)       ? "Radial Wave" :
+        (s_vis_style == VIS_STYLE_TRAILS)       ? "Wave Trails" : "VU Bars";
     char style_line[64];
     snprintf(style_line, sizeof(style_line), "%s  (X: change style)", style_name);
     draw_text_centered(style_line, 58, TOP_WIDTH, 0.35f, 0.35f, COL_TEXT_DIM);
@@ -3125,7 +3273,7 @@ static void draw_top_visualizer(C3D_RenderTarget* top, PlexTrack* track, PlayerS
         C2D_DrawRectSolid(15, 78, 0.4f, TOP_WIDTH - 30, 130, RGBA8(0x0C, 0x0C, 0x18, 0xFF));
         draw_loading_spinner(TOP_WIDTH / 2.0f, 78 + 65, 20, NULL);
     } else {
-        draw_visualizer(top, s_vis_style, 15, 78, TOP_WIDTH - 30, 130);
+        draw_visualizer(s_vis_style, 15, 78, TOP_WIDTH - 30, 130);
     }
 }
 
@@ -3291,7 +3439,7 @@ void ui_render_top(C3D_RenderTarget* top) {
             PlexTrack* track = &s_tracks[s_current_track_idx];
             switch (s_top_view) {
                 case TOPVIEW_LYRICS:     draw_top_lyrics(track, state); break;
-                case TOPVIEW_VISUALIZER: draw_top_visualizer(top, track, state); break;
+                case TOPVIEW_VISUALIZER: draw_top_visualizer(track, state); break;
                 case TOPVIEW_NOW_PLAYING:
                 default:                 draw_top_now_playing(track, state); break;
             }
